@@ -28,3 +28,6 @@ Thumbs.db
 test-logs/
 .container_health_state
 .vscode/
+
+# Claude agent
+energy-agent/
