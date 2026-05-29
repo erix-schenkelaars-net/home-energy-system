@@ -2,6 +2,12 @@
 
 A set of containerised Python services that monitor, optimise, and control a home energy system built around a Growatt SPH5000 hybrid inverter, a 16 kWh Seplos LiFePO4 battery, and 6.24 kWp of solar PV.
 
+# Home Energy System
+
+> **Hardware:** 
+> Single Raspberry Pi 5 (8GB RAM) with MariaDB database on USB SSD
+> All 9 services running simultaneously via Docker Compose
+
 ## Hardware overview
 
 | Device | Role |
