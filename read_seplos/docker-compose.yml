@@ -1,0 +1,18 @@
+services:
+  seplos_reader:
+    build: .
+    container_name: seplos_reader
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: "host"
+    privileged: true
+    environment:
+      - TZ=Europe/Amsterdam
+    env_file:
+      - ../.env
+    volumes:
+      - /dev:/dev
+      - .:/app
+      - ./logs:/logs
+    group_add:
+      - dialout

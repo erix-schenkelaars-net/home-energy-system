@@ -1,0 +1,17 @@
+services:
+  mariadb_erix:
+    image: mariadb:11.8
+    container_name: mariadb
+    restart: unless-stopped
+    network_mode: host
+
+    environment:
+      TZ: Europe/Amsterdam
+      MYSQL_ROOT_PASSWORD: ${DB_RESOL_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+
+    volumes:
+      - /mnt/usb/mariadb:/var/lib/mysql:rw
+      - /etc/localtime:/etc/localtime:ro

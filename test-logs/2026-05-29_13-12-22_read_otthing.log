@@ -1,0 +1,47 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.5, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+rootdir: /home/pi/docker
+plugins: cov-7.1.0, typeguard-4.4.2, anyio-4.8.0
+collecting ... collected 38 items
+
+read_otthing/test_read_otthing_pub.py::TestFlt::test_empty_string_returns_none PASSED [  2%]
+read_otthing/test_read_otthing_pub.py::TestFlt::test_float_passthrough PASSED [  5%]
+read_otthing/test_read_otthing_pub.py::TestFlt::test_int_converts_to_float PASSED [  7%]
+read_otthing/test_read_otthing_pub.py::TestFlt::test_invalid_string_returns_none PASSED [ 10%]
+read_otthing/test_read_otthing_pub.py::TestFlt::test_negative PASSED     [ 13%]
+read_otthing/test_read_otthing_pub.py::TestFlt::test_none_returns_none PASSED [ 15%]
+read_otthing/test_read_otthing_pub.py::TestFlt::test_string_number PASSED [ 18%]
+read_otthing/test_read_otthing_pub.py::TestFlt::test_zero PASSED         [ 21%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_false_bool PASSED [ 23%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_garbage_string_returns_0 PASSED [ 26%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_integer_returns_none PASSED [ 28%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_none_returns_none PASSED [ 31%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_string_0 PASSED [ 34%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_string_1 PASSED [ 36%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_string_false PASSED [ 39%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_string_off PASSED [ 42%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_string_on PASSED [ 44%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_string_true PASSED [ 47%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_string_true_uppercase PASSED [ 50%]
+read_otthing/test_read_otthing_pub.py::TestBoolean::test_true_bool PASSED [ 52%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_all_expected_keys_present PASSED [ 55%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_boiler_fault_false PASSED [ 57%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_boiler_flame_true PASSED [ 60%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_boiler_flow_temp PASSED [ 63%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_boiler_return_temp PASSED [ 65%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_empty_payload_no_crash PASSED [ 68%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_flame_duty PASSED [ 71%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_heater_action PASSED [ 73%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_missing_slave_fields_return_none PASSED [ 76%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_no_heatercircuit_list PASSED [ 78%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_outside_temp PASSED [ 81%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_rel_mod_float PASSED [ 84%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_returns_dict PASSED [ 86%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_thermostat_ch_enable PASSED [ 89%]
+read_otthing/test_read_otthing_pub.py::TestParsePayload::test_thermostat_room_temp PASSED [ 92%]
+read_otthing/test_read_otthing_pub.py::TestOnMessage::test_invalid_json_does_not_crash PASSED [ 94%]
+read_otthing/test_read_otthing_pub.py::TestOnMessage::test_valid_message_stored_in_userdata PASSED [ 97%]
+read_otthing/test_read_otthing_pub.py::TestOnMessage::test_wrong_topic_ignored PASSED [100%]
+
+============================== 38 passed in 0.05s ==============================

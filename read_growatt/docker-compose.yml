@@ -1,0 +1,20 @@
+services:
+  growatt_reader:
+    build: .
+    container_name: growatt_controller
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: "host"
+#    devices:
+#      - /dev/ttyUSB0:/dev/ttyUSB0
+    privileged: true
+    environment:
+      - TZ=Europe/Amsterdam
+    env_file:
+      - ../.env
+    volumes:
+      - /dev:/dev
+      - .:/app
+      - ./logs:/logs
+    group_add:
+      - dialout

@@ -1,0 +1,11 @@
+services:
+  read_otthing:
+    build: .
+    container_name: otthing_reader
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: host
+    env_file:
+      - ../.env
+    volumes:
+      - ./logs:/logs

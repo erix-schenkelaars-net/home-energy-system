@@ -1,0 +1,14 @@
+services:
+  phpmyadmin:
+    image: arm64v8/phpmyadmin:5.1
+    container_name: phpmyadmin
+    restart: unless-stopped
+    platform: linux/arm64/v8
+    network_mode: host
+    volumes:
+      - ./config.user.inc.php:/etc/phpmyadmin/config.user.inc.php:ro
+    environment:
+      PMA_HOST: 127.0.0.1
+      PMA_PORT: 3306
+      PMA_USER:  ${DB_RESOL_USER}
+      PMA_PASSWORD: ${DB_RESOL_PASSWORD}

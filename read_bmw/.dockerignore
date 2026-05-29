@@ -1,0 +1,13 @@
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+old_stuff/
+old-stuf/
+venv/
+.env
+bmw_tokens.json
+diag_bmw.py
+setup_bmw*.py
+test_*.py

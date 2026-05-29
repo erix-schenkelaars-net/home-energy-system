@@ -1,0 +1,78 @@
+# sph5k.conf — Growatt SPH5000 inverter control configuration
+# Copy to sph5k.conf and adjust to your situation.
+# Flat key = value format; lines starting with # are comments.
+# This file is the FALLBACK when battery_optimizer has no DB slot.
+# Set control_source = FILE to take full manual control.
+
+# ---------------------------------------------------------------------------
+# CONTROL SOURCE
+#   DB   = battery_optimizer (battery_schedule table) controls the inverter.
+#          This file is used only when the DB has no slot for the current quarter.
+#   FILE = This file fully controls the inverter. DB is ignored completely.
+#          Use FILE when travelling or for manual override.
+# ---------------------------------------------------------------------------
+control_source = DB
+
+# ---------------------------------------------------------------------------
+# PV CURTAILMENT BASED ON SOC
+#   0       = disabled (default)
+#   30..98  = SoC threshold %; panels OFF when SoC >= threshold,
+#             panels ON again when SoC <= threshold - 2% (hysteresis)
+#
+# Example: pv_off_at_x_perc_soc = 88
+#   Panels OFF when SoC >= 88%, ON again when SoC <= 86%.
+#   Purpose: prevents grid export during MINIMIZE_EXPORT period.
+# ---------------------------------------------------------------------------
+pv_off_at_x_perc_soc = 0
+
+# ---------------------------------------------------------------------------
+# LOAD HISTORY SKIP DAYS
+#   0 = use the most recent HISTORY_DAYS days (normal operation)
+#   N = skip the last N days when building the load profile
+#       Use after returning from holiday to avoid skewed load estimates.
+#       Reset to 0 once ~4 normal days have been recorded.
+# ---------------------------------------------------------------------------
+# load_skip_days = 0
+
+# ---------------------------------------------------------------------------
+# BASE CONFIGURATION (active when control_source = FILE, or as DB fallback)
+#
+# priority     LOAD_FIRST | BATTERY_FIRST
+# mode         CHARGE | DISCHARGE | STANDBY  (only if priority = BATTERY_FIRST)
+# power        Integer % (-100..100). Sign is normalised by mode:
+#                CHARGE: positive value → charge at that % of 3000 W
+#                DISCHARGE: negative value → discharge at abs(%) of 3000 W
+# ends_on      TIME | SOC
+# minutes_end  Integer minutes (1..1440), used if ends_on = TIME
+# soc_end      Integer % (20..98), used if ends_on = SOC
+# check_interval  Seconds between control loop iterations (default 60)
+# max_time_span   Maximum minutes for a remote control action (default 1440)
+# ---------------------------------------------------------------------------
+priority       = LOAD_FIRST
+ends_on        = TIME
+minutes_end    = 1440
+
+# ---------------------------------------------------------------------------
+# SCHEDULES (optional — time-windowed overrides)
+# Format: schedule.<name>.<key> = <value>
+# Keys: priority, mode, power, start, end, ends_on, minutes_end, soc_end
+# Time windows use 24h format HH:MM. Overnight windows wrap midnight correctly.
+#
+# Example: charge battery to 80% SoC between 02:00 and 05:00
+# ---------------------------------------------------------------------------
+# schedule.night_charge.priority    = BATTERY_FIRST
+# schedule.night_charge.mode        = CHARGE
+# schedule.night_charge.power       = 80
+# schedule.night_charge.start       = 02:00
+# schedule.night_charge.end         = 05:00
+# schedule.night_charge.ends_on     = SOC
+# schedule.night_charge.soc_end     = 80
+
+# Example: discharge to grid between 17:00 and 20:00 (only in DYNAMIC_PRICE mode)
+# schedule.evening_discharge.priority   = BATTERY_FIRST
+# schedule.evening_discharge.mode       = DISCHARGE
+# schedule.evening_discharge.power      = -100
+# schedule.evening_discharge.start      = 17:00
+# schedule.evening_discharge.end        = 20:00
+# schedule.evening_discharge.ends_on    = TIME
+# schedule.evening_discharge.minutes_end = 60

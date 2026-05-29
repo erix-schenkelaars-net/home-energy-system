@@ -1,0 +1,6 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.5, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+rootdir: /home/pi/docker
+plugins: cov-7.1.0, typeguard-4.4.2, anyio-4.8.0
+collecting ... 

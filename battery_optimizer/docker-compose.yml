@@ -1,0 +1,17 @@
+services:
+
+  energy_simulator:
+
+    build: .
+
+    container_name: battery_optimizer
+
+    volumes:
+      - ./output:/output
+      - ./logs:/logs
+      - ../read_growatt/sph5k.conf:/app/sph5k.conf:ro
+    env_file:
+      - ../.env
+
+    restart: unless-stopped
+    stop_grace_period: 2s

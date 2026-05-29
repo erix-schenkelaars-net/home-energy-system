@@ -1,0 +1,21 @@
+services:
+  p1_reader:
+    build: .
+    container_name: p1_reader
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: "host"
+#    devices:
+#      - /dev/ttyP1:/dev/ttyP1  #p1 port
+#      - /dev/ttySPH:/dev/ttySPH #sph5000 meter port
+    privileged: true
+    environment:
+      - TZ=Europe/Amsterdam
+    env_file:
+      - ../.env
+    volumes:
+      - /dev:/dev
+      - .:/app
+      - ./logs:/logs
+    group_add:
+      - dialout

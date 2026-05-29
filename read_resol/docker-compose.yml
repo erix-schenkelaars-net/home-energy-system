@@ -1,0 +1,15 @@
+services:
+  resol_2_erix_db:
+    build: .
+    container_name: resol_2_erix_db
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: "host"
+    env_file:
+      - ../.env
+    environment:
+      - TZ=Europe/Amsterdam
+    volumes:
+      # Map de lokale folder met je script/config naar /app in de container
+      - .:/app
+      - ./logs:/logs

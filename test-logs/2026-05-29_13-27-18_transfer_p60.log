@@ -1,0 +1,26 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.5, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+rootdir: /home/pi/docker
+plugins: cov-7.1.0, typeguard-4.4.2, anyio-4.8.0
+collecting ... collected 17 items
+
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_comma_replaced_by_dot PASSED [  5%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_float PASSED [ 11%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_integer PASSED [ 17%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_invalid_string_returns_none PASSED [ 23%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_long_number_truncated_to_6_chars PASSED [ 29%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_negative PASSED [ 35%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_none_returns_none PASSED [ 41%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_short_string_padded_to_4_chars PASSED [ 47%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_string_integer PASSED [ 52%]
+transfer_p60/test_transfer_p60_pub.py::TestFormatNumberString::test_zero PASSED [ 58%]
+transfer_p60/test_transfer_p60_pub.py::TestOnMessage::test_invalid_json_does_not_crash PASSED [ 64%]
+transfer_p60/test_transfer_p60_pub.py::TestOnMessage::test_payload_content_preserved PASSED [ 70%]
+transfer_p60/test_transfer_p60_pub.py::TestOnMessage::test_valid_message_stored PASSED [ 76%]
+transfer_p60/test_transfer_p60_pub.py::TestOnMessage::test_wrong_topic_not_stored PASSED [ 82%]
+transfer_p60/test_transfer_p60_pub.py::TestConnectToErixDb::test_calls_mysql_connect PASSED [ 88%]
+transfer_p60/test_transfer_p60_pub.py::TestConnectToErixDb::test_passes_correct_database PASSED [ 94%]
+transfer_p60/test_transfer_p60_pub.py::TestConnectToErixDb::test_passes_correct_host PASSED [100%]
+
+============================== 17 passed in 0.03s ==============================

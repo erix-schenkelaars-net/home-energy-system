@@ -1,0 +1,13 @@
+services:
+  read_bmw:
+    build: .
+    container_name: read_bmw
+    restart: unless-stopped
+    stop_grace_period: 2s
+    environment:
+      - TZ=Europe/Amsterdam
+    env_file:
+      - ../.env
+    volumes:
+      - ./bmw_tokens.json:/app/bmw_tokens.json
+      - ./logs:/logs

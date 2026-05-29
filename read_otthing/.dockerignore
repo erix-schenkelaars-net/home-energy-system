@@ -1,0 +1,11 @@
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+old_stuff/
+old-stuf/
+venv/
+.env
+alter_table_otthing.sql
+test_*.py

@@ -1,0 +1,11 @@
+services:
+  ha_p60_data_2_erix_db:
+    build: .
+    container_name: ha_p60_data_2_erix_db
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: host
+    env_file:
+      - ../.env
+    volumes:
+      - ./logs:/logs
