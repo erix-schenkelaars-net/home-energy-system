@@ -5,7 +5,7 @@
 #   */15 * * * *  /home/pi/docker/check-containers.sh
 #   0 7   * * *   /home/pi/docker/check-containers.sh --summary
 
-MAILTO="debian-pi5new@schenkelaars.net"
+MAILTO="${ALERT_EMAIL:-admin@example.com}"
 STATE_FILE="/home/pi/docker/.container_health_state"
 HOST=$(hostname -s)
 NOW=$(date '+%Y-%m-%d %H:%M')
