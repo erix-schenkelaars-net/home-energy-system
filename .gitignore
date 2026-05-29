@@ -25,3 +25,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+test-logs/
+.container_health_state
+.vscode/
