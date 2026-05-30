@@ -197,8 +197,6 @@ WIP = Path(__file__).stem.split("_")[-1]  # derived from filename; always correc
 log = logging.getLogger(f"battery_optimizer_lp_{WIP}")
 log.info("Starting: %s", os.path.basename(__file__))
 
-optimizer_owns_ev_plug = False  # runtime flag: True only if optimizer turned plug ON
-
 
 def ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -1849,6 +1847,51 @@ def set_ha_switch(entity_id: str, turn_on: bool) -> bool:
     return False
 
 
+def set_ev_plug_control_flag(set_control: bool) -> bool:
+    """Mark in battery_schedule that optimizer controls the plug."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        now = datetime.now()
+        flag_val = 1 if set_control else 0
+        time_window = now - timedelta(hours=3)
+        cursor.execute(
+            f"UPDATE {DB_TABLE} SET ev_plug_control = %s "
+            "WHERE slot_dt >= %s AND slot_dt <= %s",
+            (flag_val, time_window, now + timedelta(hours=3))
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        log.warning("EV plug control flag update failed: %s", e)
+        return False
+
+
+def ev_plug_is_optimizer_controlled() -> bool:
+    """Check if optimizer has control (persistent flag in battery_schedule DB)."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        now = datetime.now()
+        time_window = now - timedelta(hours=3)
+        cursor.execute(
+            f"SELECT COUNT(*) FROM {DB_TABLE} "
+            "WHERE slot_dt >= %s AND slot_dt <= %s AND ev_plug_control = 1 "
+            "LIMIT 1",
+            (time_window, now + timedelta(hours=3))
+        )
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        has_control = result and result[0] > 0
+        return has_control
+    except Exception as e:
+        log.warning("EV plug control flag check failed: %s", e)
+        return False
+
+
 def ev_optimal_start(current_hour: int, prices: dict[int, float], soc: float) -> int:
     """Find optimal hour to start EV charging using quarter-slot prices.
 
@@ -1884,18 +1927,17 @@ def ev_optimal_start(current_hour: int, prices: dict[int, float], soc: float) ->
 
 
 def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, Optional[float]]:
-    global optimizer_owns_ev_plug
     log.info("EV charge check...")
 
     at_home = ev_at_home()
     if at_home is False:
         plug_state = get_ha_switch_state(HA_EV_PLUG_ENTITY)
-        if plug_state == "on" and optimizer_owns_ev_plug:
+        if plug_state == "on" and ev_plug_is_optimizer_controlled():
             log.info("EV: car not at home — turning plug OFF")
             set_ha_switch(HA_EV_PLUG_ENTITY, False)
-            optimizer_owns_ev_plug = False
+            set_ev_plug_control_flag(False)
         elif plug_state == "on":
-            log.info("EV: car not at home, but plug was not turned ON by optimizer — skipping OFF")
+            log.info("EV: car not at home, but plug controlled by HA/remote — skipping OFF")
         else:
             log.info("EV: car not at home — skipping charge")
         return False, None
@@ -1913,14 +1955,14 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
     log.info("EV: SoC=%s%%  charging_status=%s  plug=%s",
              f"{soc:.0f}" if soc is not None else "?", charging_status, plug_state)
 
-    # BMW reports done -> stop only if optimizer owns the plug
+    # BMW reports done -> stop if optimizer controls the plug
     if charging_status == "CHARGINGENDED":
-        if plug_state == "on" and optimizer_owns_ev_plug:
+        if plug_state == "on" and ev_plug_is_optimizer_controlled():
             log.info("EV: CHARGINGENDED — turning plug OFF")
             set_ha_switch(HA_EV_PLUG_ENTITY, False)
-            optimizer_owns_ev_plug = False
+            set_ev_plug_control_flag(False)
         elif plug_state == "on":
-            log.info("EV: CHARGINGENDED, but plug was not turned ON by optimizer — skipping OFF")
+            log.info("EV: CHARGINGENDED, but plug controlled by HA/remote — skipping OFF")
         else:
             log.info("EV: CHARGINGENDED, plug already off")
         return False, soc
@@ -1962,7 +2004,7 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
     log.info("EV: optimal window (start=%d now=%d), SoC=%.0f%% — turning plug ON",
              optimal_start, current_hour, soc)
     set_ha_switch(HA_EV_PLUG_ENTITY, True)
-    optimizer_owns_ev_plug = True
+    set_ev_plug_control_flag(True)
 
     log.info("EV: waiting %ds for power response...", EV_POWER_CHECK_WAIT_S)
     time.sleep(EV_POWER_CHECK_WAIT_S)
@@ -2127,12 +2169,12 @@ def _sleep_until_next_quarter():
         soc, charging_status, _ = read_bmw_state_mqtt()
 
         if charging_status == "CHARGINGENDED":
-            if optimizer_owns_ev_plug:
+            if ev_plug_is_optimizer_controlled():
                 log.info("EV poll: CHARGINGENDED — turning plug OFF")
                 set_ha_switch(HA_EV_PLUG_ENTITY, False)
-                optimizer_owns_ev_plug = False
+                set_ev_plug_control_flag(False)
             else:
-                log.info("EV poll: CHARGINGENDED, but plug was not turned ON by optimizer — skipping OFF")
+                log.info("EV poll: CHARGINGENDED, but plug controlled by HA/remote — skipping OFF")
             continue
 
         power_w = get_ha_sensor_float(HA_EV_PLUG_POWER_ENTITY)
