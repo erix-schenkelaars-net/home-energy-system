@@ -1850,24 +1850,37 @@ def set_ha_switch(entity_id: str, turn_on: bool) -> bool:
 
 
 def ev_optimal_start(current_hour: int, prices: dict[int, float], soc: float) -> int:
+    """Find optimal hour to start EV charging using quarter-slot prices.
+
+    Returns: hour (0-23) to start charging. Real start may be within that hour
+    depending on quarter-slot optimization in LP (compute_ev_load_schedule).
+    """
     energy_needed = max(0.0, (BMW_TARGET_SOC_PCT - soc) / 100.0 * BMW_BATTERY_KWH)
-    hours_needed  = math.ceil(energy_needed / BMW_CHARGE_POWER_KW)
-    deadline      = BMW_READY_BY_HOUR if current_hour < BMW_READY_BY_HOUR else BMW_READY_BY_HOUR + 24
-    must_start_by = deadline - hours_needed
-    if current_hour >= must_start_by:
-        return current_hour
-    best_start = must_start_by
-    best_cost  = float("inf")
-    for start in range(current_hour, must_start_by + 1):
-        window = list(range(start, start + hours_needed))
-        if not all(h in prices for h in window):
+    qtrs_needed   = math.ceil(energy_needed / (BMW_CHARGE_POWER_KW * SLOT_H))
+
+    deadline_hour = BMW_READY_BY_HOUR if current_hour < BMW_READY_BY_HOUR else BMW_READY_BY_HOUR + 24
+    must_start_by_qtr = deadline_hour * 4 - qtrs_needed
+    current_qtr = current_hour * 4
+
+    if current_qtr >= must_start_by_qtr:
+        return current_hour  # already in last-chance window
+
+    best_start_hour = current_hour
+    best_cost = float("inf")
+
+    for start_qtr in range(current_qtr, must_start_by_qtr + 1):
+        window_qtrs = list(range(start_qtr, start_qtr + qtrs_needed))
+        if not all(q in prices for q in window_qtrs):
             continue
-        cost = sum(prices[h] + ENERGY_TAX_EUR_KWH + ENERGY_INKOOPVERGOEDING_EUR_KWH for h in window)
+        cost = sum(prices[q] + ENERGY_TAX_EUR_KWH + ENERGY_INKOOPVERGOEDING_EUR_KWH
+                   for q in window_qtrs)
         if cost < best_cost:
-            best_cost, best_start = cost, start
-    log.info("EV: SoC=%.0f%%  need=%dh  deadline=%d  best_start=%d  est_cost=€%.3f",
-             soc, hours_needed, deadline, best_start, best_cost)
-    return best_start
+            best_cost = cost
+            best_start_hour = start_qtr // 4
+
+    log.info("EV: SoC=%.0f%%  need=%.1fh (%dqtr)  deadline=%d  best_start=%d  est_cost=€%.3f",
+             soc, energy_needed / BMW_CHARGE_POWER_KW, qtrs_needed, deadline_hour, best_start_hour, best_cost)
+    return best_start_hour
 
 
 def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, Optional[float]]:
