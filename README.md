@@ -6,20 +6,23 @@ A set of containerised Python services that monitor, optimise, and control a hom
 
 > **Hardware:** 
 > Single Raspberry Pi 5 (8GB RAM) with MariaDB database on USB SSD
+> 3 rs485 to USB converters (with opto-coupling)
 > All 9 services running simultaneously via Docker Compose
 
-## Hardware overview
+## Hardware device overview
 
-| Device | Role |
-|--------|------|
-| Growatt SPH5000 | Hybrid inverter — PV, battery, grid, loads |
-| Seplos 16 kWh LiFePO4 | Battery (20–89.5 % SoC operating range) |
-| 6.24 kWp solar PV | Two strings: east (88°) + west (272°), 35° tilt |
-| Weheat P60 heat pump | Main space-heating load |
-| BMW i3 EV | 7.7 kWh, 2.3 kW AC charge via Antela smart plug |
-| DSMR P1 smart meter | Real-time grid import/export |
-| Resol solar controller | Solar thermal system (DHW + wood gasifier) |
-| otgw-thing (OTThing) | OpenTherm gateway to Honeywell Sparrow60 boiler |
+|-----------------------------------------|-------------------------------------------------|
+| Device                                  | Role                                            |
+|-----------------------------------------|-------------------------------------------------|
+| Growatt SPH5000 over 2 x rs485/USB      | Hybrid inverter — PV, battery, grid, loads      |
+| Seplos 16 kWh LiFePO4 over rs485/USB    | Battery (20–89.5 % SoC operating range)         |
+| Solar PV 6.24 kWp                       | Two strings: east (88°) + west (272°), 35° tilt |
+| Weheat sparrow P60 heat pump over cloud | Main space-heating load                         |
+| BMW 225XE Electric Vehicle over cloud   | 7.7 kWh, 2.3 kW AC charge via Antela smart plug |
+| DSMR P1 smart meter over wifi           | Real-time grid import/export                    | 
+| Resol solar controller over ethernet    | Solar thermal system (DHW + wood gasifier)      |
+| otgw-thing (OTThing) over wifi          | OpenTherm gateway to Honeywell Sparrow60 boiler |
+|-----------------------------------------|-------------------------------------------------|
 
 ## Services at a glance
 
