@@ -443,6 +443,105 @@ def _load_weather_cache() -> tuple[dict, dict[int, float]]:
         return {}, {}
 
 
+def _fetch_om_fullday_ghi(target) -> dict[int, dict]:
+    """Open-Meteo horizontal GHI for the FULL day (all 24 h), keyed by hour 0..23.
+
+    Independent of fetch_weather(), which keeps only future hours and so cannot
+    reconstruct the morning. Mirrors the dashboard's _fetch_om so the OM-raw
+    reference total stays identical on both sides.
+    """
+    today = datetime.now().date()
+    dd = (today - target).days
+    params = {
+        "latitude":      LAT,
+        "longitude":     LON,
+        "hourly":        "direct_radiation,diffuse_radiation",
+        "timezone":      "Europe/Amsterdam",
+        "past_days":     dd + 1 if dd > 0 else 0,
+        "forecast_days": 1 if dd > 0 else abs(dd) + 2,
+    }
+    try:
+        r = requests.get(OPEN_METEO_URL, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.warning("OM-raw full-day fetch failed: %s", exc)
+        return {}
+    hourly = data.get("hourly", {})
+    prefix = target.strftime("%Y-%m-%d")
+    out: dict[int, dict] = {}
+    for i, t in enumerate(hourly.get("time", [])):
+        if t.startswith(prefix):
+            out[int(t[11:13])] = {
+                "direct":  float(hourly["direct_radiation"][i]  or 0),
+                "diffuse": float(hourly["diffuse_radiation"][i] or 0),
+            }
+    return out
+
+
+def om_raw_quarter_kwh(target) -> list[float]:
+    """Per-quarter (96 slots) OM-raw PV (kWh) for `target` — pure Open-Meteo GHI.
+
+    Weather-only reference baseline, independent of the (forward-only) schedule.
+    Same per-quarter formula and end-of-hour GHI labelling as the dashboard's
+    build_pv_forecast, so the OM-raw curve matches on both sides.
+
+    Returns [] (not zeros) if the Open-Meteo fetch failed, so callers can tell a
+    genuine all-night zero day apart from a fetch failure and avoid overwriting a
+    good cached curve.
+    """
+    om = _fetch_om_fullday_ghi(target)
+    if not om:
+        return []
+    out: list[float] = []
+    for s in range(96):
+        hr  = s // 4
+        rad = om.get((hr + 1) % 24 if hr < 23 else 23, {})
+        ghi = rad.get("direct", 0.0) + rad.get("diffuse", 0.0)
+        out.append(min((ghi / 1000.0) * (PANEL_EAST_KWP + PANEL_WEST_KWP) * PANEL_EFF_CAL,
+                       PEAK_MEASURED_KW) * SLOT_H)
+    return out
+
+
+def total_om_raw_kwh(target) -> float:
+    """Full-day OM-raw PV total (kWh) = sum of the 96 quarter values."""
+    return sum(om_raw_quarter_kwh(target))
+
+
+def ensure_om_cache_table(conn):
+    """Cache of the per-quarter OM-raw curve so the dashboard reads it from the DB
+    (≤15 min old) instead of calling Open-Meteo itself. One row per slot_dt;
+    upserted each run, so it always holds the latest snapshot."""
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pv_om_forecast (
+            slot_dt    DATETIME NOT NULL PRIMARY KEY,
+            om_raw_kwh FLOAT,
+            created_at DATETIME NOT NULL,
+            INDEX (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    conn.commit()
+    cur.close()
+
+
+def write_om_forecast_cache(conn, target, quarters: list[float], run_ts: datetime):
+    """Upsert the 96 per-quarter OM-raw values for `target` (latest snapshot)."""
+    rows = [
+        (datetime(target.year, target.month, target.day, s // 4, (s % 4) * 15),
+         float(quarters[s]), run_ts)
+        for s in range(96)
+    ]
+    cur = conn.cursor()
+    cur.executemany("""
+        INSERT INTO pv_om_forecast (slot_dt, om_raw_kwh, created_at)
+        VALUES (%s,%s,%s)
+        ON DUPLICATE KEY UPDATE om_raw_kwh=VALUES(om_raw_kwh), created_at=VALUES(created_at)
+    """, rows)
+    conn.commit()
+    cur.close()
+
+
 def _fetch_forecast_solar() -> dict:
     panels   = [
         (PANEL_EAST_KWP, PANEL_TILT, PANEL_EAST_AZI - 180),
@@ -924,6 +1023,8 @@ def ensure_schedule_table(conn):
         ("gti_west_wm2",     "FLOAT"),
         ("pv_source",        "VARCHAR(20)"),
         ("hp_correction_kwh","FLOAT"),
+        ("total_om_raw_kwh",  "FLOAT"),
+        ("total_optimizer_kwh","FLOAT"),
     ]:
         try:
             cur.execute(f"ALTER TABLE battery_schedule ADD COLUMN {col} {typedef}")
@@ -939,7 +1040,7 @@ def ensure_schedule_table(conn):
 
 def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "OK"):
     ensure_schedule_table(conn)
-    now = datetime.now()
+    now = datetime.now().replace(microsecond=0)  # second precision: matches DATETIME col for created_at equality
     cur = conn.cursor()
     qtr_min = (now.minute // 15) * 15
     cur.execute("DELETE FROM battery_schedule WHERE applied=0 AND slot_dt >= %s",
@@ -966,8 +1067,49 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
             slot.pv_source or None, slot.hp_correction_kwh,
         ))
     conn.commit()
+
+    today = now.date()
+
+    # Optimizer full-day total as known at THIS run: latest forecast per today
+    # quarter-slot. Past slots persist from earlier runs, so the morning is
+    # recovered from the DB even though this run's schedule is forward-only.
+    cur.execute("""SELECT pv_kwh, slot_dt FROM battery_schedule
+                   WHERE DATE(slot_dt)=%s
+                   ORDER BY slot_dt ASC, created_at DESC""", (today.isoformat(),))
+    seen, total_optimizer = set(), 0.0
+    for pv_kwh, slot_dt in cur.fetchall():
+        slot_q = slot_dt.hour * 4 + slot_dt.minute // 15
+        if slot_q not in seen:
+            seen.add(slot_q)
+            total_optimizer += float(pv_kwh) if pv_kwh else 0.0
+
+    # OM-raw full-day curve (per quarter) for today + tomorrow, fetched directly
+    # from Open-Meteo so the morning is always included. Cached in pv_om_forecast
+    # so the dashboard reads the OM-raw line from the DB (≤15 min old) — the exact
+    # snapshot the optimizer worked with — instead of calling Open-Meteo itself.
+    ensure_om_cache_table(conn)
+    om_today     = om_raw_quarter_kwh(today)
+    total_om_raw = sum(om_today)  # 0.0 if Open-Meteo was unreachable this run
+    if om_today:
+        write_om_forecast_cache(conn, today, om_today, now)
+        tomorrow = today + timedelta(days=1)
+        om_tomorrow = om_raw_quarter_kwh(tomorrow)
+        if om_tomorrow:
+            write_om_forecast_cache(conn, tomorrow, om_tomorrow, now)
+    else:
+        log.warning("OM-raw: Open-Meteo unreachable this run — keeping cached curve")
+
+    # Tag this run's today-rows with both totals so the dashboard can plot the
+    # forecast's evolution (one point per created_at).
+    cur.execute("""UPDATE battery_schedule
+                   SET total_optimizer_kwh=%s, total_om_raw_kwh=%s
+                   WHERE DATE(slot_dt)=%s AND created_at=%s""",
+                (total_optimizer, total_om_raw, today.isoformat(), now))
+    conn.commit()
     cur.close()
-    log.info("Wrote %d schedule slots to DB (%s  solver=%s)", len(schedule), WIP, solver_status)
+    log.info("Wrote %d schedule slots to DB (%s  solver=%s) | Daily forecast: "
+             "optimizer=%.2f kWh  OM-raw=%.2f kWh",
+             len(schedule), WIP, solver_status, total_optimizer, total_om_raw)
 
 
 def mark_slot_applied(conn, slot_dt: datetime):

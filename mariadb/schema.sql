@@ -199,9 +199,29 @@ CREATE TABLE IF NOT EXISTS `battery_schedule` (
   `gti_west_wm2`        float        DEFAULT NULL COMMENT 'KNMI GTI west string W/m²',
   `pv_source`           varchar(20)  DEFAULT NULL COMMENT 'GTI_KNMI | GHI_OM | CLEARSKY',
   `hp_correction_kwh`   float        DEFAULT NULL COMMENT 'Heat pump load correction kWh',
+  `total_om_raw_kwh`    float        DEFAULT NULL COMMENT 'Total OM-raw GHI forecast for this day kWh',
+  `total_optimizer_kwh` float        DEFAULT NULL COMMENT 'Total optimizer PV forecast for this day kWh',
 
   PRIMARY KEY (`id`),
   KEY `slot_dt` (`slot_dt`),
+  KEY `created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- pv_om_forecast
+-- ---------------------------------------------------------------------------
+-- Per-quarter OM-raw (pure Open-Meteo GHI) PV forecast curve, one row per slot.
+-- Written by battery_optimizer every run (upsert: latest snapshot only) so the
+-- dashboards read the OM-raw reference line from the DB (≤15 min old) instead of
+-- calling Open-Meteo themselves. Covers today + tomorrow.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `pv_om_forecast` (
+  `slot_dt`     datetime  NOT NULL COMMENT 'Quarter-hour slot start (local time)',
+  `om_raw_kwh`  float     DEFAULT NULL COMMENT 'OM-raw PV forecast for this slot kWh',
+  `created_at`  datetime  NOT NULL COMMENT 'Timestamp of the optimiser run that wrote this',
+
+  PRIMARY KEY (`slot_dt`),
   KEY `created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
