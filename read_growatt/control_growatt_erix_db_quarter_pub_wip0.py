@@ -577,7 +577,13 @@ def write_sph5k_reg(client, reg, value, device_id=INVERTER_UNIT_ID):
     u16      = to_uint16(value)
     display  = u16 - 65536 if u16 > 32767 else u16
     dbg(2, "SPH", f"WRITE {reg_name} ({reg}) = {display}")
-    client.write_register(reg, u16, device_id=device_id)
+    # pymodbus renamed the unit kwarg: <=3.8 uses 'slave', >=3.9 uses 'device_id'.
+    # An unexpected-keyword TypeError is raised at call binding (nothing is sent on
+    # the wire), so falling back to the other name is safe.
+    try:
+        client.write_register(reg, u16, slave=device_id)
+    except TypeError:
+        client.write_register(reg, u16, device_id=device_id)
 
 
 def modbus_write_init_registers(client):
@@ -1441,7 +1447,7 @@ def read_conf(path=CONF_PATH) -> Conf:
         cfg.pv_off_at_soc = None
     if cfg.pv_off_at_soc:
         dbg(1, "CONF", f"pv_off_at_soc={cfg.pv_off_at_soc}%  "
-                       f"(resume at SoC <= {cfg.pv_off_at_soc - 2}%)")
+                       f"(resume at SoC <= {cfg.pv_off_at_soc - 5}%)")
 
     # ==============================================================
     # PARSE SCHEDULES
@@ -1798,16 +1804,16 @@ def main_loop():
         if cfg.control_source == "DB" and db_slot is not None:
             pv_curtail_kwh = float(db_slot.get("pv_curtail_kwh") or 0.0)
 
-        # SoC-based curtailment latch (±2% hysteresis)
+        # SoC-based curtailment latch (±5% hysteresis)
         pv_off_soc = cfg.pv_off_at_soc
         if pv_off_soc is not None:
             if not _pv_soc_curtail and soc_glob >= pv_off_soc:
                 _pv_soc_curtail = True
                 dbg(1, "SPH", f"PV SoC-curtail ACTIVE: SoC={soc_glob:.1f}% >= threshold={pv_off_soc}%"
-                              f"  (resume at <= {pv_off_soc - 2}%)")
-            elif _pv_soc_curtail and soc_glob <= (pv_off_soc - 2):
+                              f"  (resume at <= {pv_off_soc - 5}%)")
+            elif _pv_soc_curtail and soc_glob <= (pv_off_soc - 5):
                 _pv_soc_curtail = False
-                dbg(1, "SPH", f"PV SoC-curtail INACTIVE: SoC={soc_glob:.1f}% <= {pv_off_soc - 2}%"
+                dbg(1, "SPH", f"PV SoC-curtail INACTIVE: SoC={soc_glob:.1f}% <= {pv_off_soc - 5}%"
                               f"  (panels resumed)")
         else:
             _pv_soc_curtail = False   # disabled in conf -> clear latch
