@@ -68,5 +68,5 @@ If any delta goes negative (midnight rollover during the 5-minute cycle), it is 
 
 | Variable | Purpose |
 |----------|---------|
-| `DSMR_URL` | REST endpoint of the DSMR P1 reader (e.g. `http://192.168.178.220/api/v2/sm/actual`) |
+| `DSMR_URL` | REST endpoint of the DSMR P1 reader (e.g. `http://<P1_READER_HOST>/api/v2/sm/actual`) |
 | `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_TABLE` | MariaDB credentials |

@@ -4,10 +4,10 @@ A set of containerised Python services that monitor, optimise, and control a hom
 
 # Home Energy System
 
-> **Hardware:** 
-> Single Raspberry Pi 5 (8GB RAM) with MariaDB database on USB SSD
-> 3 rs485 to USB converters (with opto-coupling)
-> All 9 services running simultaneously via Docker Compose
+**Hardware:** 
+\- Single Raspberry Pi 5 (8GB RAM) with MariaDB database on USB SSD
+\- 3 rs485 to USB converters (with opto-coupling)
+\- All 9 services running simultaneously via Docker Compose
 
 ## Hardware device overview
 
@@ -75,9 +75,9 @@ A set of containerised Python services that monitor, optimise, and control a hom
 
 | Resource | Value | Used by |
 |----------|-------|---------|
-| MariaDB | `192.168.178.240:3306`, db `erix_db` | all services |
-| MQTT broker | `192.168.178.251:1883` | battery_optimizer, read_growatt, read_bmw, read_resol, read_otthing, transfer_p60 |
-| Home Assistant | `192.168.178.251:8123` | battery_optimizer (EV plug control) |
+| MariaDB | `<MARIADB_HOST>:3306`, db `erix_db` | all services |
+| MQTT broker | `<MQTT_HOST>:1883` | battery_optimizer, read_growatt, read_bmw, read_resol, read_otthing, transfer_p60 |
+| Home Assistant | `<HA_HOST>:8123` | battery_optimizer (EV plug control) |
 | `.env` file | `~/docker/.env` | all services (via `load_dotenv`) |
 
 ## Canonical inverter action names

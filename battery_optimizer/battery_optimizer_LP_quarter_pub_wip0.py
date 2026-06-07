@@ -120,7 +120,6 @@ def _parse_env_date(key: str, fallback: date) -> date:
 
 
 CONTRACT_END_DATE  = _parse_env_date("CONTRACT_END_DATE",  date(2026, 6, 16))
-SALDERING_END_DATE = _parse_env_date("SALDERING_END_DATE", date(2026, 12, 31))
 
 SIMULATE_POST_JULY = False  # set True to test DYNAMIC_PRICE mode before contract start
 
@@ -129,10 +128,63 @@ def optimizer_mode() -> str:
     return "MINIMIZE_EXPORT" if date.today() <= CONTRACT_END_DATE else "DYNAMIC_PRICE"
 
 
-# All tariffs incl. 21% VAT (EnergyZero API: base_with_vat = EPEX spot + VAT, excl. energy tax)
-ENERGY_TAX_EUR_KWH              = 0.110848
-ENERGY_INKOOPVERGOEDING_EUR_KWH = 0.0100   # purchase surcharge incl. VAT
-VERKOOP_VERGOEDING_EUR_KWH      = 0.0100   # feed-in surcharge incl. VAT
+# ---------------------------------------------------------------------------
+# ENERGY TARIFFS — single source of truth is the erix_db.energy_tariffs table
+# (also read by the WordPress "Energiekosten" dashboard). Date-versioned, all
+# prices incl. 21% VAT; the per-period saldering flag drives the export model.
+# Loaded once from the DB at startup via load_tariffs_from_db(); the fallback
+# below mirrors the table and is only used if that read fails.
+# ---------------------------------------------------------------------------
+@dataclass
+class Tariff:
+    valid_from:            date
+    valid_until:           Optional[date]
+    inkoopvergoeding_kwh:  float
+    energiebelasting_kwh:  float
+    verkoopvergoeding_kwh: float
+    saldering:             bool
+
+
+_TARIFFS: list[Tariff] = [
+    Tariff(date(2026, 6, 1), date(2026, 12, 31), 0.0100, 0.110848, 0.0100, True),
+    Tariff(date(2027, 1, 1), None,               0.0100, 0.110848, 0.0100, False),
+]
+
+
+def load_tariffs_from_db(conn) -> None:
+    """Load date-versioned electricity tariffs from the energy_tariffs table."""
+    global _TARIFFS
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        "SELECT valid_from, valid_until, elec_inkoopvergoeding_kwh, "
+        "elec_energiebelasting_kwh, elec_verkoopvergoeding_kwh, saldering_active "
+        "FROM energy_tariffs ORDER BY valid_from"
+    )
+    rows = cur.fetchall()
+    cur.close()
+    if not rows:
+        log.warning("energy_tariffs is empty — keeping fallback tariffs")
+        return
+    _TARIFFS = [
+        Tariff(r["valid_from"], r["valid_until"],
+               float(r["elec_inkoopvergoeding_kwh"]),
+               float(r["elec_energiebelasting_kwh"]),
+               float(r["elec_verkoopvergoeding_kwh"]),
+               bool(r["saldering_active"]))
+        for r in rows
+    ]
+    log.info("Loaded %d tariff period(s) from energy_tariffs (latest valid_from %s, saldering=%s)",
+             len(_TARIFFS), _TARIFFS[-1].valid_from, _TARIFFS[-1].saldering)
+
+
+def tariff_for(d: date) -> Tariff:
+    """Return the tariff period active on date d (clamps to nearest edge if out of range)."""
+    for t in _TARIFFS:
+        if t.valid_from <= d and (t.valid_until is None or d <= t.valid_until):
+            return t
+    return _TARIFFS[0] if d < _TARIFFS[0].valid_from else _TARIFFS[-1]
+
+
 FIXED_TARIFF_EUR_KWH            = 0.28
 FIXED_EXPORT_EUR_KWH            = 0.28
 
@@ -256,15 +308,18 @@ class HourSlot:
         return self.dt.minute
 
     def import_price(self) -> float:
-        return self.price_eur_kwh + ENERGY_TAX_EUR_KWH + ENERGY_INKOOPVERGOEDING_EUR_KWH
+        t = tariff_for(self.dt.date())
+        return self.price_eur_kwh + t.energiebelasting_kwh + t.inkoopvergoeding_kwh
 
     def export_price(self) -> float:
-        # Until saldering ends: exported kWh offsets energy tax + purchase surcharge.
-        # After saldering: private consumer receives only EPEX excl. VAT minus feed-in surcharge.
-        if date.today() <= SALDERING_END_DATE:
-            return self.import_price() - VERKOOP_VERGOEDING_EUR_KWH
+        # During saldering: exported kWh offset the full retail import (incl. energy
+        # tax + purchase surcharge), minus the feed-in surcharge.
+        # After saldering: consumer receives only EPEX excl. VAT minus the feed-in surcharge.
+        t = tariff_for(self.dt.date())
+        if t.saldering:
+            return self.import_price() - t.verkoopvergoeding_kwh
         else:
-            return self.price_eur_kwh / 1.21 - VERKOOP_VERGOEDING_EUR_KWH
+            return self.price_eur_kwh / 1.21 - t.verkoopvergoeding_kwh
 
 
 # ---------------------------------------------------------------------------
@@ -1213,12 +1268,13 @@ def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
                      else BMW_READY_BY_HOUR + 24) * 4)
 
     candidates = []
+    _t = tariff_for(date.today())
     for i in range(n_slots):
         abs_qtr = start_qtr_idx + i
         if abs_qtr >= deadline_qtr:
             break
         p     = prices.get(abs_qtr, 0.25)
-        allin = p + ENERGY_TAX_EUR_KWH + ENERGY_INKOOPVERGOEDING_EUR_KWH
+        allin = p + _t.energiebelasting_kwh + _t.inkoopvergoeding_kwh
         candidates.append((allin, i))
 
     candidates.sort(key=lambda x: x[0])
@@ -2052,12 +2108,13 @@ def ev_optimal_start(current_hour: int, prices: dict[int, float], soc: float) ->
 
     best_start_hour = current_hour
     best_cost = float("inf")
+    _t        = tariff_for(date.today())
 
     for start_qtr in range(current_qtr, must_start_by_qtr + 1):
         window_qtrs = list(range(start_qtr, start_qtr + qtrs_needed))
         if not all(q in prices for q in window_qtrs):
             continue
-        cost = sum(prices[q] + ENERGY_TAX_EUR_KWH + ENERGY_INKOOPVERGOEDING_EUR_KWH
+        cost = sum(prices[q] + _t.energiebelasting_kwh + _t.inkoopvergoeding_kwh
                    for q in window_qtrs)
         if cost < best_cost:
             best_cost = cost
@@ -2178,6 +2235,8 @@ def main(dry_run: bool = False):
     except Exception as exc:
         log.error("Cannot connect to MariaDB: %s", exc)
         sys.exit(1)
+
+    load_tariffs_from_db(conn)
 
     state   = read_current_state(conn)
     soc_pct = state.get("seplos_soc_pct")
