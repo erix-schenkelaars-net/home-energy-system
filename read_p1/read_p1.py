@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-read_p1_erix_db_pub_wip0.py
+read_p1.py
 ============================
 P1 smart meter reader for Growatt SPH5000 home energy system.
 
@@ -34,6 +34,13 @@ from collections import deque
 from datetime import datetime
 import struct
 import mysql.connector
+import sys
+# common/ wordt read-only gemount in de container (/app/common) en ligt op de host in de repo-root;
+# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from common import energy_cost as ec   # gedeelde, canonieke kostenberekening
 
 
 # --------------------------------------------------
@@ -147,6 +154,12 @@ MYSQL_USER       = os.environ["DB_USER"]
 MYSQL_PASSWD     = os.environ["DB_PASSWORD"]
 MYSQL_DB_NAME    = os.environ["DB_NAME"]
 MYSQL_TABLE_NAME = os.environ["DB_TABLE"]
+
+# --- gedeelde kostenberekening (gevuld in init_cost_calc) ---
+_TARIFFS  = []
+_FIXED    = []
+_PREV_CUM = {"imp": None, "exp": None, "gas": None}   # vorige cumulatieve telwerkstand
+_PREV_TS  = None
 
 
 # ---------------------------
@@ -306,7 +319,11 @@ def update_erix_db_data(data):
         p1_energy_today_export_kwh = %s,
         p1_energy_today_kwh        = %s,
         p1_gas_today_m3            = %s,
-        p1_electricity_today_kwh   = %s
+        p1_electricity_today_kwh   = %s,
+        cost_elec_var_eur          = %s,
+        cost_elec_fix_eur          = %s,
+        cost_gas_var_eur           = %s,
+        cost_gas_fix_eur           = %s
     WHERE id=(SELECT id FROM {MYSQL_TABLE_NAME} ORDER BY id DESC LIMIT 1)
     """
     try:
@@ -322,6 +339,59 @@ def update_erix_db_data(data):
     finally:
         try: cur.close(); db.close()
         except Exception: pass
+
+
+def init_cost_calc():
+    """Laad gedeelde tarieven/vaste kosten en seed de vorige telwerkstand (na read_last_db_state)."""
+    global _TARIFFS, _FIXED, _PREV_CUM, _PREV_TS
+    try:
+        db = mysql.connector.connect(host=MYSQL_HOST, user=MYSQL_USER,
+                                     passwd=MYSQL_PASSWD, db=MYSQL_DB_NAME)
+        _TARIFFS = ec.load_tariffs(db)
+        _FIXED   = ec.load_fixed(db)
+        db.close()
+        if P1_LAST_DATA.get('p1_e_t1_i') is not None:
+            _PREV_CUM = {"imp": P1_LAST_DATA['p1_e_t1_i'] + P1_LAST_DATA['p1_e_t2_i'],
+                         "exp": P1_LAST_DATA['p1_e_t1_e'] + P1_LAST_DATA['p1_e_t2_e'],
+                         "gas": P1_LAST_DATA['p1_gas']}
+            _PREV_TS = datetime.now()
+        dbg(1, DEBUG_DB_UPDATE, "DB",
+            f"Cost calc actief: {len(_TARIFFS)} tarief- + {len(_FIXED)} vaste-kosten-periodes geladen")
+    except Exception as e:
+        dbg(1, DEBUG_DB_UPDATE, "DB", f"⛔ cost calc init faalde: {e}")
+
+
+def compute_interval_costs(ts, cum_imp, cum_exp, cum_gas):
+    """4 kostcomponenten (€) voor het interval sinds de vorige write.
+    Telwerk-delta (cumulatief, rollover-veilig) × werkelijke kwartierprijs — geen middeling."""
+    global _PREV_CUM, _PREV_TS
+    if _PREV_CUM["imp"] is None or _PREV_TS is None:
+        _PREV_CUM = {"imp": cum_imp, "exp": cum_exp, "gas": cum_gas}
+        _PREV_TS = ts
+        return (None, None, None, None)   # eerste write na (re)start: nog geen interval
+    d_imp = max(0.0, cum_imp - _PREV_CUM["imp"])
+    d_exp = max(0.0, cum_exp - _PREV_CUM["exp"])
+    d_gas = max(0.0, cum_gas - _PREV_CUM["gas"])
+    days  = max(0.0, (ts - _PREV_TS).total_seconds()) / 86400.0
+    res = (None, None, None, None)
+    try:
+        db = mysql.connector.connect(host=MYSQL_HOST, user=MYSQL_USER,
+                                     passwd=MYSQL_PASSWD, db=MYSQL_DB_NAME)
+        spot  = ec.elec_spot_for_ts(db, ts)
+        gspot = ec.gas_spot_for_day(db, ts.date())
+        db.close()
+        t = ec.tariff_for(_TARIFFS, ts.date())
+        f = ec.fixed_for(_FIXED, ts.date())
+        if t is not None and f is not None:
+            res = (round(ec.elec_var_eur(d_imp, d_exp, spot, t), 6),
+                   round(ec.elec_fix_eur(days, f), 6),
+                   round(ec.gas_var_eur(d_gas, gspot, t), 6),
+                   round(ec.gas_fix_eur(days, f), 6))
+    except Exception as e:
+        dbg(1, DEBUG_DB_UPDATE, "DB", f"⛔ interval-kostberekening faalde: {e}")
+    _PREV_CUM = {"imp": cum_imp, "exp": cum_exp, "gas": cum_gas}
+    _PREV_TS = ts
+    return res
 
 
 # ---------------------------
@@ -569,6 +639,12 @@ if __name__ == "__main__":
                 f"→ electricity_today={electricity_today:.3f} kWh  "
                 f"p_del_avg={p_del_db:.1f} W  p_ret_avg={p_ret_db:.1f} W")
 
+            # Realized kost over dit interval (telwerk-delta × werkelijke prijs)
+            cum_imp = P1_LAST_DATA['p1_e_t1_i'] + P1_LAST_DATA['p1_e_t2_i']
+            cum_exp = P1_LAST_DATA['p1_e_t1_e'] + P1_LAST_DATA['p1_e_t2_e']
+            cum_gas = P1_LAST_DATA['p1_gas']
+            c_ev, c_ef, c_gv, c_gf = compute_interval_costs(target, cum_imp, cum_exp, cum_gas)
+
             update_erix_db_data((
                 P1_LAST_DATA['p1_e_t1_i'],
                 P1_LAST_DATA['p1_e_t2_i'],
@@ -577,11 +653,12 @@ if __name__ == "__main__":
                 p_del_db,
                 p_ret_db,
                 P1_LAST_DATA['p1_gas'],
-                round(e_del_today, 1),
-                round(e_ret_today, 1),
-                round(e_net_today, 1),
-                round(gas_today, 1),
-                round(electricity_today, 1),
+                round(e_del_today, 2),
+                round(e_ret_today, 2),
+                round(e_net_today, 2),
+                round(gas_today, 2),
+                round(electricity_today, 2),
+                c_ev, c_ef, c_gv, c_gf,
             ))
 
             dbg(2, DEBUG_DB_UPDATE, "DB",
@@ -590,6 +667,7 @@ if __name__ == "__main__":
 
     read_last_db_state()
     read_yesterday_data()
+    init_cost_calc()
 
     threading.Thread(target=p1_rest_thread, daemon=True).start()
     time.sleep(2)

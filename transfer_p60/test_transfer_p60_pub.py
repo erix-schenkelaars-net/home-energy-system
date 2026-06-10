@@ -2,10 +2,10 @@
 """
 test_transfer_p60_pub.py
 =========================
-Unit tests for ha_p60_data_2_erix_db_pub_wip0.py.
+Unit tests for ha_p60_data_2.py.
 
 Run with:  python -m pytest test_transfer_p60_pub.py -v
-           python -m pytest test_transfer_p60_pub.py -v --cov=ha_p60_data_2_erix_db_pub_wip0 --cov-report=term-missing
+           python -m pytest test_transfer_p60_pub.py -v --cov=ha_p60_data_2 --cov-report=term-missing
 """
 
 import importlib.util
@@ -46,7 +46,7 @@ _here = str(Path(__file__).resolve().parent)
 if _here not in sys.path:
     sys.path.insert(0, _here)
 
-import ha_p60_data_2_erix_db_pub_wip0 as mod
+import ha_p60_data_2 as mod
 
 
 # ══════════════════════════════════════════════════════════════════════════════

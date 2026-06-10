@@ -2,10 +2,10 @@
 """
 test_read_p1_pub.py
 ====================
-Unit tests for read_p1_erix_db_pub_wip0.py.
+Unit tests for read_p1.py.
 
 Run with:  python -m pytest test_read_p1_pub.py -v
-           python -m pytest test_read_p1_pub.py -v --cov=read_p1_erix_db_pub_wip0 --cov-report=term-missing
+           python -m pytest test_read_p1_pub.py -v --cov=read_p1 --cov-report=term-missing
 """
 
 import os
@@ -46,7 +46,7 @@ _here = str(Path(__file__).resolve().parent)
 if _here not in sys.path:
     sys.path.insert(0, _here)
 
-import read_p1_erix_db_pub_wip0 as mod  # noqa: E402
+import read_p1 as mod  # noqa: E402
 
 
 # ══════════════════════════════════════════════════════════════════════════════

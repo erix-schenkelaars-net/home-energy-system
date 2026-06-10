@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-control_growatt_erix_db_quarter_pub_wip0.py
+control_growatt_quarter.py
 ============================================
 Quarter-slot (15-min) inverter controller for the Growatt SPH5000.
 
@@ -214,6 +214,16 @@ soc_schedule_lock: bool = False  # module-level init; main_loop() declares globa
 BAT_RATED_W               = 3000  # max battery charge/discharge power (W)
 DB_SCHEDULE_DISCHARGE_PCT = 100   # % for DISCHARGE action (full 3000 W)
 DB_SCHEDULE_EXPORT_PCT    = 100   # % for EXPORT action   (full 3000 W)
+
+# --------------------------------------------------
+# FORCE_MAX_CHARGE (temporary export-target measure until 2026-06-16)
+# When the optimizer schedules a CHARGE action, command the full 3 kW instead of
+# (charge_kw + measured PV surplus). PV - load is almost never > 3 kW, so the battery
+# absorbs essentially ALL PV surplus rather than exporting it -> protects the annual
+# export budget. Side effect: the inverter tops up from the grid when surplus < 3 kW
+# (extra import, no extra export). Overcharge is bounded by the 85%/80% PV-disconnect
+# latch. Set False to restore economic, surplus-tracking charge rates after 2026-06-16.
+FORCE_MAX_CHARGE          = True
 
 # --------------------------------------------------
 # BASE SOC GUARDS (independent from schedule latch)
@@ -904,11 +914,14 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
 
     if action in ("BATTERY_FIRST+CHARGE", "CHARGE"):
         charge_kw    = float(slot.get("charge_kw") or 3.0)
-        # Real-time surplus: current grid export (negative meter = export to grid)
+        # Real-time surplus: current grid export (negative meter = export to grid).
+        # Kept for the debug log below; only used for cfg.power when FORCE_MAX_CHARGE is off.
         pv_surplus   = max(0.0, -ac_meter_power_w) / 1000.0
         cfg.priority    = Priority.BATTERY_FIRST
         cfg.mode        = RunMode.CHARGE
-        cfg.power       = kw_to_pct(charge_kw + pv_surplus)
+        # FORCE_MAX_CHARGE: command full 3 kW so the battery soaks up all PV surplus
+        # instead of exporting it (see flag definition). Otherwise track charge_kw + surplus.
+        cfg.power       = 100 if FORCE_MAX_CHARGE else kw_to_pct(charge_kw + pv_surplus)
         cfg.ends_on     = Ends_on.TIME
         cfg.minutes_end = mins_remaining
         cfg.soc_end     = SOC_HIGH_STOP
@@ -947,7 +960,8 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
 
     dbg(2, "CONF", f"slot_to_conf: action={action} -> priority={cfg.priority}  "
                    f"mode={cfg.mode}  power={cfg.power}  mins_remaining={mins_remaining}"
-                   + (f"  (charge_kw={charge_kw:.2f}+pv_surplus={pv_surplus:.2f}kW  meter={ac_meter_power_w:.0f}W)"
+                   + (f"  ({'FORCED 3kW; ' if FORCE_MAX_CHARGE else ''}"
+                      f"charge_kw={charge_kw:.2f}+pv_surplus={pv_surplus:.2f}kW  meter={ac_meter_power_w:.0f}W)"
                       if action in ("BATTERY_FIRST+CHARGE", "CHARGE") else ""))
     return cfg
 

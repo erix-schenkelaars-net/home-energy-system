@@ -2,10 +2,10 @@
 """
 test_read_bmw_pub.py
 =====================
-Unit tests for read_bmw_pub_wip0.py.
+Unit tests for read_bmw.py.
 
 Run with:  python -m pytest test_read_bmw_pub.py -v
-           python -m pytest test_read_bmw_pub.py -v --cov=read_bmw_pub_wip0 --cov-report=term-missing
+           python -m pytest test_read_bmw_pub.py -v --cov=read_bmw --cov-report=term-missing
 """
 
 import os
@@ -41,7 +41,7 @@ if _here not in sys.path:
     sys.path.insert(0, _here)
 
 with patch("pathlib.Path.exists", return_value=False):
-    import read_bmw_pub_wip0 as mod
+    import read_bmw as mod
 
 
 # ══════════════════════════════════════════════════════════════════════════════

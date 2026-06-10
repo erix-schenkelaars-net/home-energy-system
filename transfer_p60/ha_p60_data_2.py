@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ha_p60_data_2_erix_db_pub_wip0.py
+ha_p60_data_2.py
 ===================================
 Transfers Weheat P60 heat pump sensor data from Home Assistant MQTT to MariaDB.
 

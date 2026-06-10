@@ -2,10 +2,10 @@
 """
 test_battery_optimizer_pub.py
 ==============================
-Scenario tests + unit tests for battery_optimizer_LP_quarter_pub_wip0.py.
+Scenario tests + unit tests for battery_optimizer_LP_quarter.py.
 
 Run with:  python -m pytest test_battery_optimizer_pub.py -v
-           python -m pytest test_battery_optimizer_pub.py -v --cov=battery_optimizer_LP_quarter_pub_wip0 --cov-report=term-missing
+           python -m pytest test_battery_optimizer_pub.py -v --cov=battery_optimizer_LP_quarter --cov-report=term-missing
 
 The LP optimizer is called with mocked data — no DB, no real API, no solar API.
 Quarter-hour slots: start_hour * 4 = start_qtr_idx.
@@ -67,10 +67,10 @@ _here = str(Path(__file__).resolve().parent)
 if _here not in sys.path:
     sys.path.insert(0, _here)
 
-import battery_optimizer_LP_quarter_pub_wip0 as mod  # noqa: E402
+import battery_optimizer_LP_quarter as mod  # noqa: E402
 
 logging.disable(logging.NOTSET)
-logging.getLogger("battery_optimizer_LP_quarter_pub_wip0").setLevel(logging.CRITICAL)
+logging.getLogger("battery_optimizer_LP_quarter").setLevel(logging.CRITICAL)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  Test fixtures
