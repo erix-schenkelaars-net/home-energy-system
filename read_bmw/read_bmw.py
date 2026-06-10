@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-read_bmw_pub_wip0.py — BMW CarData → Home Assistant MQTT bridge
+read_bmw.py — BMW CarData → Home Assistant MQTT bridge
 =======================================================
 BMW ConnectedDrive is dead (blocked Sept 2025). This uses the new
 official BMW CarData API (EU Data Act / Extended Vehicle Approach).

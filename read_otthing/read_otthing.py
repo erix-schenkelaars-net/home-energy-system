@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-read_otthing_pub_wip0.py
+read_otthing.py
 ========================
 Reads OpenTherm gateway (otgw-thing) data from MQTT and writes to MariaDB.
 

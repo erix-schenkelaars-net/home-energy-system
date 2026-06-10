@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `sph_temp_c`                          float        DEFAULT NULL COMMENT 'Inverter temperature °C',
   `used_energy_today_kwh`               double       DEFAULT NULL,
 
+  -- Realized energiekosten per 5-min interval — written by read_p1 (zie common/energy_cost.py)
+  `cost_elec_var_eur`                   double       DEFAULT NULL COMMENT 'Variabele stroomkost interval (EUR)',
+  `cost_elec_fix_eur`                   double       DEFAULT NULL COMMENT 'Vaste stroomkost interval (EUR)',
+  `cost_gas_var_eur`                    double       DEFAULT NULL COMMENT 'Variabele gaskost interval (EUR)',
+  `cost_gas_fix_eur`                    double       DEFAULT NULL COMMENT 'Vaste gaskost interval (EUR)',
+
   -- Seplos 16 kWh LiFePO4 BMS — written by read_seplos
   `seplos_alarm_active`                 int(11)      DEFAULT NULL,
   `seplos_cell_voltage_delta_mv`        float        DEFAULT NULL COMMENT 'Max cell voltage spread mV',

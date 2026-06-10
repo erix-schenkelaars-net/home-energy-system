@@ -20,4 +20,4 @@ until python3 -c "import socket; s=socket.create_connection(('${DB_HOST}', 3306)
 done
 echo "MariaDB reachable, starting controller."
 
-exec python3 -u control_growatt_erix_db_quarter_pub_wip0.py 2>&1 | tee -a "${LOG_FILE}"
+exec python3 -u control_growatt_quarter.py 2>&1 | tee -a "${LOG_FILE}"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-resol_2_erix_db_pub_wip0.py
+resol_2.py
 ============================
 Reads temperature, flow, and relay data from a Resol VBus solar controller
 via a VBus-to-LAN adapter (TCP socket), then:

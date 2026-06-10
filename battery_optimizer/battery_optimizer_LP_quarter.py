@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-battery_optimizer_LP_quarter_pub_wip0.py
+battery_optimizer_LP_quarter.py
 =========================================
 Quarter-slot (15-min) LP/MILP rolling battery optimizer for a home energy system.
 
@@ -40,6 +40,12 @@ from typing import Optional
 
 import mysql.connector
 import numpy as np
+# common/ wordt read-only gemount in de container (/app/common) en ligt op de host in de repo-root;
+# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from common import energy_cost as ec   # gedeelde, canonieke kostenberekening
 from scipy.optimize import milp, LinearConstraint, Bounds
 import paho.mqtt.client as paho_mqtt
 import requests
@@ -72,7 +78,7 @@ PANEL_EAST_KWP  = 3.12
 PANEL_WEST_KWP  = 3.12
 PANEL_EAST_AZI  = 88
 PANEL_WEST_AZI  = 272
-PANEL_TILT      = 35
+PANEL_TILT      = 24.16   # gemeten dakhoek (0=horizontaal); was 35
 PANEL_EFF       = 0.963
 PANEL_EFF_CAL   = 0.70  # calibrated on clear days (GHI-based fallback)
 PEAK_MEASURED_KW = 5.2
@@ -135,54 +141,22 @@ def optimizer_mode() -> str:
 # Loaded once from the DB at startup via load_tariffs_from_db(); the fallback
 # below mirrors the table and is only used if that read fails.
 # ---------------------------------------------------------------------------
-@dataclass
-class Tariff:
-    valid_from:            date
-    valid_until:           Optional[date]
-    inkoopvergoeding_kwh:  float
-    energiebelasting_kwh:  float
-    verkoopvergoeding_kwh: float
-    saldering:             bool
-
-
-_TARIFFS: list[Tariff] = [
-    Tariff(date(2026, 6, 1), date(2026, 12, 31), 0.0100, 0.110848, 0.0100, True),
-    Tariff(date(2027, 1, 1), None,               0.0100, 0.110848, 0.0100, False),
-]
+# Tarieven + de all-in/saldering-formule komen uit de gedeelde module common/energy_cost.py
+# (zelfde berekening als read_p1 en het dashboard). Geladen in load_tariffs_from_db().
+_TARIFFS: list = list(ec._FALLBACK_TARIFFS)
 
 
 def load_tariffs_from_db(conn) -> None:
-    """Load date-versioned electricity tariffs from the energy_tariffs table."""
+    """Laad datum-versie tarieven uit energy_tariffs via de gedeelde module."""
     global _TARIFFS
-    cur = conn.cursor(dictionary=True)
-    cur.execute(
-        "SELECT valid_from, valid_until, elec_inkoopvergoeding_kwh, "
-        "elec_energiebelasting_kwh, elec_verkoopvergoeding_kwh, saldering_active "
-        "FROM energy_tariffs ORDER BY valid_from"
-    )
-    rows = cur.fetchall()
-    cur.close()
-    if not rows:
-        log.warning("energy_tariffs is empty — keeping fallback tariffs")
-        return
-    _TARIFFS = [
-        Tariff(r["valid_from"], r["valid_until"],
-               float(r["elec_inkoopvergoeding_kwh"]),
-               float(r["elec_energiebelasting_kwh"]),
-               float(r["elec_verkoopvergoeding_kwh"]),
-               bool(r["saldering_active"]))
-        for r in rows
-    ]
+    _TARIFFS = ec.load_tariffs(conn)
     log.info("Loaded %d tariff period(s) from energy_tariffs (latest valid_from %s, saldering=%s)",
              len(_TARIFFS), _TARIFFS[-1].valid_from, _TARIFFS[-1].saldering)
 
 
-def tariff_for(d: date) -> Tariff:
-    """Return the tariff period active on date d (clamps to nearest edge if out of range)."""
-    for t in _TARIFFS:
-        if t.valid_from <= d and (t.valid_until is None or d <= t.valid_until):
-            return t
-    return _TARIFFS[0] if d < _TARIFFS[0].valid_from else _TARIFFS[-1]
+def tariff_for(d: date):
+    """Tariefperiode actief op datum d (delegeert naar de gedeelde module)."""
+    return ec.tariff_for(_TARIFFS, d)
 
 
 FIXED_TARIFF_EUR_KWH            = 0.28
@@ -206,6 +180,17 @@ BMW_HOME_RADIUS_M           = 200    # maximum distance from home (metres)
 
 HISTORY_DAYS  = 4
 HISTORY_HOURS = 72
+
+# Load-forecast tuning (Predbat-geïnspireerd; zie build_load_profile / compute_inday_load_factor)
+LOAD_LOOKBACK_DAYS      = 14    # #5: venster lang genoeg voor zowel weekdagen als weekend
+LOAD_RECENCY_HALFLIFE_D = 7.0   # #5: recente dagen tellen zwaarder (exponentieel verval)
+LOAD_DROP_LOWEST_DAY    = True  # #2: laagste-verbruiksdag (outlier, bv. vakantie) negeren
+LOAD_PESSIMISM          = 1.05  # #2: 5% conservatieve opslag op de base-load forecast
+INDAY_ADJUST            = True  # #1: rest van vandaag schalen o.b.v. werkelijk vs voorspeld verbruik
+INDAY_MIN_ELAPSED_H     = 2.0   # #1: pas toe na 2 u verstreken (ochtend-ruis vermijden)
+INDAY_FACTOR_MIN        = 0.7   # #1: clamp ondergrens
+INDAY_FACTOR_MAX        = 1.4   # #1: clamp bovengrens
+INDAY_DAMPING           = 0.7   # #1: demping richting 1.0 (0=geen correctie, 1=volledig)
 
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER", "YOUR_MQTT_BROKER_IP")
 MQTT_BROKER_PORT = int(os.environ.get("MQTT_PORT", 1883))
@@ -308,18 +293,12 @@ class HourSlot:
         return self.dt.minute
 
     def import_price(self) -> float:
-        t = tariff_for(self.dt.date())
-        return self.price_eur_kwh + t.energiebelasting_kwh + t.inkoopvergoeding_kwh
+        # all-in afnameprijs via gedeelde module (= EPEX + inkoop + energiebelasting)
+        return ec.all_in_import(self.price_eur_kwh, tariff_for(self.dt.date()))
 
     def export_price(self) -> float:
-        # During saldering: exported kWh offset the full retail import (incl. energy
-        # tax + purchase surcharge), minus the feed-in surcharge.
-        # After saldering: consumer receives only EPEX excl. VAT minus the feed-in surcharge.
-        t = tariff_for(self.dt.date())
-        if t.saldering:
-            return self.import_price() - t.verkoopvergoeding_kwh
-        else:
-            return self.price_eur_kwh / 1.21 - t.verkoopvergoeding_kwh
+        # teruglever-waarde via gedeelde module (saldering-bewust)
+        return ec.export_credit_price(self.price_eur_kwh, tariff_for(self.dt.date()))
 
 
 # ---------------------------------------------------------------------------
@@ -1201,34 +1180,105 @@ def _read_load_skip_days() -> int:
     return 0
 
 
-def build_load_profile(conn, base_load_w: float) -> dict[int, float]:
-    skip = _read_load_skip_days()
-    now  = datetime.now()
+def build_load_profile(conn, base_load_w: float) -> dict[tuple[bool, int], float]:
+    """Weekdag/weekend-bewust, recency-gewogen uur-van-de-dag load-profiel (kWh/uur).
+    Geeft een dict met sleutel (is_weekend, hour). NB: GEEN pessimisme hier — dat
+    wordt in optimise() op de uiteindelijke slot-load toegepast zodat de in-day-ratio
+    schoon blijft.
+      #5 dag-weging  : recente dagen wegen zwaarder (exp. verval), weekend en weekdag apart.
+      #2 outlier     : de dag met het laagste totaalverbruik wordt genegeerd.
+    """
+    skip  = _read_load_skip_days()
+    now   = datetime.now()
     until = now - timedelta(days=skip)
-    effective_history = max(HISTORY_DAYS, skip) if skip > 0 else HISTORY_DAYS
-    since = until - timedelta(days=effective_history)
+    lookback = max(LOAD_LOOKBACK_DAYS, HISTORY_DAYS)
+    since = until - timedelta(days=lookback)
     if skip:
-        log.info("load_skip_days=%d: load profile from %s to %s (%d days)",
-                 skip, since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d"), effective_history)
+        log.info("load_skip_days=%d: load history %s .. %s",
+                 skip, since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d"))
+
     cur = conn.cursor(dictionary=True)
     cur.execute("""
-        SELECT HOUR(ts) AS hr,
+        SELECT DATE(ts) AS d, HOUR(ts) AS hr,
                AVG(p1_power_import_w + COALESCE(sph_pv_power_tot_w,0)
                    - p1_power_export_w
                    - COALESCE(sph_bat_act_charge_discharge_power_w,0)) AS avg_load_w
         FROM energy WHERE ts >= %s AND ts < %s AND p1_power_import_w IS NOT NULL
-        GROUP BY HOUR(ts)
+        GROUP BY DATE(ts), HOUR(ts)
     """, (since, until))
-    rows = {r["hr"]: max(r["avg_load_w"] or 0, 50) for r in cur.fetchall()}
+    by_day: dict[date, dict[int, float]] = {}
+    for r in cur.fetchall():
+        d = r["d"].date() if isinstance(r["d"], datetime) else r["d"]
+        by_day.setdefault(d, {})[int(r["hr"])] = max(r["avg_load_w"] or 0.0, 50.0)
     cur.close()
 
-    profile = {}
-    for h in range(24):
-        if h in rows and rows[h] > 50:
-            profile[h] = rows[h] / 1000.0
-        else:
-            profile[h] = base_load_w / 1000.0
+    # Vandaag uitsluiten (partieel; in-day-adjustment behandelt de rest van vandaag apart)
+    by_day.pop(until.date(), None)
+
+    # #2 outlier: gooi de dag met het laagste totaalverbruik weg (bv. afwezigheid)
+    if LOAD_DROP_LOWEST_DAY and len(by_day) > 2:
+        lowest = min(by_day, key=lambda dd: sum(by_day[dd].values()))
+        by_day.pop(lowest, None)
+
+    # #5 recency-gewogen gemiddelde per (weekend?, uur)
+    profile: dict[tuple[bool, int], float] = {}
+    for is_weekend in (False, True):
+        days = [dd for dd in by_day if (dd.weekday() >= 5) == is_weekend]
+        for h in range(24):
+            num = den = 0.0
+            for dd in days:
+                if h in by_day[dd]:
+                    age = (until.date() - dd).days
+                    w   = 0.5 ** (age / LOAD_RECENCY_HALFLIFE_D)
+                    num += w * by_day[dd][h]
+                    den += w
+            if den > 0:
+                profile[(is_weekend, h)] = (num / den) / 1000.0
+    # ontbrekende sleutels opvullen met de base-load fallback
+    for is_weekend in (False, True):
+        for h in range(24):
+            profile.setdefault((is_weekend, h), base_load_w / 1000.0)
+
+    log.info("Load profile: %d dagen gebruikt (weekdag+weekend, recency-gewogen, lowest-day=%s)",
+             len(by_day), "dropped" if LOAD_DROP_LOWEST_DAY else "kept")
     return profile
+
+
+def compute_inday_load_factor(conn, profile: dict[tuple[bool, int], float], now: datetime) -> float:
+    """#1 In-day adjustment: verhouding werkelijk vs voorspeld verbruik vandaag tot nu,
+    gedempt en geclampt. Schaalt straks alleen de resterende slots van VANDAAG."""
+    if not INDAY_ADJUST:
+        return 1.0
+    elapsed_h = now.hour + now.minute / 60.0
+    if elapsed_h < INDAY_MIN_ELAPSED_H:
+        return 1.0
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT AVG(p1_power_import_w + COALESCE(sph_pv_power_tot_w,0)
+                   - p1_power_export_w
+                   - COALESCE(sph_bat_act_charge_discharge_power_w,0)) AS avg_w
+        FROM energy WHERE ts >= %s AND ts < %s AND p1_power_import_w IS NOT NULL
+    """, (midnight, now))
+    row = cur.fetchone()
+    cur.close()
+    if not row or row["avg_w"] is None:
+        return 1.0
+    actual_w = max(row["avg_w"], 50.0)
+
+    is_weekend = now.weekday() >= 5
+    hours_done = list(range(now.hour + 1))   # uren 0..nu (incl. lopend uur)
+    pred = [profile.get((is_weekend, h), profile.get((False, h), 0.0)) * 1000.0 for h in hours_done]
+    pred_w = sum(pred) / len(pred) if pred else 0.0
+    if pred_w <= 0:
+        return 1.0
+
+    raw    = actual_w / pred_w
+    damped = 1.0 + INDAY_DAMPING * (raw - 1.0)
+    factor = min(INDAY_FACTOR_MAX, max(INDAY_FACTOR_MIN, damped))
+    log.info("In-day load adjust: werkelijk %.0f W vs voorspeld %.0f W -> ruw %.2f, factor %.2f",
+             actual_w, pred_w, raw, factor)
+    return factor
 
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1324,7 @@ def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
         if abs_qtr >= deadline_qtr:
             break
         p     = prices.get(abs_qtr, 0.25)
-        allin = p + _t.energiebelasting_kwh + _t.inkoopvergoeding_kwh
+        allin = p + _t.energiebelasting_kwh + _t.inkoop_kwh
         candidates.append((allin, i))
 
     candidates.sort(key=lambda x: x[0])
@@ -1349,12 +1399,13 @@ def optimise(
     start_qtr_idx: int,
     prices: dict[int, float],
     radiation: dict[str, dict],
-    load_profile: dict[int, float],
+    load_profile: dict[tuple[bool, int], float],
     initial_soc_pct: float,
     today: date,
     mode: str = "DYNAMIC_PRICE",
     ev_soc: Optional[float] = None,
     ref_temp_by_hour: Optional[dict[int, float]] = None,
+    inday_load_factor: float = 1.0,
 ) -> tuple[list[HourSlot], str]:
     if ref_temp_by_hour is None:
         ref_temp_by_hour = {}
@@ -1392,7 +1443,12 @@ def optimise(
         # PV per quarter slot: linear interpolation between hour midpoints
         pv            = estimate_pv_kwh_per_quarter(radiation, dt, qtr)
 
-        db_load_h     = load_profile.get(hour, BASE_LOAD_FALLBACK_W / 1000)
+        # #5 weekdag/weekend-bewust profiel; #2 pessimisme; #1 in-day factor (alleen vandaag)
+        db_load_h     = load_profile.get((d.weekday() >= 5, hour),
+                                         load_profile.get((False, hour), BASE_LOAD_FALLBACK_W / 1000))
+        if d == today:
+            db_load_h *= inday_load_factor
+        db_load_h    *= LOAD_PESSIMISM
         hp_corr_h     = predict_hp_correction_kwh(forecast_temp, ref_temp, hour)
         load          = max(0.05 * SLOT_H, (db_load_h + hp_corr_h) * SLOT_H)
         hp_correction = hp_corr_h * SLOT_H
@@ -2054,7 +2110,7 @@ def set_ev_plug_control_flag(set_control: bool) -> bool:
         flag_val = 1 if set_control else 0
         time_window = now - timedelta(hours=3)
         cursor.execute(
-            f"UPDATE {DB_TABLE} SET ev_plug_control = %s "
+            "UPDATE battery_schedule SET ev_plug_control = %s "
             "WHERE slot_dt >= %s AND slot_dt <= %s",
             (flag_val, time_window, now + timedelta(hours=3))
         )
@@ -2075,7 +2131,7 @@ def ev_plug_is_optimizer_controlled() -> bool:
         now = datetime.now()
         time_window = now - timedelta(hours=3)
         cursor.execute(
-            f"SELECT COUNT(*) FROM {DB_TABLE} "
+            "SELECT COUNT(*) FROM battery_schedule "
             "WHERE slot_dt >= %s AND slot_dt <= %s AND ev_plug_control = 1 "
             "LIMIT 1",
             (time_window, now + timedelta(hours=3))
@@ -2114,7 +2170,7 @@ def ev_optimal_start(current_hour: int, prices: dict[int, float], soc: float) ->
         window_qtrs = list(range(start_qtr, start_qtr + qtrs_needed))
         if not all(q in prices for q in window_qtrs):
             continue
-        cost = sum(prices[q] + _t.energiebelasting_kwh + _t.inkoopvergoeding_kwh
+        cost = sum(prices[q] + _t.energiebelasting_kwh + _t.inkoop_kwh
                    for q in window_qtrs)
         if cost < best_cost:
             best_cost = cost
@@ -2263,8 +2319,9 @@ def main(dry_run: bool = False):
     if ev_is_charging:
         log.info("EV is charging — included in LP load profile")
 
-    base_load = read_avg_consumption(conn)
-    load_prof = build_load_profile(conn, base_load)
+    base_load    = read_avg_consumption(conn)
+    load_prof    = build_load_profile(conn, base_load)
+    inday_factor = compute_inday_load_factor(conn, load_prof, now)
 
     mode = optimizer_mode()
     if SIMULATE_POST_JULY:
@@ -2285,6 +2342,7 @@ def main(dry_run: bool = False):
         mode             = mode,
         ev_soc           = ev_soc,
         ref_temp_by_hour = ref_temp_by_hour,
+        inday_load_factor = inday_factor,
     )
 
     if not schedule:

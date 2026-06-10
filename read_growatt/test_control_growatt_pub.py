@@ -2,10 +2,10 @@
 """
 test_control_growatt_pub.py
 ============================
-Test suite for control_growatt_erix_db_quarter_pub_wip0.py.
+Test suite for control_growatt_quarter.py.
 
 Run with:  python -m pytest test_control_growatt_pub.py -v
-           python -m pytest test_control_growatt_pub.py -v --cov=control_growatt_erix_db_quarter_pub_wip0 --cov-report=term-missing
+           python -m pytest test_control_growatt_pub.py -v --cov=control_growatt_quarter --cov-report=term-missing
 
 Covers:
   A.  slot_to_conf — BATTERY_FIRST+PV_CHARGE
@@ -71,7 +71,7 @@ _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
     sys.path.insert(0, _here)
 
-import control_growatt_erix_db_quarter_pub_wip0 as ctrl
+import control_growatt_quarter as ctrl
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,9 +537,15 @@ class TestSlotToConfActions(unittest.TestCase):
         self.assertEqual(cfg.mode,     ctrl.RunMode.CHARGE)
 
     def test_charge_power_from_kw(self):
-        cfg = ctrl.slot_to_conf({"action": "BATTERY_FIRST+CHARGE", "charge_kw": 1.5},
-                                 self.now, self.base)
-        self.assertEqual(cfg.power, 50)   # 1500/3000 * 100
+        # Test de onderliggende kw->pct conversie met de tijdelijke FORCE_MAX_CHARGE-override UIT.
+        _saved = ctrl.FORCE_MAX_CHARGE
+        ctrl.FORCE_MAX_CHARGE = False
+        try:
+            cfg = ctrl.slot_to_conf({"action": "BATTERY_FIRST+CHARGE", "charge_kw": 1.5},
+                                     self.now, self.base)
+            self.assertEqual(cfg.power, 50)   # 1500/3000 * 100
+        finally:
+            ctrl.FORCE_MAX_CHARGE = _saved
 
     def test_charge_kw_3_gives_100pct(self):
         cfg = ctrl.slot_to_conf({"action": "BATTERY_FIRST+CHARGE", "charge_kw": 3.0},

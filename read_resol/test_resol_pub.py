@@ -2,10 +2,10 @@
 """
 test_resol_pub.py
 ==================
-Unit tests for resol_2_erix_db_pub_wip0.py.
+Unit tests for resol_2.py.
 
 Run with:  python -m pytest test_resol_pub.py -v
-           python -m pytest test_resol_pub.py -v --cov=resol_2_erix_db_pub_wip0 --cov-report=term-missing
+           python -m pytest test_resol_pub.py -v --cov=resol_2 --cov-report=term-missing
 """
 
 import os
@@ -52,10 +52,10 @@ import importlib.util
 import time as _time
 
 _here = str(Path(__file__).resolve().parent)
-_src  = Path(_here) / "resol_2_erix_db_pub_wip0.py"
-_spec = importlib.util.spec_from_file_location("resol_2_erix_db_pub_wip0", _src)
+_src  = Path(_here) / "resol_2.py"
+_spec = importlib.util.spec_from_file_location("resol_2", _src)
 mod   = importlib.util.module_from_spec(_spec)
-sys.modules["resol_2_erix_db_pub_wip0"] = mod
+sys.modules["resol_2"] = mod
 
 assert _spec is not None and _spec.loader is not None, "Could not load resol module spec"
 

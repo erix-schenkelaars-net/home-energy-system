@@ -7,4 +7,4 @@ LOG_DIR=/logs
 LOG_FILE="${LOG_DIR}/debug_$(date +%Y-%m-%d).log"
 mkdir -p "${LOG_DIR}"
 
-exec python3 -u ha_p60_data_2_erix_db_pub_wip0.py 2>&1 | tee -a "${LOG_FILE}"
+exec python3 -u ha_p60_data_2.py 2>&1 | tee -a "${LOG_FILE}"

@@ -7,4 +7,4 @@ LOG_DIR=/logs
 LOG_FILE="${LOG_DIR}/debug_$(date +%Y-%m-%d).log"
 mkdir -p "${LOG_DIR}"
 
-exec python3 -u battery_optimizer_LP_quarter_pub_wip0.py 2>&1 | tee -a "${LOG_FILE}"
+exec python3 -u battery_optimizer_LP_quarter.py 2>&1 | tee -a "${LOG_FILE}"

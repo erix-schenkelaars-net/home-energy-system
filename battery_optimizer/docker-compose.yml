@@ -10,6 +10,7 @@ services:
       - ./output:/output
       - ./logs:/logs
       - ../read_growatt/sph5k.conf:/app/sph5k.conf:ro
+      - ../common:/app/common:ro
     env_file:
       - ../.env
 

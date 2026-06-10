@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-read_seplos_pub_wip0.py
+read_seplos.py
 =======================
 Seplos BMS real-time monitor and dynamic current limiter for Growatt SPH5000.
 
