@@ -31,7 +31,7 @@ import time
 import serial
 import requests
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 import struct
 import mysql.connector
 import sys
@@ -103,8 +103,9 @@ def next_5min_boundary(now=None):
         now = datetime.now()
     next_min = (now.minute // 5 + 1) * 5
     if next_min == 60:
-        return now.replace(hour=(now.hour + 1) % 24,
-                           minute=0, second=10, microsecond=0)
+        if now.hour == 23:
+            return (now + timedelta(days=1)).replace(hour=0, minute=0, second=10, microsecond=0)
+        return now.replace(hour=now.hour + 1, minute=0, second=10, microsecond=0)
     return now.replace(minute=next_min, second=10, microsecond=0)
 
 
@@ -214,7 +215,8 @@ def read_last_db_state():
         dbg(2, DEBUG_YESTERDAY, "DB",
             f"LAST counters READY with values: {r[5]}   {P1_LAST_DATA}")
     finally:
-        cur.close(); db.close()
+        try: cur.close(); db.close()
+        except Exception: pass
 
 
 # ---------------------------
@@ -261,8 +263,11 @@ def read_yesterday_data():
             "yesterday values at {}".format(YESTERDAY_DATA))
         dbg(2, DEBUG_YESTERDAY, "DB",
             "yesterday read at {}".format(r[5]))
+    except Exception as e:
+        dbg(1, DEBUG_YESTERDAY, "DB", f"⛔ read_yesterday_data FAILED: {e}")
     finally:
-        cur.close(); db.close()
+        try: cur.close(); db.close()
+        except Exception: pass
 
 
 # ---------------------------
@@ -321,9 +326,7 @@ def update_erix_db_data(data):
         p1_gas_today_m3            = %s,
         p1_electricity_today_kwh   = %s,
         cost_elec_var_eur          = %s,
-        cost_elec_fix_eur          = %s,
-        cost_gas_var_eur           = %s,
-        cost_gas_fix_eur           = %s
+        cost_gas_var_eur           = %s
     WHERE id=(SELECT id FROM {MYSQL_TABLE_NAME} ORDER BY id DESC LIMIT 1)
     """
     try:
@@ -381,12 +384,11 @@ def compute_interval_costs(ts, cum_imp, cum_exp, cum_gas):
         gspot = ec.gas_spot_for_day(db, ts.date())
         db.close()
         t = ec.tariff_for(_TARIFFS, ts.date())
-        f = ec.fixed_for(_FIXED, ts.date())
-        if t is not None and f is not None:
+        if t is not None:
             res = (round(ec.elec_var_eur(d_imp, d_exp, spot, t), 6),
-                   round(ec.elec_fix_eur(days, f), 6),
+                   None,
                    round(ec.gas_var_eur(d_gas, gspot, t), 6),
-                   round(ec.gas_fix_eur(days, f), 6))
+                   None)
     except Exception as e:
         dbg(1, DEBUG_DB_UPDATE, "DB", f"⛔ interval-kostberekening faalde: {e}")
     _PREV_CUM = {"imp": cum_imp, "exp": cum_exp, "gas": cum_gas}
@@ -590,79 +592,83 @@ if __name__ == "__main__":
             if stop_event.is_set():
                 break
 
-            read_yesterday_data()
-            with YESTERDAY_LOCK:
-                y = YESTERDAY_DATA.copy()
+            try:
+                read_yesterday_data()
+                with YESTERDAY_LOCK:
+                    y = YESTERDAY_DATA.copy()
 
-            with P1_LOCK:
-                if None in (
+                with P1_LOCK:
+                    if None in (
+                        P1_LAST_DATA['p1_e_t1_i'],
+                        P1_LAST_DATA['p1_e_t2_i'],
+                        P1_LAST_DATA['p1_e_t1_e'],
+                        P1_LAST_DATA['p1_e_t2_e'],
+                        P1_LAST_DATA['p1_gas'],
+                    ):
+                        continue
+
+                    e_del_today = (
+                        (P1_LAST_DATA['p1_e_t1_i'] + P1_LAST_DATA['p1_e_t2_i'])
+                        - (y['EdaldelYF'] + y['EpiekdelYF'])
+                    )
+                    e_ret_today = (
+                        (P1_LAST_DATA['p1_e_t1_e'] + P1_LAST_DATA['p1_e_t2_e'])
+                        - (y['EdalretYF'] + y['EpiekretYF'])
+                    )
+                    gas_today = P1_LAST_DATA['p1_gas'] - y['GasYF']
+
+                    if e_del_today < 0 or e_ret_today < 0 or gas_today < 0:
+                        dbg(1, DEBUG_DB_UPDATE, "DB",
+                            f"⚠ Negative daily delta clamped to 0 "
+                            f"(import={e_del_today:.3f} export={e_ret_today:.3f} "
+                            f"gas={gas_today:.3f}) – likely midnight rollover")
+                        e_del_today = max(0.0, e_del_today)
+                        e_ret_today = max(0.0, e_ret_today)
+                        gas_today   = max(0.0, gas_today)
+
+                    # Use smoothed power values for DB write
+                    p_del_db = P1_LAST_DATA['p1_p_del_avg']
+                    p_ret_db = P1_LAST_DATA['p1_p_ret_avg']
+
+                bat_chg_today, bat_dis_today = read_battery_today_kwh()
+
+                e_net_today       = e_del_today - e_ret_today
+                electricity_today = e_net_today + bat_dis_today - bat_chg_today
+
+                dbg(1, DEBUG_DB_UPDATE, "DB",
+                    f"Today totals: import={e_del_today:.3f}  export={e_ret_today:.3f}  "
+                    f"net_grid={e_net_today:.3f}  "
+                    f"bat_chg={bat_chg_today:.3f}  bat_dis={bat_dis_today:.3f}  "
+                    f"→ electricity_today={electricity_today:.3f} kWh  "
+                    f"p_del_avg={p_del_db:.1f} W  p_ret_avg={p_ret_db:.1f} W")
+
+                # Realized kost over dit interval (telwerk-delta × werkelijke prijs)
+                cum_imp = P1_LAST_DATA['p1_e_t1_i'] + P1_LAST_DATA['p1_e_t2_i']
+                cum_exp = P1_LAST_DATA['p1_e_t1_e'] + P1_LAST_DATA['p1_e_t2_e']
+                cum_gas = P1_LAST_DATA['p1_gas']
+                c_ev, _,    c_gv, _    = compute_interval_costs(target, cum_imp, cum_exp, cum_gas)
+
+                update_erix_db_data((
                     P1_LAST_DATA['p1_e_t1_i'],
                     P1_LAST_DATA['p1_e_t2_i'],
                     P1_LAST_DATA['p1_e_t1_e'],
                     P1_LAST_DATA['p1_e_t2_e'],
+                    p_del_db,
+                    p_ret_db,
                     P1_LAST_DATA['p1_gas'],
-                ):
-                    continue
+                    round(e_del_today, 2),
+                    round(e_ret_today, 2),
+                    round(e_net_today, 2),
+                    round(gas_today, 2),
+                    round(electricity_today, 2),
+                    c_ev, c_gv,
+                ))
 
-                e_del_today = (
-                    (P1_LAST_DATA['p1_e_t1_i'] + P1_LAST_DATA['p1_e_t2_i'])
-                    - (y['EdaldelYF'] + y['EpiekdelYF'])
-                )
-                e_ret_today = (
-                    (P1_LAST_DATA['p1_e_t1_e'] + P1_LAST_DATA['p1_e_t2_e'])
-                    - (y['EdalretYF'] + y['EpiekretYF'])
-                )
-                gas_today = P1_LAST_DATA['p1_gas'] - y['GasYF']
+                dbg(2, DEBUG_DB_UPDATE, "DB",
+                    f"DB write OK at {target.strftime('%H:%M:%S')}")
 
-                if e_del_today < 0 or e_ret_today < 0 or gas_today < 0:
-                    dbg(1, DEBUG_DB_UPDATE, "DB",
-                        f"⚠ Negative daily delta clamped to 0 "
-                        f"(import={e_del_today:.3f} export={e_ret_today:.3f} "
-                        f"gas={gas_today:.3f}) – likely midnight rollover")
-                    e_del_today = max(0.0, e_del_today)
-                    e_ret_today = max(0.0, e_ret_today)
-                    gas_today   = max(0.0, gas_today)
-
-                # Use smoothed power values for DB write
-                p_del_db = P1_LAST_DATA['p1_p_del_avg']
-                p_ret_db = P1_LAST_DATA['p1_p_ret_avg']
-
-            bat_chg_today, bat_dis_today = read_battery_today_kwh()
-
-            e_net_today       = e_del_today - e_ret_today
-            electricity_today = e_net_today + bat_dis_today - bat_chg_today
-
-            dbg(1, DEBUG_DB_UPDATE, "DB",
-                f"Today totals: import={e_del_today:.3f}  export={e_ret_today:.3f}  "
-                f"net_grid={e_net_today:.3f}  "
-                f"bat_chg={bat_chg_today:.3f}  bat_dis={bat_dis_today:.3f}  "
-                f"→ electricity_today={electricity_today:.3f} kWh  "
-                f"p_del_avg={p_del_db:.1f} W  p_ret_avg={p_ret_db:.1f} W")
-
-            # Realized kost over dit interval (telwerk-delta × werkelijke prijs)
-            cum_imp = P1_LAST_DATA['p1_e_t1_i'] + P1_LAST_DATA['p1_e_t2_i']
-            cum_exp = P1_LAST_DATA['p1_e_t1_e'] + P1_LAST_DATA['p1_e_t2_e']
-            cum_gas = P1_LAST_DATA['p1_gas']
-            c_ev, c_ef, c_gv, c_gf = compute_interval_costs(target, cum_imp, cum_exp, cum_gas)
-
-            update_erix_db_data((
-                P1_LAST_DATA['p1_e_t1_i'],
-                P1_LAST_DATA['p1_e_t2_i'],
-                P1_LAST_DATA['p1_e_t1_e'],
-                P1_LAST_DATA['p1_e_t2_e'],
-                p_del_db,
-                p_ret_db,
-                P1_LAST_DATA['p1_gas'],
-                round(e_del_today, 2),
-                round(e_ret_today, 2),
-                round(e_net_today, 2),
-                round(gas_today, 2),
-                round(electricity_today, 2),
-                c_ev, c_ef, c_gv, c_gf,
-            ))
-
-            dbg(2, DEBUG_DB_UPDATE, "DB",
-                f"DB write OK at {target.strftime('%H:%M:%S')}")
+            except Exception as e:
+                dbg(1, DEBUG_DB_UPDATE, "DB", f"⛔ DB writer cycle FAILED: {e}")
 
 
     read_last_db_state()

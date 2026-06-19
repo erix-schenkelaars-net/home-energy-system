@@ -150,7 +150,7 @@ def prices_make(base=0.22, cheap=0.13, peak=0.33,
 
 
 def run_scenario(soc, rad, prices, ev_soc=None, start_h=0,
-                 mode="MINIMIZE_EXPORT", load=None):
+                 mode="DYNAMIC_PRICE", load=None):
     if load is None:
         load = LOAD_NORM
     return mod.optimise(
@@ -421,7 +421,7 @@ class TestS09NegativePrice(_ScenarioBase):
         self.assertLessEqual(self.max_soc, mod.BAT_MAX_SOC_PCT)
 
     def test_charges_at_negative_price(self):
-        # MINIMIZE_EXPORT mode: check any charging happens
+        # DYNAMIC_PRICE mode: check any charging happens
         charge_slots = [s for s in self.slots if "CHARGE" in s.action]
         self.assertGreater(len(charge_slots), 0, "LP should charge at negative all-in price")
 

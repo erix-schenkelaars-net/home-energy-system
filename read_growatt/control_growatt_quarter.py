@@ -20,7 +20,7 @@ Control sources (sph5k.conf control_source key):
   FILE -- sph5k.conf fully controls; DB is ignored
 
 SOC guards (always active, override schedule):
-  LOW  lock (<= 20%): force BATTERY_FIRST+CHARGE 50%; releases >= 22%
+  LOW  lock (<= 18%): force BATTERY_FIRST+CHARGE 50%; releases >= 25%
   HIGH lock (>= 90%): force BATTERY_FIRST+DISCHARGE 50%; releases <= 88%
 
 PV curtailment:
@@ -181,7 +181,6 @@ DB_TABLE  = os.environ["DB_TABLE"]
 
 INVERTER_UNIT_ID  = 1
 REMOTE_HOLD_POWER = 1   # 1% -> 0 W, prevents fallback to LOAD_FIRST
-_last_pnet        = None
 _enable           = int(1)
 _disable          = int(0)
 CONF_PATH         = "./sph5k.conf"
@@ -216,23 +215,13 @@ DB_SCHEDULE_DISCHARGE_PCT = 100   # % for DISCHARGE action (full 3000 W)
 DB_SCHEDULE_EXPORT_PCT    = 100   # % for EXPORT action   (full 3000 W)
 
 # --------------------------------------------------
-# FORCE_MAX_CHARGE (temporary export-target measure until 2026-06-16)
-# When the optimizer schedules a CHARGE action, command the full 3 kW instead of
-# (charge_kw + measured PV surplus). PV - load is almost never > 3 kW, so the battery
-# absorbs essentially ALL PV surplus rather than exporting it -> protects the annual
-# export budget. Side effect: the inverter tops up from the grid when surplus < 3 kW
-# (extra import, no extra export). Overcharge is bounded by the 85%/80% PV-disconnect
-# latch. Set False to restore economic, surplus-tracking charge rates after 2026-06-16.
-FORCE_MAX_CHARGE          = True
-
-# --------------------------------------------------
 # BASE SOC GUARDS (independent from schedule latch)
 # --------------------------------------------------
 SOC_HIGH_STOP   = 90
 SOC_HIGH_RESUME = 88   # 2% hysteresis (symmetric with LOW)
 
-SOC_LOW_STOP    = 20
-SOC_LOW_RESUME  = 22   # 2% hysteresis (symmetric with HIGH)
+SOC_LOW_STOP    = 18
+SOC_LOW_RESUME  = 25   # 7% hysteresis — wide band keeps control_growatt as true last resort
 
 base_high_lock = False
 base_low_lock  = False
@@ -885,7 +874,7 @@ def read_battery_schedule_slot(now: datetime) -> Optional[dict]:
         return None
 
 
-def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: float = 0.0) -> Conf:
+def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: float = 0.0, bat_charge_discharge_w: float = 0.0) -> Conf:
     """Convert a battery_schedule DB row into a Conf object for the control loop.
 
     Action mapping (canonical names):
@@ -914,14 +903,12 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
 
     if action in ("BATTERY_FIRST+CHARGE", "CHARGE"):
         charge_kw    = float(slot.get("charge_kw") or 3.0)
-        # Real-time surplus: current grid export (negative meter = export to grid).
-        # Kept for the debug log below; only used for cfg.power when FORCE_MAX_CHARGE is off.
-        pv_surplus   = max(0.0, -ac_meter_power_w) / 1000.0
+        # PV surplus invariant to battery's own charging: add back what the battery is
+        # already absorbing so the setpoint doesn't collapse as the battery soaks up surplus.
+        pv_surplus   = max(0.0, bat_charge_discharge_w - ac_meter_power_w) / 1000.0
         cfg.priority    = Priority.BATTERY_FIRST
         cfg.mode        = RunMode.CHARGE
-        # FORCE_MAX_CHARGE: command full 3 kW so the battery soaks up all PV surplus
-        # instead of exporting it (see flag definition). Otherwise track charge_kw + surplus.
-        cfg.power       = 100 if FORCE_MAX_CHARGE else kw_to_pct(charge_kw + pv_surplus)
+        cfg.power       = kw_to_pct(charge_kw + pv_surplus)
         cfg.ends_on     = Ends_on.TIME
         cfg.minutes_end = mins_remaining
         cfg.soc_end     = SOC_HIGH_STOP
@@ -960,8 +947,8 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
 
     dbg(2, "CONF", f"slot_to_conf: action={action} -> priority={cfg.priority}  "
                    f"mode={cfg.mode}  power={cfg.power}  mins_remaining={mins_remaining}"
-                   + (f"  ({'FORCED 3kW; ' if FORCE_MAX_CHARGE else ''}"
-                      f"charge_kw={charge_kw:.2f}+pv_surplus={pv_surplus:.2f}kW  meter={ac_meter_power_w:.0f}W)"
+                   + (f"  (charge_kw={charge_kw:.2f}+pv_surplus={pv_surplus:.2f}kW"
+                      f"  meter={ac_meter_power_w:.0f}W  bat={bat_charge_discharge_w:.0f}W)"
                       if action in ("BATTERY_FIRST+CHARGE", "CHARGE") else ""))
     return cfg
 
@@ -1750,7 +1737,8 @@ def main_loop():
                     _last_db_created_at = slot_created
 
                 meter_w     = (regs.get("REG_AC_METER_POWER", 0.0) or 0.0) if regs else 0.0
-                cfg_obj     = slot_to_conf(db_slot, now, cfg, ac_meter_power_w=meter_w)
+                bat_w       = (regs.get("REG_Charge_discharge_power", 0.0) or 0.0) if regs else 0.0
+                cfg_obj     = slot_to_conf(db_slot, now, cfg, ac_meter_power_w=meter_w, bat_charge_discharge_w=bat_w)
                 source      = Source.BASE
                 source_name = f"DB:{db_slot['action']}"
                 dbg(2, "CONF", f"DB schedule active: {source_name}")
