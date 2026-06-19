@@ -136,8 +136,10 @@ def prices_make(base=0.22, cheap=0.13, peak=0.33,
     if cheap_h is None: cheap_h = [2, 3, 4, 5]
     if peak_h  is None: peak_h  = [17, 18, 19, 20]
     p = {}
-    for idx in range(48):
-        h = idx % 24
+    # LP uses quarter-hour slots: idx 0 = 00:00, idx 4 = 01:00, idx 12 = 03:00, etc.
+    # Cover the full 2-day (192-slot) horizon so cheap/peak hours map to the right time.
+    for idx in range(192):
+        h = (idx // 4) % 24  # hour-of-day from quarter-slot index
         if h in cheap_h:
             p[idx] = cheap
         elif h in peak_h:

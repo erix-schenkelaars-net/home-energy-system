@@ -94,7 +94,7 @@ PANEL_PR_GTI = 0.80
 SLOT_H = 0.25  # slot duration: 15 minutes = 0.25 hours
 
 BAT_CAPACITY_KWH     = 16.0
-BAT_MIN_SOC_PCT      = 25.0   # LP floor matches SOC_LOW_RESUME in control_growatt
+BAT_MIN_SOC_PCT      = 20.0   # hard LP / dispatch floor (BMS protection margin)
 BAT_MAX_SOC_PCT      = 89.5   # Seplos BMS trips at 89.8%; 89.5% is safely reachable
 BAT_MAX_CHARGE_KW    = 3.0
 BAT_MIN_CHARGE_KW    = 0.3
@@ -104,12 +104,6 @@ BAT_DISCHARGE_EFF    = 0.95
 BAT_ROUNDTRIP_EFF    = BAT_CHARGE_EFF * BAT_DISCHARGE_EFF
 BAT_MIN_KWH          = BAT_CAPACITY_KWH * BAT_MIN_SOC_PCT / 100.0
 BAT_MAX_KWH          = BAT_CAPACITY_KWH * BAT_MAX_SOC_PCT / 100.0
-# Absolute LP floor when the battery is purely covering house load (LOAD_FIRST / STANDBY).
-# Lower than BAT_MIN_SOC_PCT because BATTERY_FIRST+DISCHARGE only drains to the dynamic
-# floor (computed per slot from expected overnight load); the 20% floor is only reached
-# when there is no more overnight load left to cover.
-BAT_LOAD_FIRST_MIN_SOC_PCT = 20.0
-BAT_LOAD_FIRST_MIN_KWH    = BAT_CAPACITY_KWH * BAT_LOAD_FIRST_MIN_SOC_PCT / 100.0
 
 LP_DISCHARGE_MIN_KW  = 0.30
 
@@ -1444,23 +1438,6 @@ def find_discharge_target_slot(slots: list[HourSlot],
     return None
 
 
-def expected_pv_charge_kwh(slots: list[HourSlot],
-                            ev_load: list[float],
-                            from_t: int,
-                            current_soc_kwh: float) -> float:
-    room        = BAT_MAX_KWH - current_soc_kwh
-    pv_absorbed = 0.0
-    for t in range(from_t, len(slots)):
-        _eff_pv = (0.0 if (PV_CURTAIL_ENABLED and slots[t].export_price() < 0)
-                   else slots[t].pv_kwh)
-        surplus  = max(0.0, _eff_pv - slots[t].load_kwh - ev_load[t])
-        absorbed = min(surplus * BAT_CHARGE_EFF,
-                       room - pv_absorbed,
-                       BAT_MAX_CHARGE_KW * SLOT_H * BAT_CHARGE_EFF)
-        pv_absorbed += absorbed
-        if pv_absorbed >= room:
-            break
-    return pv_absorbed
 
 
 def compute_load_until_pv_surplus(slots: list[HourSlot],
@@ -1499,7 +1476,7 @@ def compute_max_worthwhile_charge_price(slots: list[HourSlot],
 # 6.  LP OPTIMISER
 # ---------------------------------------------------------------------------
 
-def optimise(
+def optimise(  # noqa: C901
     start_qtr_idx: int,
     prices: dict[int, float],
     radiation: dict[str, dict],
@@ -1579,263 +1556,189 @@ def optimise(
              "enabled" if PV_CURTAIL_ENABLED else "disabled")
 
     ev_load = compute_ev_load_schedule(start_qtr_idx, n, prices, ev_soc, current_hour)
-    # pv_surplus in kW (upper bound for passive_charge): (pv - load - ev) kWh/slot / SLOT_H
+    # pv_surplus[t] in kW: max PV available for charging in slot t
     pv_surplus = [max(0.0, (slot.pv_kwh - slot.load_kwh - ev_load[t]) / SLOT_H)
                   for t, slot in enumerate(slots)]
 
     initial_soc_kwh_raw  = min(initial_soc_pct / 100.0 * BAT_CAPACITY_KWH, BAT_MAX_KWH)
-    if initial_soc_kwh_raw < BAT_LOAD_FIRST_MIN_KWH:
+    if initial_soc_kwh_raw < BAT_MIN_KWH:
         log.warning("SoC %.1f%% (%.2f kWh) is below absolute LP floor %.1f%% (%.2f kWh) — "
                     "clamping to floor for LP (BMS should have blocked discharge at this level)",
                     initial_soc_pct, initial_soc_kwh_raw,
-                    BAT_LOAD_FIRST_MIN_SOC_PCT, BAT_LOAD_FIRST_MIN_KWH)
-    initial_soc_kwh      = max(initial_soc_kwh_raw, BAT_LOAD_FIRST_MIN_KWH)
+                    BAT_MIN_SOC_PCT, BAT_MIN_KWH)
+    initial_soc_kwh      = max(initial_soc_kwh_raw, BAT_MIN_KWH)
     current_charge_price = slots[0].import_price()
     discharge_target_t   = find_discharge_target_slot(slots, ev_load, current_charge_price)
     max_charge_price     = [compute_max_worthwhile_charge_price(slots, ev_load, t) for t in range(n)]
-    pv_before_target     = (expected_pv_charge_kwh(slots, ev_load, 0, initial_soc_kwh)
-                            if discharge_target_t is not None else 0.0)
 
-    log.info("LP: discharge_target_t=%s  pv_before_target=%.2f kWh  "
-             "max_charge_price[0]=%.4f",
-             discharge_target_t, pv_before_target,
+    log.info("LP: discharge_target_t=%s  max_charge_price[0]=%.4f",
+             discharge_target_t,
              max_charge_price[0] if max_charge_price else 0.0)
 
-    # Variable layout:
-    #   [0..n-1]        charge_on       binary
-    #   [n..2n-1]       charge_kw       kW grid->battery
-    #   [2n..3n-1]      bat_discharge   kW battery->load
-    #   [3n..4n-1]      passive_charge  kW PV->battery (passive)
-    #   [4n..5n-1]      grid_import     kWh
-    #   [5n..6n-1]      grid_export     kWh
-    #   [6n..7n]        soc             kWh  (n+1 values)
-    #   [7n+1..8n]      pv_curtail      kWh curtailed PV
-    #   [8n+1..9n]      bat_standby     binary (LP_STANDBY_ENABLED only)
-    curtail_base = 7 * n + 1
-    standby_base = 8 * n + 1
-    total_vars   = (9 * n + 1) if LP_STANDBY_ENABLED else (8 * n + 1)
+    # Variable layout (8n+1 total — passive_charge removed):
+    #   [0..n-1]        charge_on      binary: 1=BATTERY_FIRST, 0=LOAD_FIRST
+    #   [n..2n-1]       charge_kw      kW charged into battery
+    #   [2n..3n-1]      bat_discharge  kW discharged from battery
+    #   [3n..4n-1]      grid_import    kWh
+    #   [4n..5n-1]      grid_export    kWh
+    #   [5n..6n]        soc            kWh  (n+1 values, soc[0] = initial)
+    #   [6n+1..7n]      pv_curtail     kWh curtailed PV
+    #   [7n+1..8n]      bat_standby    binary (LP_STANDBY_ENABLED only)
+    co_base  = 0
+    ck_base  = n
+    bd_base  = 2 * n
+    gi_base  = 3 * n
+    ge_base  = 4 * n
+    soc_base = 5 * n
+    ct_base  = 6 * n + 1
+    sb_base  = 7 * n + 1
+    total_vars = 8 * n + 1
 
+    # Objective coefficients
     c_obj = np.zeros(total_vars)
     for t, slot in enumerate(slots):
-        c_obj[4*n + t] = slot.import_price()
-        c_obj[5*n + t] = -slot.export_price()
-        c_obj[2*n + t] += 1e-4
+        c_obj[gi_base + t] =  slot.import_price()
+        c_obj[ge_base + t] = -slot.export_price()
+        c_obj[bd_base + t] += 1e-4  # tiny: discourage unnecessary battery cycling
         net_demand_t = slot.load_kwh + ev_load[t] - slot.pv_kwh
         if net_demand_t >= 0:
-            c_obj[t] += LP_CHARGE_INCENTIVE  # deficit/night: discourage spurious BATTERY_FIRST
-        # PV surplus: no incentive — the energy-balance opportunity cost (export_price)
-        # already guides charge_on correctly.  Adding -LP_CHARGE_INCENTIVE here was
-        # cancelling the price-spread arbitrage (export morning, charge midday).
+            c_obj[co_base + t] += LP_CHARGE_INCENTIVE  # deficit/night: discourage spurious BATTERY_FIRST
         if max_charge_price[t] > 0 and slot.import_price() > max_charge_price[t]:
-            c_obj[n + t] += slot.import_price() - max_charge_price[t]
+            c_obj[ck_base + t] += slot.import_price() - max_charge_price[t]
         if discharge_target_t is not None and t == discharge_target_t:
-            c_obj[6*n + t] += PV_ROOM_PENALTY_EUR_KWH / BAT_CAPACITY_KWH
-        # Tiny curtailment penalty prevents unnecessary curtailment when costs are equal
-        c_obj[curtail_base + t] = 1e-6
+            c_obj[soc_base + t] += PV_ROOM_PENALTY_EUR_KWH / BAT_CAPACITY_KWH
+        c_obj[ct_base + t] = 1e-6  # tiny curtailment penalty
 
-    # Energy balance (equality), per quarter slot (kWh):
-    #   -(charge_kw × SLOT_H) + (bat_discharge × SLOT_H) - (passive_charge × SLOT_H)
-    #   + grid_import - grid_export - pv_curtail = net_demand_kWh
-    # grid_import, grid_export, pv_curtail are kWh/slot; charge_kw etc. are kW.
-    A_eq = np.zeros((2*n + 1, total_vars))
-    b_eq = np.zeros(2*n + 1)
+    # Equality constraints: energy balance + SoC update + initial SoC (2n+1 rows).
+    # Energy balance per slot (kWh):
+    #   -charge_kw*SLOT_H + bat_discharge*SLOT_H + grid_import - grid_export - pv_curtail = net_demand
+    # SoC update (kWh):
+    #   soc[t+1] - soc[t] = charge_kw*SLOT_H*eff - bat_discharge*SLOT_H/eff
+    A_eq = np.zeros((2 * n + 1, total_vars))
+    b_eq = np.zeros(2 * n + 1)
     for t, slot in enumerate(slots):
         net_demand = slot.load_kwh + ev_load[t] - slot.pv_kwh
-        A_eq[t,       n + t] = -SLOT_H
-        A_eq[t,   2*n + t  ] =  SLOT_H
-        A_eq[t,   3*n + t  ] = -SLOT_H
-        A_eq[t,   4*n + t  ] =  1.0
-        A_eq[t,   5*n + t  ] = -1.0
-        A_eq[t, curtail_base + t] = -1.0
+        A_eq[t,     ck_base  + t    ] = -SLOT_H
+        A_eq[t,     bd_base  + t    ] =  SLOT_H
+        A_eq[t,     gi_base  + t    ] =  1.0
+        A_eq[t,     ge_base  + t    ] = -1.0
+        A_eq[t,     ct_base  + t    ] = -1.0
         b_eq[t] = net_demand
-        # SoC balance (kWh): delta_soc = charge × SLOT_H × eff - discharge × SLOT_H / eff
-        A_eq[n+t,       n + t  ] = -BAT_CHARGE_EFF    * SLOT_H
-        A_eq[n+t,   2*n + t    ] =  1.0 / BAT_DISCHARGE_EFF * SLOT_H
-        A_eq[n+t,   3*n + t    ] = -BAT_CHARGE_EFF    * SLOT_H
-        A_eq[n+t,   6*n + t    ] = -1.0
-        A_eq[n+t,   6*n + t + 1] =  1.0
-        b_eq[n+t] = 0.0
-    A_eq[2*n, 6*n] = 1.0
-    b_eq[2*n]      = initial_soc_kwh
+        A_eq[n + t, ck_base  + t    ] = -BAT_CHARGE_EFF * SLOT_H
+        A_eq[n + t, bd_base  + t    ] =  SLOT_H / BAT_DISCHARGE_EFF
+        A_eq[n + t, soc_base + t    ] = -1.0
+        A_eq[n + t, soc_base + t + 1] =  1.0
+        b_eq[n + t] = 0.0
+    A_eq[2 * n, soc_base] = 1.0
+    b_eq[2 * n]           = initial_soc_kwh
 
-    # Pre-compute charge_kw_ub before the constraint matrix so row 3*n+t can be
-    # conditioned on it. When charge_kw_ub[t]=0 (battery full, no grid charging allowed),
-    # setting the min-charge coefficient to 0 prevents charge_on=1 from becoming
-    # infeasible — which was blocking BATTERY_FIRST export at high-price slots.
-    _bl = initial_soc_kwh
-    baseline_soc_kwh = [_bl]
-    for _t, _slot in enumerate(slots):
-        _bl_pv = (0.0 if (PV_CURTAIL_ENABLED and _slot.export_price() < 0)
-                  else _slot.pv_kwh)
-        _demand      = max(0.0, _slot.load_kwh + ev_load[_t] - _bl_pv)
-        _deliverable = min((_bl - BAT_LOAD_FIRST_MIN_KWH) * BAT_DISCHARGE_EFF,
-                           BAT_MAX_DISCHARGE_KW * SLOT_H)
-        _bl          = max(BAT_LOAD_FIRST_MIN_KWH, _bl - min(_demand, _deliverable) / BAT_DISCHARGE_EFF)
-        _pv_sur      = max(0.0, _bl_pv - _slot.load_kwh - ev_load[_t])
-        _pv_charge   = min(_pv_sur * BAT_CHARGE_EFF, BAT_MAX_KWH - _bl,
-                           BAT_MAX_CHARGE_KW * SLOT_H * BAT_CHARGE_EFF)
-        _bl          = min(BAT_MAX_KWH, _bl + _pv_charge)
-        baseline_soc_kwh.append(_bl)
-
-    charge_kw_ub = []
-    for t in range(n):
-        _soc_t    = baseline_soc_kwh[t]
-        _room     = max(0.0, BAT_MAX_KWH - _soc_t)
-        _pv_cover = min(expected_pv_charge_kwh(slots, ev_load, t, _soc_t), _room)
-        _grid_room = max(0.0, _room - _pv_cover)
-        if min(baseline_soc_kwh[t + 1:]) <= BAT_LOAD_FIRST_MIN_KWH + 0.01:
-            _grid_room = _room
-        charge_kw_ub.append(
-            min(BAT_MAX_CHARGE_KW, _grid_room / SLOT_H / BAT_CHARGE_EFF if _grid_room > 0 else 0.0)
-        )
-
-    A_ub = np.zeros((4*n, total_vars))
-    b_ub = np.zeros(4*n)
-    for t in range(n):
-        A_ub[t,       n + t] = 1.0
-        A_ub[t,   2*n + t  ] = 1.0
-        b_ub[t] = BAT_MAX_CHARGE_KW
-        A_ub[n+t,     n + t] = 1.0
-        A_ub[n+t, 3*n + t  ] = 1.0
-        b_ub[n+t] = BAT_MAX_CHARGE_KW
-        A_ub[2*n+t,     t  ] = -BAT_MAX_CHARGE_KW
-        A_ub[2*n+t, n + t  ] =  1.0
-        b_ub[2*n+t] = 0.0
-        A_ub[3*n+t,     t  ] =  min(BAT_MIN_CHARGE_KW, charge_kw_ub[t])
-        A_ub[3*n+t, n + t  ] = -1.0
-        b_ub[3*n+t] = 0.0
-
-    # Dynamic SoC floor: reserve enough battery for LOAD_FIRST overnight until next PV surplus.
-    # Floor[t] = 20% + load_until_pv[t] / BAT_DISCHARGE_EFF, capped at BAT_MAX_KWH.
-    # Self-consistent: as the night progresses and load is consumed, the floor shrinks at
-    # the same rate as the SoC shrinks in LOAD_FIRST mode, so the constraint stays feasible.
-    _max_reserve = BAT_MAX_KWH - BAT_LOAD_FIRST_MIN_KWH  # headroom above 20%
+    # Flat SoC floor: LP optimizes over the full 2-day horizon and keeps enough energy
+    # for overnight on its own.  A dynamic reserve-until-PV floor creates infeasibility
+    # when the peak discharge window spans the PV-end transition (floor jumps from 20%
+    # to 70%+ in a single slot), so we keep the floor flat at the hard BMS minimum.
     soc_lb = []
     soc_ub = []
     for t in range(n + 1):
-        if t == 0:
-            lo = min(BAT_LOAD_FIRST_MIN_KWH, initial_soc_kwh)
-        else:
-            _load_to_pv = compute_load_until_pv_surplus(slots, ev_load, t)
-            _reserve    = min(_max_reserve, _load_to_pv / BAT_DISCHARGE_EFF)
-            lo          = BAT_LOAD_FIRST_MIN_KWH + _reserve
+        lo = min(BAT_MIN_KWH, initial_soc_kwh) if t == 0 else BAT_MIN_KWH
         soc_lb.append(lo)
         soc_ub.append(max(BAT_MAX_KWH, initial_soc_kwh) if t == 0 else BAT_MAX_KWH)
 
-    # Log dynamic floor at key horizon points for observability.
-    _fl = soc_lb
-    _f0 = _fl[0];  _f12 = _fl[min(48, n)];  _f24 = _fl[min(96, n)];  _fpk = max(_fl)
     _pct = lambda k: k / BAT_CAPACITY_KWH * 100
-    log.info("Dynamic SoC floor: now=%.1f%% (%.2f kWh)  +12h=%.1f%% (%.2f kWh)  "
-             "+24h=%.1f%% (%.2f kWh)  peak=%.1f%% (%.2f kWh)",
-             _pct(_f0), _f0, _pct(_f12), _f12, _pct(_f24), _f24, _pct(_fpk), _fpk)
+    log.info("SoC floor: flat %.1f%% (%.2f kWh) throughout horizon",
+             _pct(soc_lb[1]), soc_lb[1])
 
-    bat_discharge_ub = [BAT_MAX_DISCHARGE_KW for _ in range(n)]
-    # baseline_soc_kwh and charge_kw_ub computed above (before constraint matrix).
+    # Variable bounds
+    M = BAT_MAX_DISCHARGE_KW + BAT_MAX_CHARGE_KW  # big-M for LOAD_FIRST constraints
 
-    # Curtailment only when all-in export price < 0.
-    curtail_ub = [
-        slot.pv_kwh if (PV_CURTAIL_ENABLED and slot.export_price() < 0) else 0.0
-        for slot in slots
-    ]
-
-    lb_vars = ([0.0]*n + [0.0]*n + [0.0]*n + [0.0]*n + [0.0]*n + [0.0]*n + soc_lb +
-               [0.0]*n + ([0.0]*n if LP_STANDBY_ENABLED else []))
-    # STANDBY is only meaningful when there is PV surplus to block from passively
-    # charging the battery.  At night (no PV) bat_standby=1 would just mean "use grid
-    # instead of battery", which is not the intended semantics and leads the LP to
-    # hoard the battery overnight rather than covering load via LOAD_FIRST.
-    standby_ub = ([1.0 if pv_surplus[t] > 0 else 0.0 for t in range(n)]
-                  if LP_STANDBY_ENABLED else [])
-    ub_vars = ([1.0]*n + charge_kw_ub + bat_discharge_ub +
-               [min(s, BAT_MAX_CHARGE_KW) for s in pv_surplus] +
-               [np.inf]*n + [np.inf]*n + soc_ub +
-               curtail_ub + standby_ub)
+    lb_vars = np.zeros(total_vars)
+    ub_vars = np.full(total_vars, np.inf)
+    ub_vars[co_base : co_base + n] = 1.0              # charge_on: binary [0,1]
+    ub_vars[ck_base : ck_base + n] = BAT_MAX_CHARGE_KW  # charge_kw: [0, 3 kW]
+    ub_vars[bd_base : bd_base + n] = BAT_MAX_DISCHARGE_KW  # bat_discharge: [0, 3 kW]
+    for t in range(n + 1):
+        lb_vars[soc_base + t] = soc_lb[t]
+        ub_vars[soc_base + t] = soc_ub[t]
+    for t, slot in enumerate(slots):
+        ub_vars[ct_base + t] = (slot.pv_kwh
+                                if (PV_CURTAIL_ENABLED and slot.export_price() < 0)
+                                else 0.0)
+    if LP_STANDBY_ENABLED:
+        for t in range(n):
+            # STANDBY only meaningful when PV is present; at night it would mean "use grid
+            # instead of battery" which is not the intended semantics.
+            ub_vars[sb_base + t] = 1.0 if pv_surplus[t] > 0 else 0.0
 
     integrality = np.zeros(total_vars)
-    integrality[:n] = 1   # charge_on is binary
+    integrality[co_base : co_base + n] = 1
     if LP_STANDBY_ENABLED:
-        integrality[standby_base:standby_base + n] = 1  # bat_standby is binary
+        integrality[sb_base : sb_base + n] = 1
 
-    # LOAD_FIRST passive drain: model that the inverter in LOAD_FIRST uses the battery
-    # (not the grid) to cover net demand. Without this, the LP can plan battery=0 +
-    # grid=demand, which is economically valid but physically impossible with this inverter.
-    #
-    # Constraint A: bat_discharge[t] <= lf_net_demand_kw[t] + M * charge_on[t]
-    #   charge_on=0 (LOAD_FIRST): battery discharges exactly the deficit
-    #   charge_on=1 (BATTERY_FIRST+CHARGE): no upper bound (M is large)
-    #
-    # Constraint B: grid_import[t] <= lf_net_demand_kwh[t] + M*SLOT_H * charge_on[t]
-    #   charge_on=0: grid imports at most lf_net_demand (fallback when battery is empty)
-    #   charge_on=1: no upper bound
-    #
-    # Constraint C: bat_discharge[t] >= lf_net_demand_kw[t] - M * charge_on[t]
-    #   charge_on=0: battery must cover at least the full deficit
-    #   charge_on=1: no lower bound
-    M_LF = BAT_MAX_DISCHARGE_KW + BAT_MAX_CHARGE_KW  # = 6.0 kW
-    lf_net_demand_kw = [
-        max(0.0, (slot.load_kwh + ev_load[t] - slot.pv_kwh) / SLOT_H)
-        for t, slot in enumerate(slots)
-    ]
-    lf_net_demand_kwh = [
-        max(0.0, slot.load_kwh + ev_load[t] - slot.pv_kwh)
-        for t, slot in enumerate(slots)
-    ]
+    # Precompute per-slot LOAD_FIRST quantities
+    lf_kw  = [max(0.0, (slot.load_kwh + ev_load[t] - slot.pv_kwh) / SLOT_H)
+              for t, slot in enumerate(slots)]
+    lf_kwh = [max(0.0,  slot.load_kwh + ev_load[t] - slot.pv_kwh)
+              for t, slot in enumerate(slots)]
 
-    A_ub_lf = np.zeros((3 * n, total_vars))
-    b_ub_lf = np.zeros(3 * n)
+    # Inequality constraints per slot (3 base + 3 standby = 3n or 6n total):
+    #
+    # 1. ck ≤ eff_sur + BAT_MAX*co  (eff_sur = min(pv_surplus, BAT_MAX_CHARGE_KW))
+    #    LOAD_FIRST (co=0): charge_kw ≤ min(pv_surplus, BAT_MAX) — PV-only charging
+    #    BATTERY_FIRST (co=1): effectively uncapped (variable UB = BAT_MAX applies)
+    #
+    # 2. bd ≤ lf_kw + M*co      (LOAD_FIRST: cap discharge at demand; BATTERY_FIRST: uncapped)
+    #
+    # 3. gi ≤ lf_kwh + M*SLOT_H*co  (LOAD_FIRST: no grid import for charging)
+    #
+    # [standby only:]
+    # 4. ck + BAT_MAX*sb ≤ BAT_MAX    → sb=1 forces ck = 0
+    # 5. bd + BAT_MAX_D*sb ≤ BAT_MAX_D → sb=1 forces bd = 0
+    # 6. co + sb ≤ 1                   → can't be both BATTERY_FIRST and STANDBY
+    n_ineq = 3 * n + (3 * n if LP_STANDBY_ENABLED else 0)
+    A_ub = np.zeros((n_ineq, total_vars))
+    b_ub = np.zeros(n_ineq)
+
     for t in range(n):
-        # Constraint A: bat_discharge[t] (kW) <= lf_net_demand_kw[t] + M * charge_on[t]
-        A_ub_lf[t,       2*n + t] =  1.0
-        A_ub_lf[t,       t      ] = -M_LF
-        b_ub_lf[t]                 = lf_net_demand_kw[t]
-        # Constraint B: grid_import[t] (kWh) <= lf_net_demand_kwh[t] + M*SLOT_H * charge_on[t]
-        A_ub_lf[n + t,   4*n + t] =  1.0
-        A_ub_lf[n + t,   t      ] = -M_LF * SLOT_H
-        b_ub_lf[n + t]             = lf_net_demand_kwh[t]
-        # Constraint C: bat_discharge[t] (kW) >= lf_net_demand_kw[t] - M * charge_on[t]
-        A_ub_lf[2*n + t, 2*n + t] = -1.0
-        A_ub_lf[2*n + t, t      ] = -M_LF
-        b_ub_lf[2*n + t]           = -lf_net_demand_kw[t]
+        sur     = pv_surplus[t]
+        eff_sur = min(sur, BAT_MAX_CHARGE_KW)  # cap at max charge rate (HW limit)
+        # 1. ck ≤ eff_sur + BAT_MAX*co  →  ck - BAT_MAX*co ≤ eff_sur
+        A_ub[t,         ck_base + t] =  1.0
+        A_ub[t,         co_base + t] = -BAT_MAX_CHARGE_KW
+        b_ub[t]                      =  eff_sur
+        # 2. bd ≤ lf_kw + M*co  →  bd - M*co ≤ lf_kw
+        A_ub[n + t,     bd_base + t] =  1.0
+        A_ub[n + t,     co_base + t] = -M
+        b_ub[n + t]                  =  lf_kw[t]
+        # 3. gi ≤ lf_kwh + M*SLOT_H*co  →  gi - M*SLOT_H*co ≤ lf_kwh
+        A_ub[2*n + t,   gi_base + t] =  1.0
+        A_ub[2*n + t,   co_base + t] = -M * SLOT_H
+        b_ub[2*n + t]                =  lf_kwh[t]
 
     if LP_STANDBY_ENABLED:
-        # Standby constraints: bat_standby[t]=1 → passive_charge=0, bat_discharge=0,
-        # charge_on=0. Three constraint rows per slot:
-        #   A) passive_charge[t] + pv_surplus[t]*bat_standby[t] <= pv_surplus[t]
-        #   B) bat_discharge[t] + BAT_MAX_DISCHARGE_KW*bat_standby[t] <= BAT_MAX_DISCHARGE_KW
-        #   C) charge_on[t] + bat_standby[t] <= 1
-        A_ub_std = np.zeros((3 * n, total_vars))
-        b_ub_std = np.zeros(3 * n)
+        base = 3 * n
         for t in range(n):
-            A_ub_std[t,         3*n + t         ] = 1.0
-            A_ub_std[t,         standby_base + t ] = pv_surplus[t]
-            b_ub_std[t]                            = pv_surplus[t]
-            A_ub_std[n + t,     2*n + t         ] = 1.0
-            A_ub_std[n + t,     standby_base + t ] = BAT_MAX_DISCHARGE_KW
-            b_ub_std[n + t]                        = BAT_MAX_DISCHARGE_KW
-            A_ub_std[2*n + t,   t               ] = 1.0
-            A_ub_std[2*n + t,   standby_base + t ] = 1.0
-            b_ub_std[2*n + t]                      = 1.0
-            # Relax LOAD_FIRST bat_discharge lower-bound (constraint C in A_ub_lf)
-            # when standby is active — battery cannot cover load in standby mode.
-            A_ub_lf[2*n + t,    standby_base + t ] = -M_LF
+            r = base + 3 * t
+            # 6. ck + BAT_MAX*sb ≤ BAT_MAX
+            A_ub[r,     ck_base + t] =  1.0
+            A_ub[r,     sb_base + t] =  BAT_MAX_CHARGE_KW
+            b_ub[r]                  =  BAT_MAX_CHARGE_KW
+            # 7. bd + BAT_MAX_D*sb ≤ BAT_MAX_D
+            A_ub[r + 1, bd_base + t] =  1.0
+            A_ub[r + 1, sb_base + t] =  BAT_MAX_DISCHARGE_KW
+            b_ub[r + 1]              =  BAT_MAX_DISCHARGE_KW
+            # 8. co + sb ≤ 1
+            A_ub[r + 2, co_base + t] =  1.0
+            A_ub[r + 2, sb_base + t] =  1.0
+            b_ub[r + 2]              =  1.0
 
-        A_ub_full = np.vstack([A_ub, A_ub_lf, A_ub_std])
-        b_ub_full = np.hstack([b_ub, b_ub_lf, b_ub_std])
-    else:
-        A_ub_full = np.vstack([A_ub, A_ub_lf])
-        b_ub_full = np.hstack([b_ub, b_ub_lf])
-
-    _n_ineq = 4*n + 3*n + (3*n if LP_STANDBY_ENABLED else 0)
-    _n_bin  = n + (n if LP_STANDBY_ENABLED else 0)
+    _n_bin = n + (n if LP_STANDBY_ENABLED else 0)
     dbg(1, DEBUG_OPT, "OPT",
         f"MILP: {total_vars} vars ({_n_bin} binary, {n} curtail)  "
-        f"{2*n+1} eq  {_n_ineq} ineq  standby={'on' if LP_STANDBY_ENABLED else 'off'}")
+        f"{2*n+1} eq  {n_ineq} ineq  standby={'on' if LP_STANDBY_ENABLED else 'off'}")
     result = milp(
         c           = c_obj,
         constraints = [
-            LinearConstraint(A_eq,      lb=b_eq,    ub=b_eq),
-            LinearConstraint(A_ub_full, lb=-np.inf, ub=b_ub_full),
+            LinearConstraint(A_eq, lb=b_eq, ub=b_eq),
+            LinearConstraint(A_ub, lb=-np.inf, ub=b_ub),
         ],
         integrality = integrality,
         bounds      = Bounds(lb=lb_vars, ub=ub_vars),
@@ -1859,16 +1762,12 @@ def optimise(
         return slots, "MILP_FAILED"
 
     x              = result.x
-    charge_on      = x[0          :   n]
-    charge_kw_sol  = x[n          : 2*n]
-    bat_discharge  = x[2*n        : 3*n]
-    passive_charge = x[3*n        : 4*n]
-    _grid_import   = x[4*n        : 5*n]
-    _grid_export   = x[5*n        : 6*n]
-    soc_kwh        = x[6*n        : 7*n + 1]
-    pv_curtail_sol = x[curtail_base: curtail_base + n]
-    bat_standby_sol = (x[standby_base: standby_base + n]
-                       if LP_STANDBY_ENABLED else np.zeros(n))
+    charge_on      = x[co_base  : co_base + n]
+    charge_kw_sol  = x[ck_base  : ck_base + n]
+    bat_disch_sol  = x[bd_base  : bd_base + n]
+    soc_kwh        = x[soc_base : soc_base + n + 1]
+    pv_curtail_sol = x[ct_base  : ct_base + n]
+    standby_sol    = (x[sb_base : sb_base + n] if LP_STANDBY_ENABLED else np.zeros(n))
 
     obj_value = result.fun
     dbg(1, DEBUG_OPT, "OPT",
@@ -1876,47 +1775,31 @@ def optimise(
     log.info("MILP solved: objective=€%.4f  status=%d  mode=%s",
              obj_value, result.status, mode)
 
-    slot_lp_vars: list[tuple[int, float, float, float, bool]] = []
+    # Classify action for each slot
     for t, slot in enumerate(slots):
-        co = round(charge_on[t])
-        ck = charge_kw_sol[t]
-        bd = bat_discharge[t]
-        pc = passive_charge[t]
+        co  = round(charge_on[t])
+        sb  = round(standby_sol[t]) if LP_STANDBY_ENABLED else 0
+        ck  = charge_kw_sol[t]
+        bd  = bat_disch_sol[t]
+        sur = pv_surplus[t]
         slot.ev_kwh         = ev_load[t]
         slot.pv_curtail_kwh = max(0.0, pv_curtail_sol[t])
-        if co == 1:
-            if ck <= BAT_MIN_CHARGE_KW * 1.05 and bd >= LP_DISCHARGE_MIN_KW:
-                # charge_on=1 puts inverter in BATTERY_FIRST mode for export.
-                # ck is at or near the forced minimum (constraint artifact, not real
-                # charging intent). Dominant intent is discharge/export to grid.
-                # Check this BEFORE pv_surplus so discharge intent wins over PV_CHARGE
-                # when both bat_d and pv_surplus are present simultaneously.
-                slot.action    = "BATTERY_FIRST+DISCHARGE"
-                slot.charge_kw = 0.0
-            elif ck <= BAT_MIN_CHARGE_KW * 1.05 and pv_surplus[t] > 0:
-                # LP wants to charge but barely from grid + PV available
-                # -> PV fills battery; AC charging disabled by control_growatt
-                slot.action    = "BATTERY_FIRST+PV_CHARGE"
-                slot.charge_kw = 0.0
-            elif ck <= BAT_MIN_CHARGE_KW * 1.05:
-                # charge_on=1 but no meaningful PV, discharge or grid-charge intent.
-                # LP_CHARGE_INCENTIVE artifact: treat as LOAD_FIRST so the simulation
-                # doesn't spuriously charge 0.30 kW from grid when charge_kw_ub=0.
-                slot.action    = "LOAD_FIRST"
-                slot.charge_kw = 0.0
-            else:
-                slot.action    = "BATTERY_FIRST+CHARGE"
-                slot.charge_kw = max(BAT_MIN_CHARGE_KW, min(ck, BAT_MAX_CHARGE_KW))
-        elif bd >= LP_DISCHARGE_MIN_KW:
-            slot.action    = "BATTERY_FIRST+DISCHARGE"
-            slot.charge_kw = 0.0
-        elif LP_STANDBY_ENABLED and round(bat_standby_sol[t]) == 1:
+        if sb == 1:
             slot.action    = "STANDBY"
             slot.charge_kw = 0.0
-        else:
-            slot.action    = "LOAD_FIRST"
+        elif co == 1 and bd >= LP_DISCHARGE_MIN_KW:
+            slot.action    = "BATTERY_FIRST+DISCHARGE"
             slot.charge_kw = 0.0
-        slot_lp_vars.append((co, ck, bd, pc, False))
+        elif co == 1 and ck >= BAT_MIN_CHARGE_KW * 0.5:
+            slot.action    = ("BATTERY_FIRST+CHARGE" if ck > sur + 0.05
+                              else "BATTERY_FIRST+PV_CHARGE")
+            slot.charge_kw = min(ck, BAT_MAX_CHARGE_KW)
+        elif co == 0:
+            slot.action    = "LOAD_FIRST"
+            slot.charge_kw = min(ck, sur)  # = pv_surplus (forced by constraint 2)
+        else:
+            slot.action    = "LOAD_FIRST"  # co=1 but no meaningful charge/discharge
+            slot.charge_kw = 0.0
 
     curtailed_slots = [(t, s) for t, s in enumerate(slots)
                        if s.pv_curtail_kwh >= PV_CURTAIL_MIN_KWH]
@@ -1929,70 +1812,74 @@ def optimise(
     else:
         log.info("%s: no PV curtailment needed in this schedule", WIP)
 
+    # Dispatch simulation — use LP values directly, no override heuristics
     action_counts: dict[str, int] = {}
     running_soc = initial_soc_kwh
     for t, slot in enumerate(slots):
-        co, ck, bd, pc, discharge_overridden = slot_lp_vars[t]
         soc_before   = running_soc
         total_demand = slot.load_kwh + ev_load[t]
-
         effective_pv = slot.pv_kwh - slot.pv_curtail_kwh
         net          = effective_pv - total_demand
 
         if slot.action == "BATTERY_FIRST+CHARGE":
-            room             = BAT_MAX_KWH - running_soc
-            max_charge_kwh   = BAT_MAX_CHARGE_KW * SLOT_H
-            actual_charge_kwh = min(slot.charge_kw * SLOT_H,
-                                    room / BAT_CHARGE_EFF if BAT_CHARGE_EFF > 0 else room,
-                                    max_charge_kwh)
-            actual_charge_kwh = max(actual_charge_kwh, 0.0)
-            bat_stored        = actual_charge_kwh * BAT_CHARGE_EFF
-            running_soc       = min(running_soc + bat_stored, BAT_MAX_KWH)
-            grid_net          = total_demand + actual_charge_kwh - effective_pv
-            gi                = max(grid_net, 0.0)
-            ge                = max(-grid_net, 0.0)
-            slot.charge_kw    = actual_charge_kwh / SLOT_H
+            room           = BAT_MAX_KWH - running_soc
+            actual_kwh     = min(slot.charge_kw * SLOT_H,
+                                 room / BAT_CHARGE_EFF,
+                                 BAT_MAX_CHARGE_KW * SLOT_H)
+            actual_kwh     = max(actual_kwh, 0.0)
+            bat_stored     = actual_kwh * BAT_CHARGE_EFF
+            running_soc    = min(running_soc + bat_stored, BAT_MAX_KWH)
+            grid_net       = total_demand + actual_kwh - effective_pv
+            gi             = max(grid_net, 0.0)
+            ge             = max(-grid_net, 0.0)
+            slot.charge_kw = actual_kwh / SLOT_H
+
         elif slot.action == "BATTERY_FIRST+PV_CHARGE":
-            pv_surplus_t      = max(effective_pv - total_demand, 0.0)
-            room              = BAT_MAX_KWH - running_soc
-            bat_stored        = min(min(pv_surplus_t, BAT_MAX_CHARGE_KW * SLOT_H) * BAT_CHARGE_EFF, room)
-            running_soc       = min(running_soc + bat_stored, BAT_MAX_KWH)
-            bat_absorbed      = bat_stored / BAT_CHARGE_EFF if BAT_CHARGE_EFF > 0 else bat_stored
-            gi                = max(total_demand - effective_pv, 0.0)
-            ge                = max(pv_surplus_t - bat_absorbed, 0.0)
-            slot.charge_kw    = bat_absorbed / SLOT_H
+            # Charge at LP-planned rate from PV; export the remainder — NOT 100% absorption.
+            room           = BAT_MAX_KWH - running_soc
+            actual_kwh     = min(slot.charge_kw * SLOT_H,
+                                 room / BAT_CHARGE_EFF,
+                                 BAT_MAX_CHARGE_KW * SLOT_H,
+                                 max(net, 0.0))
+            actual_kwh     = max(actual_kwh, 0.0)
+            bat_stored     = actual_kwh * BAT_CHARGE_EFF
+            running_soc    = min(running_soc + bat_stored, BAT_MAX_KWH)
+            gi             = max(total_demand - effective_pv, 0.0)
+            ge             = max(net - actual_kwh, 0.0)
+            slot.charge_kw = actual_kwh / SLOT_H
+
         elif slot.action == "BATTERY_FIRST+DISCHARGE":
-            bat_drained  = bd * SLOT_H / BAT_DISCHARGE_EFF
-            running_soc  = max(running_soc - bat_drained, BAT_LOAD_FIRST_MIN_KWH)
-            actual_drain = soc_before - running_soc
-            delivered    = actual_drain * BAT_DISCHARGE_EFF
+            bat_drained  = bat_disch_sol[t] * SLOT_H / BAT_DISCHARGE_EFF
+            running_soc  = max(running_soc - bat_drained, BAT_MIN_KWH)
+            delivered    = (soc_before - running_soc) * BAT_DISCHARGE_EFF
             grid_net     = total_demand - effective_pv - delivered
             gi           = max(grid_net, 0.0)
             ge           = max(-grid_net, 0.0)
+
         elif slot.action == "STANDBY":
-            # Battery fully passive (BMS 0 A): PV surplus → grid, deficit → grid import.
-            # SoC is unchanged.
             gi = max(-net, 0.0)
             ge = max(net,  0.0)
-        else:  # LOAD_FIRST
+
+        else:  # LOAD_FIRST: battery covers deficit; full PV surplus → battery (automatic)
             if net >= 0:
-                room              = BAT_MAX_KWH - running_soc
-                max_pv_store      = BAT_MAX_CHARGE_KW * SLOT_H * BAT_CHARGE_EFF
-                bat_stored        = min(net * BAT_CHARGE_EFF, room, max_pv_store)
-                running_soc       = min(running_soc + bat_stored, BAT_MAX_KWH)
-                bat_absorbed      = bat_stored / BAT_CHARGE_EFF if BAT_CHARGE_EFF > 0 else bat_stored
-                overflow          = max(net - bat_absorbed, 0.0)
-                gi, ge            = 0.0, overflow
+                room          = BAT_MAX_KWH - running_soc
+                bat_stored    = min(net * BAT_CHARGE_EFF, room,
+                                    BAT_MAX_CHARGE_KW * SLOT_H * BAT_CHARGE_EFF)
+                running_soc   = min(running_soc + bat_stored, BAT_MAX_KWH)
+                bat_absorbed  = bat_stored / BAT_CHARGE_EFF if BAT_CHARGE_EFF > 0 else bat_stored
+                gi, ge        = 0.0, max(net - bat_absorbed, 0.0)
+                slot.charge_kw = bat_absorbed / SLOT_H
             else:
                 deficit         = -net
-                bat_available   = max(running_soc - BAT_LOAD_FIRST_MIN_KWH, 0.0)
+                bat_available   = max(running_soc - BAT_MIN_KWH, 0.0)
                 bat_deliverable = min(bat_available * BAT_DISCHARGE_EFF,
                                       BAT_MAX_DISCHARGE_KW * SLOT_H)
                 bat_discharge_a = min(deficit, bat_deliverable)
-                bat_drained     = bat_discharge_a / BAT_DISCHARGE_EFF if BAT_DISCHARGE_EFF > 0 else bat_discharge_a
-                running_soc     = max(running_soc - bat_drained, BAT_LOAD_FIRST_MIN_KWH)
-                gi              = max(deficit - bat_discharge_a, 0.0)
-                ge              = 0.0
+                bat_drained     = (bat_discharge_a / BAT_DISCHARGE_EFF
+                                   if BAT_DISCHARGE_EFF > 0 else bat_discharge_a)
+                running_soc     = max(running_soc - bat_drained, BAT_MIN_KWH)
+                gi, ge          = max(deficit - bat_discharge_a, 0.0), 0.0
+                slot.charge_kw  = 0.0
 
         slot.soc_start_pct  = soc_before  / BAT_CAPACITY_KWH * 100.0
         slot.soc_end_pct    = running_soc / BAT_CAPACITY_KWH * 100.0
@@ -2002,15 +1889,14 @@ def optimise(
         slot.cost_fixed_eur = gi * FIXED_TARIFF_EUR_KWH - ge * FIXED_EXPORT_EUR_KWH
         action_counts[slot.action] = action_counts.get(slot.action, 0) + 1
         curtail_str = f"  [curtail={slot.pv_curtail_kwh:.3f}kWh]" if slot.pv_curtail_kwh >= PV_CURTAIL_MIN_KWH else ""
-        _stby = round(bat_standby_sol[t])
         dbg(3, DEBUG_OPT, "OPT",
             f"  {slot.dt.strftime('%d %H:%M')}  {slot.action:<24}  "
             f"spot={slot.price_eur_kwh:.4f}  allin={slot.import_price():.4f}  "
-            f"charge_on={co}  stby={_stby}  charge_kw={slot.charge_kw:.2f}  bat_d={bd:.2f}  "
-            f"pv_avail={effective_pv:.3f}  "
+            f"co={round(charge_on[t])}  sb={round(standby_sol[t])}  "
+            f"ck={charge_kw_sol[t]:.2f}  bd={bat_disch_sol[t]:.2f}  "
+            f"pv_sur={pv_surplus[t]:.3f}  pv_eff={effective_pv:.3f}  "
             f"soc={slot.soc_start_pct:.1f}→{slot.soc_end_pct:.1f}%  "
             f"grid={slot.grid_kwh:+.3f}  cost=€{slot.cost_eur:.4f}"
-            + ("  [override->LF]" if discharge_overridden else "")
             + curtail_str)
 
     dbg(2, DEBUG_OPT, "OPT",
@@ -2018,25 +1904,22 @@ def optimise(
     log.info("LP dispatch summary: %s",
              "  ".join(f"{k}={v}" for k, v in action_counts.items()))
 
-    # Debug: per-slot passive_charge vs STANDBY choice for PV-surplus slots (first 12 h).
-    # Helps diagnose why LP charges battery in high-export-price morning hours instead of
-    # exporting PV and using STANDBY until cheaper midday.
     if DEBUG_OPT:
         _hdr = (f"{'t':>3}  {'dt':>12}  {'exp_p':>6}  {'imp_p':>6}  "
-                f"{'pv_sur':>6}  {'pass_c':>6}  {'stby':>4}  {'co':>2}  "
+                f"{'pv_sur':>6}  {'ck_lp':>6}  {'stby':>4}  {'co':>2}  "
                 f"{'floor':>6}  action")
         _rows = []
-        for t, slot in enumerate(slots[:min(48, n)]):   # first 12 h = 48 quarter-slots
+        for t, slot in enumerate(slots[:min(48, n)]):
             if pv_surplus[t] > 0.01:
                 _rows.append(
                     f"{t:>3}  {slot.dt.strftime('%d %H:%M'):>12}  "
                     f"{slot.export_price():>6.4f}  {slot.import_price():>6.4f}  "
-                    f"{pv_surplus[t]:>6.3f}  {passive_charge[t]:>6.3f}  "
-                    f"{round(bat_standby_sol[t]):>4}  {round(charge_on[t]):>2}  "
+                    f"{pv_surplus[t]:>6.3f}  {charge_kw_sol[t]:>6.3f}  "
+                    f"{round(standby_sol[t]):>4}  {round(charge_on[t]):>2}  "
                     f"{soc_lb[t]:>6.3f}  {slot.action}"
                 )
         if _rows:
-            dbg(1, DEBUG_OPT, "OPT", "PV-slot passive_charge analysis (first 12 h):")
+            dbg(1, DEBUG_OPT, "OPT", "PV-slot ck analysis (first 12 h):")
             dbg(1, DEBUG_OPT, "OPT", _hdr)
             for _r in _rows:
                 dbg(1, DEBUG_OPT, "OPT", _r)
@@ -2057,8 +1940,7 @@ def optimise(
     dbg(1, DEBUG_OPT, "OPT",
         f"LP done: {len(slots)} slots  total_cost=€{total_cost:.4f}  "
         f"SoC {initial_soc_pct:.1f}% → {soc_kwh[-1]/BAT_CAPACITY_KWH*100:.1f}%")
-    # pv_kwh reduced to effective value (0 after curtailment).
-    # Must happen AFTER baseline calculation: baseline uses full PV.
+    # pv_kwh reduced to effective value — must happen AFTER baseline (which uses full PV).
     for _s in slots:
         _s.pv_kwh = max(0.0, _s.pv_kwh - _s.pv_curtail_kwh)
 
