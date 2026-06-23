@@ -20,7 +20,7 @@ Control sources (sph5k.conf control_source key):
   FILE -- sph5k.conf fully controls; DB is ignored
 
 SOC guards (always active, override schedule):
-  LOW  lock (<= 20%): force BATTERY_FIRST+CHARGE 50%; releases >= 22%
+  LOW  lock (<= 18%): force BATTERY_FIRST+CHARGE 50%; releases >= 25%
   HIGH lock (>= 90%): force BATTERY_FIRST+DISCHARGE 50%; releases <= 88%
 
 PV curtailment:
@@ -51,6 +51,9 @@ import serial
 import mysql.connector
 import json
 import paho.mqtt.publish as mqtt_publish
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import battery_constants as bc
+from common.battery_alert import alert_trigger, alert_clear
 
 
 print("=====================================================================================")
@@ -181,7 +184,6 @@ DB_TABLE  = os.environ["DB_TABLE"]
 
 INVERTER_UNIT_ID  = 1
 REMOTE_HOLD_POWER = 1   # 1% -> 0 W, prevents fallback to LOAD_FIRST
-_last_pnet        = None
 _enable           = int(1)
 _disable          = int(0)
 CONF_PATH         = "./sph5k.conf"
@@ -204,6 +206,7 @@ pret_glob         = 0.0   # grid export W (positive = exporting); updated each l
 _bms_zeroed       = False  # True after set_in_standby zeros 0x1367; cleared by reset_bms_limits
 _meter_zero_count = 0      # consecutive meter=0.0 readings; alarm 401 fires after 5
 soc_schedule_lock: bool = False  # module-level init; main_loop() declares global
+vmin_glob: Optional[int] = None  # latest min cell voltage in mV from seplos DB; None if unavailable
 
 # --------------------------------------------------
 # BATTERY SIZING (for kW -> % conversion)
@@ -211,31 +214,30 @@ soc_schedule_lock: bool = False  # module-level init; main_loop() declares globa
 # NOT % of the inverter's AC rating.  SPH5000: PV+battery AC = 5000 W, but
 # max battery charge = max battery discharge = 3000 W -> 100%.
 # --------------------------------------------------
-BAT_RATED_W               = 3000  # max battery charge/discharge power (W)
-DB_SCHEDULE_DISCHARGE_PCT = 100   # % for DISCHARGE action (full 3000 W)
-DB_SCHEDULE_EXPORT_PCT    = 100   # % for EXPORT action   (full 3000 W)
+BAT_RATED_W               = bc.BAT_RATED_W   # 3000 W max battery charge/discharge
+DB_SCHEDULE_DISCHARGE_PCT = 100              # % for DISCHARGE action (full 3000 W)
+DB_SCHEDULE_EXPORT_PCT    = 100              # % for EXPORT action   (full 3000 W)
 
 # --------------------------------------------------
-# FORCE_MAX_CHARGE (temporary export-target measure until 2026-06-16)
-# When the optimizer schedules a CHARGE action, command the full 3 kW instead of
-# (charge_kw + measured PV surplus). PV - load is almost never > 3 kW, so the battery
-# absorbs essentially ALL PV surplus rather than exporting it -> protects the annual
-# export budget. Side effect: the inverter tops up from the grid when surplus < 3 kW
-# (extra import, no extra export). Overcharge is bounded by the 85%/80% PV-disconnect
-# latch. Set False to restore economic, surplus-tracking charge rates after 2026-06-16.
-FORCE_MAX_CHARGE          = True
+# BASE SOC GUARDS — sourced from common/battery_constants.py
+# --------------------------------------------------
+SOC_HIGH_STOP      = bc.SOC_HIGH_STOP      # 90
+SOC_HIGH_RESUME    = bc.SOC_HIGH_RESUME    # 88  (2% hysteresis)
+SOC_DISCHARGE_STOP = bc.SOC_DISCHARGE_STOP # 17  (actual 17.0–17.9%)
+SOC_LOW_STOP       = bc.SOC_LOW_STOP       # 14  (actual 14.0–14.9%)
+SOC_LOW_RESUME     = bc.SOC_LOW_RESUME     # 20  (6% hysteresis)
 
 # --------------------------------------------------
-# BASE SOC GUARDS (independent from schedule latch)
+# CELL-VOLTAGE GUARDS — mV, parallel to SoC guards above
+# Fires when coulomb-counter SoC is unreliable (drift or sudden recalibration).
 # --------------------------------------------------
-SOC_HIGH_STOP   = 90
-SOC_HIGH_RESUME = 88   # 2% hysteresis (symmetric with LOW)
+VMIN_DISCHARGE_STOP_MV = bc.VMIN_DISCHARGE_STOP_MV  # 3080 mV
+VMIN_LOW_STOP_MV       = bc.VMIN_LOW_STOP_MV        # 3020 mV
+VMIN_LOW_RESUME_MV     = bc.VMIN_LOW_RESUME_MV      # 3150 mV
 
-SOC_LOW_STOP    = 20
-SOC_LOW_RESUME  = 22   # 2% hysteresis (symmetric with HIGH)
-
-base_high_lock = False
-base_low_lock  = False
+base_high_lock     = False
+base_low_lock      = False
+base_low_vmin_lock = False  # True when vmin_mv <= VMIN_LOW_STOP_MV
 CHECK_INTERVAL = 60    # seconds; overwritten by main_loop() from config
 MAX_TIME_SPAN  = 1440  # minutes; overwritten by main_loop() from config
 
@@ -599,8 +601,12 @@ def write_sph5k_reg(client, reg, value, device_id=INVERTER_UNIT_ID):
 def modbus_write_init_registers(client):
     try:
         dbg(1, "SPH", "*WRITE INIT REGISTERS*")
-        write_sph5k_reg(client, REG_ADDR["REG_Charging_cut_off_SOC"],    90)
-        write_sph5k_reg(client, REG_ADDR["REG_Disharging_cut_off_SOC"],  20)
+        write_sph5k_reg(client, REG_ADDR["REG_Charging_cut_off_SOC"],                90)
+        write_sph5k_reg(client, REG_ADDR["REG_Disharging_cut_off_SOC"],              14)
+        # 30406: LOAD_FIRST autonomous discharge cutoff = 14%. SPH stops at ~14.9%.
+        # LP BATTERY_FIRST floor is 18%; Seplos taper cuts at 15.2% — so this register
+        # is only a last-resort hardware safety net below the Seplos soft stop.
+        write_sph5k_reg(client, REG_ADDR["REG_Load_priority_discharge_cut_off_SOC"], 14)
         return True
     except Exception as e:
         traceback.print_exc()
@@ -844,6 +850,27 @@ def kw_to_pct(kw: float) -> int:
     return max(1, min(100, int(kw * 1000 / (BAT_RATED_W / 100))))
 
 
+def read_vmin_from_db() -> Optional[int]:
+    """Return latest min cell voltage in mV from seplos_cell_voltage_min_v, or None."""
+    try:
+        db = mysql.connector.connect(
+            host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
+            db=DB_NAME, ssl_disabled=True, connection_timeout=3
+        )
+        cur = db.cursor()
+        cur.execute(
+            f"SELECT seplos_cell_voltage_min_v FROM {DB_TABLE} "
+            f"WHERE seplos_cell_voltage_min_v IS NOT NULL ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        cur.close()
+        db.close()
+        return round(float(row[0]) * 1000) if row else None
+    except Exception as e:
+        dbg(1, "DB", f"Failed to read vmin: {e}")
+        return None
+
+
 def read_battery_schedule_slot(now: datetime) -> Optional[dict]:
     """Read the battery_schedule slot for the current quarter from the DB.
 
@@ -885,7 +912,7 @@ def read_battery_schedule_slot(now: datetime) -> Optional[dict]:
         return None
 
 
-def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: float = 0.0) -> Conf:
+def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: float = 0.0, bat_charge_discharge_w: float = 0.0) -> Conf:
     """Convert a battery_schedule DB row into a Conf object for the control loop.
 
     Action mapping (canonical names):
@@ -914,14 +941,12 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
 
     if action in ("BATTERY_FIRST+CHARGE", "CHARGE"):
         charge_kw    = float(slot.get("charge_kw") or 3.0)
-        # Real-time surplus: current grid export (negative meter = export to grid).
-        # Kept for the debug log below; only used for cfg.power when FORCE_MAX_CHARGE is off.
-        pv_surplus   = max(0.0, -ac_meter_power_w) / 1000.0
+        # PV surplus invariant to battery's own charging: add back what the battery is
+        # already absorbing so the setpoint doesn't collapse as the battery soaks up surplus.
+        pv_surplus   = max(0.0, bat_charge_discharge_w - ac_meter_power_w) / 1000.0
         cfg.priority    = Priority.BATTERY_FIRST
         cfg.mode        = RunMode.CHARGE
-        # FORCE_MAX_CHARGE: command full 3 kW so the battery soaks up all PV surplus
-        # instead of exporting it (see flag definition). Otherwise track charge_kw + surplus.
-        cfg.power       = 100 if FORCE_MAX_CHARGE else kw_to_pct(charge_kw + pv_surplus)
+        cfg.power       = kw_to_pct(charge_kw + pv_surplus)
         cfg.ends_on     = Ends_on.TIME
         cfg.minutes_end = mins_remaining
         cfg.soc_end     = SOC_HIGH_STOP
@@ -940,7 +965,7 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
         cfg.power       = -DB_SCHEDULE_EXPORT_PCT   # negative -> inverter discharges + exports to grid
         cfg.ends_on     = Ends_on.TIME
         cfg.minutes_end = mins_remaining
-        cfg.soc_end     = SOC_LOW_STOP
+        cfg.soc_end     = SOC_DISCHARGE_STOP
 
     elif action == "STANDBY":
         cfg.priority    = Priority.BATTERY_FIRST
@@ -960,8 +985,8 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
 
     dbg(2, "CONF", f"slot_to_conf: action={action} -> priority={cfg.priority}  "
                    f"mode={cfg.mode}  power={cfg.power}  mins_remaining={mins_remaining}"
-                   + (f"  ({'FORCED 3kW; ' if FORCE_MAX_CHARGE else ''}"
-                      f"charge_kw={charge_kw:.2f}+pv_surplus={pv_surplus:.2f}kW  meter={ac_meter_power_w:.0f}W)"
+                   + (f"  (charge_kw={charge_kw:.2f}+pv_surplus={pv_surplus:.2f}kW"
+                      f"  meter={ac_meter_power_w:.0f}W  bat={bat_charge_discharge_w:.0f}W)"
                       if action in ("BATTERY_FIRST+CHARGE", "CHARGE") else ""))
     return cfg
 
@@ -1558,7 +1583,7 @@ def dbg_controller_state(cmd, soc):
             f"{mins_end} | "
             f"SOC={soc_str} | "
             f"HIGH={int(base_high_lock)} "
-            f"LOW={int(base_low_lock)} "
+            f"LOW={int(base_low_lock)}(soc)/{int(base_low_vmin_lock)}(v) "
             f"SOC_LOCK={int(soc_schedule_lock)}"
         )
 
@@ -1568,7 +1593,8 @@ def dbg_controller_state(cmd, soc):
 
 def main_loop():
     global soc_schedule_lock, CHECK_INTERVAL, MAX_TIME_SPAN
-    global base_high_lock, base_low_lock
+    global base_high_lock, base_low_lock, base_low_vmin_lock
+    global vmin_glob
 
     soc_schedule_lock = False
     base_high_lock    = False
@@ -1613,9 +1639,9 @@ def main_loop():
         )
 
     # --------------------------------------------------
-    # Apply SOC guards
+    # Apply SOC + cell-voltage guards
     # --------------------------------------------------
-    def build_final_command(run: ActiveRun, soc: float) -> ControlCommand:
+    def build_final_command(run: ActiveRun, soc: float, vmin_mv: Optional[int]) -> ControlCommand:
 
         cmd = ControlCommand(
             priority=run.priority,
@@ -1630,12 +1656,29 @@ def main_loop():
             minutes_end=run.minutes_end
         )
 
-        # LOW SOC -> force charge at 50% regardless of scheduled mode
-        if base_low_lock:
-            dbg(1, "SPH", "LOW_SOC guard -> forcing charge 50%")
+        # EMERGENCY LOW SOC or LOW VMIN -> force charge (OR-logic: whichever fires first)
+        if base_low_lock or base_low_vmin_lock:
+            reason = (f"vmin={vmin_mv} mV <= {VMIN_LOW_STOP_MV} mV" if base_low_vmin_lock
+                      else f"SOC={soc}% <= {SOC_LOW_STOP}%")
+            dbg(1, "SPH", f"LOW guard -> forcing charge 50% ({reason})")
             cmd.priority = Priority.BATTERY_FIRST
             cmd.mode     = RunMode.CHARGE
             cmd.power    = max(abs(cmd.power or 50), 50)
+
+        # DISCHARGE stop guard: floor reached → switch to LOAD_FIRST.
+        # Fires every loop while in DISCHARGE + (SOC <= 17% OR vmin <= 3080 mV).
+        # base_low_lock / base_low_vmin_lock take absolute priority above this guard.
+        elif run.mode == RunMode.DISCHARGE and (
+            (soc is not None and soc <= SOC_DISCHARGE_STOP) or
+            (vmin_mv is not None and vmin_mv <= VMIN_DISCHARGE_STOP_MV)
+        ):
+            reason = (f"vmin={vmin_mv} mV <= {VMIN_DISCHARGE_STOP_MV} mV"
+                      if vmin_mv is not None and vmin_mv <= VMIN_DISCHARGE_STOP_MV
+                      else f"SOC={soc}% <= {SOC_DISCHARGE_STOP}%")
+            dbg(1, "SPH", f"DISCHARGE_STOP guard -> LOAD_FIRST ({reason})")
+            cmd.priority = Priority.LOAD_FIRST
+            cmd.mode     = None
+            cmd.power    = None
 
         # HIGH SOC -> force discharge at 50% regardless of scheduled mode
         elif base_high_lock:
@@ -1720,6 +1763,10 @@ def main_loop():
 
         regs = run_data_collection(client)
 
+        vmin_db = read_vmin_from_db()
+        if vmin_db is not None:
+            vmin_glob = vmin_db
+
         cfg            = read_conf(CONF_PATH)
         CHECK_INTERVAL = cfg.check_interval
         MAX_TIME_SPAN  = cfg.max_time_span
@@ -1750,7 +1797,8 @@ def main_loop():
                     _last_db_created_at = slot_created
 
                 meter_w     = (regs.get("REG_AC_METER_POWER", 0.0) or 0.0) if regs else 0.0
-                cfg_obj     = slot_to_conf(db_slot, now, cfg, ac_meter_power_w=meter_w)
+                bat_w       = (regs.get("REG_Charge_discharge_power", 0.0) or 0.0) if regs else 0.0
+                cfg_obj     = slot_to_conf(db_slot, now, cfg, ac_meter_power_w=meter_w, bat_charge_discharge_w=bat_w)
                 source      = Source.BASE
                 source_name = f"DB:{db_slot['action']}"
                 dbg(2, "CONF", f"DB schedule active: {source_name}")
@@ -1763,7 +1811,7 @@ def main_loop():
                 cfg_obj, source, source_name = select_config(now, cfg)
 
         # --------------------------------------------------
-        # Update BASE locks
+        # Update BASE locks (SoC + cell voltage)
         # --------------------------------------------------
         if soc_glob is not None:
 
@@ -1778,10 +1826,28 @@ def main_loop():
             if not base_low_lock and soc_glob <= SOC_LOW_STOP:
                 dbg(1, "SPH", f"LOW SOC lock engaged @ {soc_glob}%")
                 base_low_lock = True
+                alert_trigger('soc_low_lock',
+                              f"⚠ SOC lock: {soc_glob}% ≤ {SOC_LOW_STOP}% — noodlading actief")
 
             if base_low_lock and soc_glob >= SOC_LOW_RESUME:
                 dbg(1, "SPH", f"LOW SOC lock released @ {soc_glob}%")
                 base_low_lock = False
+                alert_clear('soc_low_lock',
+                            f"SOC lock opgeheven: {soc_glob}% ≥ {SOC_LOW_RESUME}%")
+
+        if vmin_glob is not None:
+
+            if not base_low_vmin_lock and vmin_glob <= VMIN_LOW_STOP_MV:
+                dbg(1, "SPH", f"LOW VMIN lock engaged @ {vmin_glob} mV")
+                base_low_vmin_lock = True
+                alert_trigger('vmin_low_lock',
+                              f"⚠ VMIN lock: {vmin_glob} mV ≤ {VMIN_LOW_STOP_MV} mV — noodlading actief")
+
+            if base_low_vmin_lock and vmin_glob >= VMIN_LOW_RESUME_MV:
+                dbg(1, "SPH", f"LOW VMIN lock released @ {vmin_glob} mV")
+                base_low_vmin_lock = False
+                alert_clear('vmin_low_lock',
+                            f"VMIN lock opgeheven: {vmin_glob} mV ≥ {VMIN_LOW_RESUME_MV} mV")
 
         # --------------------------------------------------
         # Build pipeline
@@ -1803,7 +1869,7 @@ def main_loop():
                 reset_bms_limits(ser)
             soc_schedule_lock = False
 
-        final_cmd = build_final_command(active_run, soc_glob)
+        final_cmd = build_final_command(active_run, soc_glob, vmin_glob)
 
         dbg_controller_state(final_cmd, soc_glob)
 
@@ -1847,8 +1913,14 @@ def main_loop():
 
         # --------------------------------------------------
         # SOC schedule latch
+        # DISCHARGE mode is excluded: its SOC floor is handled by the
+        # DISCHARGE_STOP guard in build_final_command (LOAD_FIRST override).
+        # Enabling the latch for DISCHARGE would put the inverter in STANDBY
+        # instead of the desired LOAD_FIRST passive drain.
         # --------------------------------------------------
-        if active_run.soc_end is not None and soc_latch_condition(active_run, soc_glob):
+        if (active_run.soc_end is not None
+                and active_run.mode != RunMode.DISCHARGE
+                and soc_latch_condition(active_run, soc_glob)):
             dbg(1, "CONF", f"SOC target reached ({soc_glob}%)")
             soc_schedule_lock = True
 

@@ -2,3 +2,4 @@ python-dotenv==1.0.1
 mysql-connector-python==9.5.0
 pyserial==3.5
 pytz
+paho-mqtt==2.1.0
