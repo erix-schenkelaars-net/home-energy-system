@@ -19,6 +19,7 @@ Configuration via environment variables (see ../.env):
   DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, DB_TABLE
 """
 import os
+import sys
 from dotenv import load_dotenv
 from pathlib import Path
 import serial
@@ -26,6 +27,8 @@ import time
 from datetime import datetime
 from datetime import date
 import mysql.connector
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common.battery_alert import alert_trigger, alert_clear
 
 # Load .env from parent directory (x:/home/pi/docker/.env)
 env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -51,20 +54,20 @@ MAX_CHARGE_LIMIT = 60
 MAX_DISCHARGE_LIMIT = 60   # writing -60 to discharge register means 60 A discharge limit
 
 # Thresholds
-SOC_CHARGE_TAPER_START = 87    # % - begin reducing charge current
+SOC_CHARGE_TAPER_START = 88    # % - begin reducing charge current
 SOC_CHARGE_TAPER_END = 89.8    # % - minimum charge current
-SOC_DISCHARGE_TAPER_START = 23 # % - begin reducing discharge current
-SOC_DISCHARGE_TAPER_END = 20.2 # % - minimum discharge current
+SOC_DISCHARGE_TAPER_START = 17   # % - begin reducing discharge current
+SOC_DISCHARGE_TAPER_END = 15.2  # % - minimum discharge current
 
 VMAX_TAPER_START_MV = 3400     # mV - begin voltage charge taper
 VMAX_TAPER_END_MV = 3500       # mV - stop charging at cell level
 VMIN_TAPER_START_MV = 3150     # mV - begin voltage discharge taper
 VMIN_TAPER_END_MV = 2950       # mV - hard discharge floor
 
-VDELTA_TAPER_START_MV = 30     # mV - begin reducing both charge and discharge when cells diverge
-VDELTA_TAPER_END_MV   = 60     # mV - stop both completely (well below EVE MB31 BMS intervention ~100 mV)
+VDELTA_TAPER_START_MV = 25     # mV - begin reducing discharge when cells diverge
+VDELTA_TAPER_END_MV   = 35     # mV - discharge = 0A (well below EVE MB31 BMS intervention ~100 mV)
 
-TMAX_TAPER_START = 40          # °C - begin high-temp taper
+TMAX_TAPER_START = 50          # °C - begin high-temp taper (max in spec is 60)
 TMAX_CUTOFF = 55               # °C - stop all current above this
 TMIN_CHARGE_START = 10         # °C - begin cold charge taper
 TMIN_CHARGE_CUTOFF = 5         # °C - no charging below this (LFP cell damage risk)
@@ -338,9 +341,11 @@ def calculate_dynamic_limits(soc, vmin_mv, vmax_mv, vdiff_mv, tmax, tmin):
 
     # ----------------------------------------------------------------
     # 6. Cell voltage delta taper — imbalanced pack protection
-    #    High spread means one cell races ahead or lags behind;
-    #    both charge and discharge are unsafe at full rate until the
-    #    pack rebalances. Single symmetric threshold from EVE MB31 spec.
+    #    High spread means a weak cell lags behind on discharge; limit
+    #    discharge rate to protect it. Charge is NOT limited here:
+    #    at deep discharge with high spread we want to allow charging
+    #    to recover the pack — overcharging is already caught by the
+    #    vmax taper (section 3) when any cell approaches 3400 mV.
     # ----------------------------------------------------------------
     if vdiff_mv >= VDELTA_TAPER_START_MV:
         vdelta_limit = linear_taper(
@@ -350,7 +355,6 @@ def calculate_dynamic_limits(soc, vmin_mv, vmax_mv, vdiff_mv, tmax, tmin):
             limit_high=MAX_CHARGE_LIMIT,
             limit_low=0.0
         )
-        max_charge    = min(max_charge,    vdelta_limit)
         max_discharge = min(max_discharge, vdelta_limit)
 
     return int(round(max(max_charge, 0.0))), int(round(max(max_discharge, 0.0)))
@@ -646,6 +650,8 @@ def main():
         last_discharge_limit = None
         last_charge_write_ts = 0.0
         last_discharge_write_ts = 0.0
+        last_vdelta_taper_active = False
+        last_vmin_taper_active   = False
         while True:
             pia = safe_modbus_read(ser, 0x1000, 18)
             pib = safe_modbus_read(ser, 0x1100, 26)
@@ -669,6 +675,32 @@ def main():
 
             vmin, vmax = min(cell_v), max(cell_v)
             tmin, tmax = min(cell_t), max(cell_t)
+            vdelta = vmax - vmin
+
+            # State-change signaling for taper activation
+            vdelta_taper_active = vdelta >= VDELTA_TAPER_START_MV
+            if vdelta_taper_active and not last_vdelta_taper_active:
+                msg = (f"Vdelta taper: {vdelta} mV (grens {VDELTA_TAPER_START_MV} mV) "
+                       f"vmin={vmin} mV soc={soc}%")
+                dbg(1, DEBUG_MAIN, "MAIN", f"⚠ VDELTA taper STARTED: {msg}")
+                alert_trigger('vdelta_taper', msg)
+            elif not vdelta_taper_active and last_vdelta_taper_active:
+                msg = f"Vdelta taper gestopt: {vdelta} mV soc={soc}%"
+                dbg(1, DEBUG_MAIN, "MAIN", f"✓ VDELTA taper STOPPED: {msg}")
+                alert_clear('vdelta_taper', msg)
+            last_vdelta_taper_active = vdelta_taper_active
+
+            vmin_taper_active = vmin <= VMIN_TAPER_START_MV
+            if vmin_taper_active and not last_vmin_taper_active:
+                msg = (f"Vmin taper: {vmin} mV (grens {VMIN_TAPER_START_MV} mV) "
+                       f"vdelta={vdelta} mV soc={soc}%")
+                dbg(1, DEBUG_MAIN, "MAIN", f"⚠ VMIN taper STARTED: {msg}")
+                alert_trigger('vmin_taper', msg)
+            elif not vmin_taper_active and last_vmin_taper_active:
+                msg = f"Vmin taper gestopt: {vmin} mV soc={soc}%"
+                dbg(1, DEBUG_MAIN, "MAIN", f"✓ VMIN taper STOPPED: {msg}")
+                alert_clear('vmin_taper', msg)
+            last_vmin_taper_active = vmin_taper_active
 
             # ------------------------------------------
             # Dynamic PCS current limit control
@@ -678,7 +710,7 @@ def main():
                 soc,
                 vmin,
                 vmax,
-                vmax - vmin,
+                vdelta,
                 tmax,
                 tmin
             )
