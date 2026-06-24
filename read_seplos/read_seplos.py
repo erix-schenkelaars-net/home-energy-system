@@ -680,6 +680,8 @@ def main():
             pow_t = temp(pib[25])
 
             vmin, vmax = min(cell_v), max(cell_v)
+            vmin_idx  = cell_v.index(vmin) + 1   # 1-based cell number
+            vmax_idx  = cell_v.index(vmax) + 1
             tmin, tmax = min(cell_t), max(cell_t)
             vdelta = vmax - vmin
 
@@ -711,22 +713,22 @@ def main():
             # Messages use worst-case value from the debounce window
             if vdelta_taper_active and not last_vdelta_taper_active:
                 msg = (f"Vdelta taper: {vdelta_worst} mV (grens {VDELTA_TAPER_START_MV} mV) "
-                       f"vmin={vmin_worst} mV soc={soc}%")
+                       f"cel#{vmin_idx}={vmin_worst} mV cel#{vmax_idx}={vmax} mV soc={soc}%")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⚠ VDELTA taper STARTED: {msg}")
                 alert_trigger('vdelta_taper', msg)
             elif not vdelta_taper_active and last_vdelta_taper_active:
-                msg = f"Vdelta taper gestopt: {vdelta} mV soc={soc}%"
+                msg = f"Vdelta taper gestopt: {vdelta} mV cel#{vmin_idx}={vmin} mV soc={soc}%"
                 dbg(1, DEBUG_MAIN, "MAIN", f"✓ VDELTA taper STOPPED: {msg}")
                 alert_clear('vdelta_taper', msg)
             last_vdelta_taper_active = vdelta_taper_active
 
             if vmin_taper_active and not last_vmin_taper_active:
-                msg = (f"Vmin taper: {vmin_worst} mV (grens {VMIN_TAPER_START_MV} mV) "
+                msg = (f"Vmin taper: cel#{vmin_idx}={vmin_worst} mV (grens {VMIN_TAPER_START_MV} mV) "
                        f"vdelta={vdelta_worst} mV soc={soc}%")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⚠ VMIN taper STARTED: {msg}")
                 alert_trigger('vmin_taper', msg)
             elif not vmin_taper_active and last_vmin_taper_active:
-                msg = f"Vmin taper gestopt: {vmin} mV soc={soc}%"
+                msg = f"Vmin taper gestopt: cel#{vmin_idx}={vmin} mV soc={soc}%"
                 dbg(1, DEBUG_MAIN, "MAIN", f"✓ VMIN taper STOPPED: {msg}")
                 alert_clear('vmin_taper', msg)
             last_vmin_taper_active = vmin_taper_active
@@ -831,7 +833,7 @@ def main():
             dbg(2, DEBUG_MAIN, "MAIN", f"active FET states     {active_FET_states}")
             dbg(2, DEBUG_MAIN, "MAIN", f"active hard faults    {active_hard_faults}")
             if charge_limit != MAX_CHARGE_LIMIT or discharge_limit != MAX_DISCHARGE_LIMIT:
-                dbg(1, DEBUG_MAIN, "MAIN", f"⛔ vmin {vmin} mV, vmax {vmax} mV, vdelta {vmax-vmin} mV, tmax {tmax} °C, soc {soc} %")
+                dbg(1, DEBUG_MAIN, "MAIN", f"⛔ cel#{vmin_idx}={vmin} mV, cel#{vmax_idx}={vmax} mV, vdelta {vmax-vmin} mV, tmax {tmax} °C, soc {soc} %")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⛔ charge_limit_A        {charge_limit} A discharge_limit_A {-discharge_limit} A")
 
             # ---- PIC byte explanation ----
