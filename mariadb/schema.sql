@@ -248,6 +248,27 @@ CREATE TABLE IF NOT EXISTS `electricity_prices` (
 
 
 -- ---------------------------------------------------------------------------
+-- battery_alert_latch
+-- ---------------------------------------------------------------------------
+-- One row per alert key. Written by common/battery_alert.py (read_seplos and
+-- control_growatt). Tracks active/cleared state and acknowledgement by the user.
+-- Read by WordPress battery page and homepage tile shortcode.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `battery_alert_latch` (
+  `alert_key`       varchar(40)  NOT NULL                  COMMENT 'vdelta_taper | vmin_taper | soc_low_lock | vmin_low_lock',
+  `active`          tinyint(1)   NOT NULL DEFAULT 0         COMMENT '1 while condition is active, 0 after it clears',
+  `triggered_at`    datetime     DEFAULT NULL               COMMENT 'When the condition first triggered',
+  `cleared_at`      datetime     DEFAULT NULL               COMMENT 'When the condition cleared',
+  `trigger_message` varchar(255) DEFAULT NULL               COMMENT 'Message at trigger time (never overwritten)',
+  `message`         varchar(255) DEFAULT NULL               COMMENT 'Message at clear time',
+  `acknowledged`    tinyint(1)   NOT NULL DEFAULT 0         COMMENT '1 after user clicks "Gezien" in WordPress',
+  `acknowledged_at` datetime     DEFAULT NULL,
+
+  PRIMARY KEY (`alert_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+-- ---------------------------------------------------------------------------
 -- energy_tariffs
 -- ---------------------------------------------------------------------------
 -- Contract tariffs per period (valid_from / valid_until).

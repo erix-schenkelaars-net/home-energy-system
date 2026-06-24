@@ -37,23 +37,29 @@ def _db_write(alert_key: str, active: bool, message: str) -> None:
         ts  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         sql = """
             INSERT INTO battery_alert_latch
-                (alert_key, active, triggered_at, message, acknowledged, acknowledged_at)
-            VALUES (%s, %s, %s, %s, 0, NULL)
+                (alert_key, active, triggered_at, cleared_at,
+                 trigger_message, message, acknowledged, acknowledged_at)
+            VALUES (%s, %s, %s, NULL, %s, NULL, 0, NULL)
             ON DUPLICATE KEY UPDATE
                 active          = VALUES(active),
                 triggered_at    = CASE WHEN VALUES(active) = 1
-                                       THEN VALUES(triggered_at) ELSE triggered_at END,
-                message         = VALUES(message),
+                                       THEN VALUES(triggered_at)    ELSE triggered_at END,
+                cleared_at      = CASE WHEN VALUES(active) = 0
+                                       THEN %s                      ELSE NULL END,
+                trigger_message = CASE WHEN VALUES(active) = 1
+                                       THEN VALUES(trigger_message) ELSE trigger_message END,
+                message         = CASE WHEN VALUES(active) = 0
+                                       THEN %s                      ELSE message END,
                 acknowledged    = CASE WHEN VALUES(active) = 1 THEN 0 ELSE acknowledged END,
                 acknowledged_at = CASE WHEN VALUES(active) = 1 THEN NULL ELSE acknowledged_at END
         """
         cur = db.cursor()
-        cur.execute(sql, (alert_key, int(active), ts, message))
+        cur.execute(sql, (alert_key, int(active), ts, message, ts, message))
         db.commit()
         cur.close()
         db.close()
-    except Exception:
-        pass  # non-fatal
+    except Exception as e:
+        print(f"[battery_alert] DB write failed for {alert_key}: {e}", flush=True)
 
 
 def _mqtt(active: bool, alert_key: str, message: str) -> None:
@@ -74,8 +80,8 @@ def _mqtt(active: bool, alert_key: str, message: str) -> None:
             qos=1,
             retain=True,
         )
-    except Exception:
-        pass  # non-fatal — DB is the authoritative record
+    except Exception as e:
+        print(f"[battery_alert] MQTT publish failed for {alert_key}: {e}", flush=True)
 
 
 def alert_trigger(alert_key: str, message: str) -> None:

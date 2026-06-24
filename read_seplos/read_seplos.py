@@ -20,6 +20,7 @@ Configuration via environment variables (see ../.env):
 """
 import os
 import sys
+from collections import deque
 from dotenv import load_dotenv
 from pathlib import Path
 import serial
@@ -652,6 +653,11 @@ def main():
         last_discharge_write_ts = 0.0
         last_vdelta_taper_active = False
         last_vmin_taper_active   = False
+        vdelta_taper_count  = 0   # consecutive readings >= VDELTA_TAPER_START_MV
+        vmin_taper_count    = 0   # consecutive readings <= VMIN_TAPER_START_MV
+        TAPER_DEBOUNCE      = 5   # readings (~10 s) before taper + alert activate
+        vdelta_window = deque(maxlen=TAPER_DEBOUNCE)  # last N vdelta readings
+        vmin_window   = deque(maxlen=TAPER_DEBOUNCE)  # last N vmin readings
         while True:
             pia = safe_modbus_read(ser, 0x1000, 18)
             pib = safe_modbus_read(ser, 0x1100, 26)
@@ -677,11 +683,35 @@ def main():
             tmin, tmax = min(cell_t), max(cell_t)
             vdelta = vmax - vmin
 
-            # State-change signaling for taper activation
-            vdelta_taper_active = vdelta >= VDELTA_TAPER_START_MV
+            # ------------------------------------------
+            # Debounce taper conditions (taper + alert
+            # only activate after TAPER_DEBOUNCE consecutive readings)
+            # ------------------------------------------
+            vdelta_window.append(vdelta)
+            vmin_window.append(vmin)
+
+            if vdelta >= VDELTA_TAPER_START_MV:
+                vdelta_taper_count = min(vdelta_taper_count + 1, TAPER_DEBOUNCE)
+            else:
+                vdelta_taper_count = 0
+
+            if vmin <= VMIN_TAPER_START_MV:
+                vmin_taper_count = min(vmin_taper_count + 1, TAPER_DEBOUNCE)
+            else:
+                vmin_taper_count = 0
+
+            vdelta_taper_active = vdelta_taper_count >= TAPER_DEBOUNCE
+            vmin_taper_active   = vmin_taper_count   >= TAPER_DEBOUNCE
+
+            # Worst-case values over debounce window (highest vdelta, lowest vmin)
+            vdelta_worst = max(vdelta_window)
+            vmin_worst   = min(vmin_window)
+
+            # State-change logging + alert (only when debounce threshold crossed)
+            # Messages use worst-case value from the debounce window
             if vdelta_taper_active and not last_vdelta_taper_active:
-                msg = (f"Vdelta taper: {vdelta} mV (grens {VDELTA_TAPER_START_MV} mV) "
-                       f"vmin={vmin} mV soc={soc}%")
+                msg = (f"Vdelta taper: {vdelta_worst} mV (grens {VDELTA_TAPER_START_MV} mV) "
+                       f"vmin={vmin_worst} mV soc={soc}%")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⚠ VDELTA taper STARTED: {msg}")
                 alert_trigger('vdelta_taper', msg)
             elif not vdelta_taper_active and last_vdelta_taper_active:
@@ -690,10 +720,9 @@ def main():
                 alert_clear('vdelta_taper', msg)
             last_vdelta_taper_active = vdelta_taper_active
 
-            vmin_taper_active = vmin <= VMIN_TAPER_START_MV
             if vmin_taper_active and not last_vmin_taper_active:
-                msg = (f"Vmin taper: {vmin} mV (grens {VMIN_TAPER_START_MV} mV) "
-                       f"vdelta={vdelta} mV soc={soc}%")
+                msg = (f"Vmin taper: {vmin_worst} mV (grens {VMIN_TAPER_START_MV} mV) "
+                       f"vdelta={vdelta_worst} mV soc={soc}%")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⚠ VMIN taper STARTED: {msg}")
                 alert_trigger('vmin_taper', msg)
             elif not vmin_taper_active and last_vmin_taper_active:
@@ -702,15 +731,20 @@ def main():
                 alert_clear('vmin_taper', msg)
             last_vmin_taper_active = vmin_taper_active
 
+            # Effective values passed to taper calculation: worst-case over debounce window,
+            # suppressed (no taper) until the debounce count is reached
+            vdelta_eff = vdelta_worst if vdelta_taper_active else 0
+            vmin_eff   = vmin_worst   if vmin_taper_active   else VMIN_TAPER_START_MV + 1
+
             # ------------------------------------------
             # Dynamic PCS current limit control
             # ------------------------------------------
 
             charge_limit, discharge_limit = calculate_dynamic_limits(
                 soc,
-                vmin,
+                vmin_eff,
                 vmax,
-                vdelta,
+                vdelta_eff,
                 tmax,
                 tmin
             )

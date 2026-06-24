@@ -27,6 +27,22 @@ mysql -h 127.0.0.1 -u root -p your_db_name < schema.sql
 | `battery_schedule` | battery_optimizer | 192-slot rolling schedule (48 h horizon, 15-min slots) |
 | `electricity_prices` | battery_optimizer | Quarter-hour EPEX spot prices incl. VAT |
 | `energy_tariffs` | manual | Contract tariffs per period (purchase, tax, feed-in) |
+| `battery_alert_latch` | common/battery_alert.py | One row per alert key — active/cleared state + acknowledgement |
+
+### `battery_alert_latch` table
+
+| Column | Description |
+|--------|-------------|
+| `alert_key` (PK) | `vdelta_taper` \| `vmin_taper` \| `soc_low_lock` \| `vmin_low_lock` |
+| `active` | 1 while condition is active, 0 after it clears |
+| `triggered_at` | When the condition first triggered |
+| `cleared_at` | When the condition cleared |
+| `trigger_message` | Message recorded at trigger time — **never overwritten** |
+| `message` | Message recorded at clear time |
+| `acknowledged` | 1 after user clicks "Gezien" in WordPress battery page |
+| `acknowledged_at` | Timestamp of acknowledgement |
+
+Alert keys are set by `common/battery_alert.py` (`alert_trigger` / `alert_clear`), shared between `read_seplos` and `control_growatt`. WordPress battery page shows a red banner for every row where `acknowledged = 0`. The homepage tile blinks when any unacknowledged alert exists.
 
 ### `energy` table — column groups
 
