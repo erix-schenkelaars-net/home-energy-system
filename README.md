@@ -138,3 +138,4 @@ Each service has its own `README.md`:
 - [read_otthing/README.md](read_otthing/README.md) — OpenTherm gateway reader
 - [transfer_p60/README.md](transfer_p60/README.md) — Weheat P60 heat pump bridge
 - [read_bmw/README.md](read_bmw/README.md) — BMW CarData bridge
+- [mariadb/README.md](mariadb/README.md) — MariaDB schema and table reference
