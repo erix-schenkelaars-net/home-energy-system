@@ -26,7 +26,28 @@ mysql -h 127.0.0.1 -u root -p your_db_name < schema.sql
 | `energy` | read_p1, read_seplos, read_resol, read_otthing, transfer_p60 | One row per 5-minute interval — all sensor data |
 | `battery_schedule` | battery_optimizer | 192-slot rolling schedule (48 h horizon, 15-min slots) |
 | `electricity_prices` | battery_optimizer | Quarter-hour EPEX spot prices incl. VAT |
-| `energy_tariffs` | manual | Contract tariffs per period (purchase, tax, feed-in) |
+| `gas_prices` | battery_optimizer | Daily gas spot prices incl. VAT via EnergyZero |
+| `energy_tariffs` | manual | Contract tariffs per period (variable purchase, tax, feed-in) |
+| `fixed_costs` | manual | Fixed daily costs per period (delivery, grid, tax reduction) |
+| `cost_simulation` | battery_optimizer | Per-run cost comparison across scenarios A/B/C/D |
+| `pv_om_forecast` | battery_optimizer | Per-quarter Open-Meteo raw PV forecast (latest snapshot) |
+| `pv_solcast_forecast` | battery_optimizer | Per-quarter Solcast PV forecast (latest snapshot, when available) |
+| `battery_alert_latch` | common/battery_alert.py | One row per alert key — active/cleared state + acknowledgement |
+
+### `battery_alert_latch` table
+
+| Column | Description |
+|--------|-------------|
+| `alert_key` (PK) | `vdelta_taper` \| `vmin_taper` \| `soc_low_lock` \| `vmin_low_lock` |
+| `active` | 1 while condition is active, 0 after it clears |
+| `triggered_at` | When the condition first triggered |
+| `cleared_at` | When the condition cleared |
+| `trigger_message` | Message recorded at trigger time — **never overwritten** |
+| `message` | Message recorded at clear time |
+| `acknowledged` | 1 after user clicks "Gezien" in WordPress battery page |
+| `acknowledged_at` | Timestamp of acknowledgement |
+
+Alert keys are set by `common/battery_alert.py` (`alert_trigger` / `alert_clear`), shared between `read_seplos` and `control_growatt`. WordPress battery page shows a red banner for every row where `acknowledged = 0`. The homepage tile blinks when any unacknowledged alert exists.
 
 ### `energy` table — column groups
 
