@@ -26,7 +26,12 @@ mysql -h 127.0.0.1 -u root -p your_db_name < schema.sql
 | `energy` | read_p1, read_seplos, read_resol, read_otthing, transfer_p60 | One row per 5-minute interval — all sensor data |
 | `battery_schedule` | battery_optimizer | 192-slot rolling schedule (48 h horizon, 15-min slots) |
 | `electricity_prices` | battery_optimizer | Quarter-hour EPEX spot prices incl. VAT |
-| `energy_tariffs` | manual | Contract tariffs per period (purchase, tax, feed-in) |
+| `gas_prices` | battery_optimizer | Daily gas spot prices incl. VAT via EnergyZero |
+| `energy_tariffs` | manual | Contract tariffs per period (variable purchase, tax, feed-in) |
+| `fixed_costs` | manual | Fixed daily costs per period (delivery, grid, tax reduction) |
+| `cost_simulation` | battery_optimizer | Per-run cost comparison across scenarios A/B/C/D |
+| `pv_om_forecast` | battery_optimizer | Per-quarter Open-Meteo raw PV forecast (latest snapshot) |
+| `pv_solcast_forecast` | battery_optimizer | Per-quarter Solcast PV forecast (latest snapshot, when available) |
 | `battery_alert_latch` | common/battery_alert.py | One row per alert key — active/cleared state + acknowledgement |
 
 ### `battery_alert_latch` table
