@@ -1,8 +1,8 @@
 """
 battery_alert.py — shared alert helper for read_seplos and control_growatt.
 
-Writes to battery_alert_latch in MariaDB and publishes to MQTT so Home
-Assistant can push a phone notification.
+Every trigger and clear event gets its own row in battery_alert_latch so the
+full history is preserved. WordPress banner shows all unacknowledged rows.
 
 Usage:
     from common.battery_alert import alert_trigger, alert_clear
@@ -34,27 +34,20 @@ def _db_write(alert_key: str, active: bool, message: str) -> None:
             ssl_disabled=True,
             connection_timeout=5,
         )
-        ts  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        sql = """
-            INSERT INTO battery_alert_latch
-                (alert_key, active, triggered_at, cleared_at,
-                 trigger_message, message, acknowledged, acknowledged_at)
-            VALUES (%s, %s, %s, NULL, %s, NULL, 0, NULL)
-            ON DUPLICATE KEY UPDATE
-                active          = VALUES(active),
-                triggered_at    = CASE WHEN VALUES(active) = 1
-                                       THEN VALUES(triggered_at)    ELSE triggered_at END,
-                cleared_at      = CASE WHEN VALUES(active) = 0
-                                       THEN %s                      ELSE NULL END,
-                trigger_message = CASE WHEN VALUES(active) = 1
-                                       THEN VALUES(trigger_message) ELSE trigger_message END,
-                message         = CASE WHEN VALUES(active) = 0
-                                       THEN %s                      ELSE message END,
-                acknowledged    = CASE WHEN VALUES(active) = 1 THEN 0 ELSE acknowledged END,
-                acknowledged_at = CASE WHEN VALUES(active) = 1 THEN NULL ELSE acknowledged_at END
-        """
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         cur = db.cursor()
-        cur.execute(sql, (alert_key, int(active), ts, message, ts, message))
+        if active:
+            cur.execute("""
+                INSERT INTO battery_alert_latch
+                    (ts, alert_key, active, triggered_at, cleared_at, message, acknowledged)
+                VALUES (%s, %s, 1, %s, NULL, %s, 0)
+            """, (ts, alert_key, ts, message))
+        else:
+            cur.execute("""
+                INSERT INTO battery_alert_latch
+                    (ts, alert_key, active, triggered_at, cleared_at, message, acknowledged)
+                VALUES (%s, %s, 0, NULL, %s, %s, 0)
+            """, (ts, alert_key, ts, message))
         db.commit()
         cur.close()
         db.close()

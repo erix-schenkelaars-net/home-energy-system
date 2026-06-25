@@ -255,16 +255,18 @@ CREATE TABLE IF NOT EXISTS `electricity_prices` (
 -- Read by WordPress battery page and homepage tile shortcode.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `battery_alert_latch` (
-  `alert_key`       varchar(40)  NOT NULL                  COMMENT 'vdelta_taper | vmin_taper | soc_low_lock | vmin_low_lock',
-  `active`          tinyint(1)   NOT NULL DEFAULT 0         COMMENT '1 while condition is active, 0 after it clears',
-  `triggered_at`    datetime     DEFAULT NULL               COMMENT 'When the condition first triggered',
-  `cleared_at`      datetime     DEFAULT NULL               COMMENT 'When the condition cleared',
-  `trigger_message` varchar(255) DEFAULT NULL               COMMENT 'Message at trigger time (never overwritten)',
-  `message`         varchar(255) DEFAULT NULL               COMMENT 'Message at clear time',
-  `acknowledged`    tinyint(1)   NOT NULL DEFAULT 0         COMMENT '1 after user clicks "Gezien" in WordPress',
+  `id`              bigint(20)   NOT NULL AUTO_INCREMENT,
+  `ts`              datetime     DEFAULT NULL               COMMENT 'Event timestamp (trigger or clear)',
+  `alert_key`       varchar(40)  NOT NULL                   COMMENT 'vdelta_taper | vmin_taper | soc_low_lock | vmin_low_lock',
+  `active`          tinyint(1)   NOT NULL DEFAULT 0          COMMENT '1 = trigger event, 0 = clear event',
+  `triggered_at`    datetime     DEFAULT NULL               COMMENT 'Set for trigger events',
+  `cleared_at`      datetime     DEFAULT NULL               COMMENT 'Set for clear events',
+  `message`         varchar(255) DEFAULT NULL               COMMENT 'Event message',
+  `acknowledged`    tinyint(1)   NOT NULL DEFAULT 0          COMMENT '1 after user clicks "Gezien" in WordPress',
   `acknowledged_at` datetime     DEFAULT NULL,
 
-  PRIMARY KEY (`alert_key`)
+  PRIMARY KEY (`id`),
+  KEY `idx_alert_key` (`alert_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 
