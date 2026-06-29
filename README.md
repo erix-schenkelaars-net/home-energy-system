@@ -96,7 +96,7 @@ These names are shared exactly between `battery_optimizer`, `read_growatt`, and 
 
 - Battery SoC: 20 % min hard floor, 89.5 % max (Seplos BMS trips at 89.8 %)
 - Charge/discharge rate: ≤ 3.0 kW
-- Grid export: forbidden until 2026-06-30 (`MINIMIZE_EXPORT` mode); full arbitrage from 2026-07-01
+- Grid export: allowed from 2026-06-17 (`DYNAMIC_PRICE` mode); full arbitrage — buy low, sell high
 
 ## Operational modes
 
@@ -104,8 +104,7 @@ These names are shared exactly between `battery_optimizer`, `read_growatt`, and 
 
 | Period | Mode | Objective |
 |--------|------|-----------|
-| Until 2026-06-30 | `MINIMIZE_EXPORT` | Cover load cheaply; never export |
-| From 2026-07-01 | `DYNAMIC_PRICE` | Full arbitrage — buy low, sell high |
+| From 2026-06-17 | `DYNAMIC_PRICE` | Full arbitrage — buy low, sell high |
 
 ## Running and rebuilding
 
@@ -138,3 +137,4 @@ Each service has its own `README.md`:
 - [read_otthing/README.md](read_otthing/README.md) — OpenTherm gateway reader
 - [transfer_p60/README.md](transfer_p60/README.md) — Weheat P60 heat pump bridge
 - [read_bmw/README.md](read_bmw/README.md) — BMW CarData bridge
+- [mariadb/README.md](mariadb/README.md) — MariaDB schema and table reference

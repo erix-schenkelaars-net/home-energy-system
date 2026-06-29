@@ -16,5 +16,6 @@ services:
       - /dev:/dev
       - .:/app
       - ./logs:/logs
+      - ../common:/app/common:ro
     group_add:
       - dialout

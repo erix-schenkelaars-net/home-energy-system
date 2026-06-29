@@ -248,6 +248,112 @@ CREATE TABLE IF NOT EXISTS `electricity_prices` (
 
 
 -- ---------------------------------------------------------------------------
+-- battery_alert_latch
+-- ---------------------------------------------------------------------------
+-- One row per alert key. Written by common/battery_alert.py (read_seplos and
+-- control_growatt). Tracks active/cleared state and acknowledgement by the user.
+-- Read by WordPress battery page and homepage tile shortcode.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `battery_alert_latch` (
+  `id`              bigint(20)   NOT NULL AUTO_INCREMENT,
+  `ts`              datetime     DEFAULT NULL               COMMENT 'Event timestamp (trigger or clear)',
+  `alert_key`       varchar(40)  NOT NULL                   COMMENT 'vdelta_taper | vmin_taper | soc_low_lock | vmin_low_lock',
+  `active`          tinyint(1)   NOT NULL DEFAULT 0          COMMENT '1 = trigger event, 0 = clear event',
+  `triggered_at`    datetime     DEFAULT NULL               COMMENT 'Set for trigger events',
+  `cleared_at`      datetime     DEFAULT NULL               COMMENT 'Set for clear events',
+  `message`         varchar(255) DEFAULT NULL               COMMENT 'Event message',
+  `acknowledged`    tinyint(1)   NOT NULL DEFAULT 0          COMMENT '1 after user clicks "Gezien" in WordPress',
+  `acknowledged_at` datetime     DEFAULT NULL,
+
+  PRIMARY KEY (`id`),
+  KEY `idx_alert_key` (`alert_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- fixed_costs
+-- ---------------------------------------------------------------------------
+-- Fixed daily costs per period (valid_from / valid_until).
+-- Updated manually when the energy supplier or grid operator changes tariffs.
+-- NULL valid_until means the row is currently active.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `fixed_costs` (
+  `id`                                int(11)      NOT NULL AUTO_INCREMENT,
+  `valid_from`                        date         NOT NULL,
+  `valid_until`                       date         DEFAULT NULL COMMENT 'NULL = currently active',
+  `elec_leveringskosten_day`          decimal(8,6) NOT NULL COMMENT 'Powerpeers fixed delivery costs electricity EUR/day incl. VAT',
+  `gas_leveringskosten_day`           decimal(8,6) NOT NULL COMMENT 'Powerpeers fixed delivery costs gas EUR/day incl. VAT',
+  `vermindering_energiebelasting_day` decimal(8,6) NOT NULL COMMENT 'Energy tax reduction EUR/day incl. VAT (negative)',
+  `elec_systeembeheer_day`            decimal(8,6) NOT NULL COMMENT 'Enexis grid capacity tariff electricity EUR/day incl. VAT',
+  `gas_systeembeheer_day`             decimal(8,6) NOT NULL COMMENT 'Enexis grid capacity tariff gas EUR/day incl. VAT',
+
+  PRIMARY KEY (`id`),
+  KEY `idx_valid_from` (`valid_from`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- gas_prices
+-- ---------------------------------------------------------------------------
+-- Daily gas spot prices (incl. 21% VAT) via EnergyZero.
+-- Written by battery_optimizer; used by cost calculations.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `gas_prices` (
+  `date`            date         NOT NULL COMMENT 'Day local time',
+  `markttarief_m3`  decimal(8,6) NOT NULL COMMENT 'Gas spot incl. VAT EUR/m³ via EnergyZero',
+
+  PRIMARY KEY (`date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- cost_simulation
+-- ---------------------------------------------------------------------------
+-- Per-run cost comparison: scenarios A/B/C/D vs. baseline and dynamic pricing.
+-- Written by battery_optimizer every run; used by dashboard to track savings.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `cost_simulation` (
+  `id`                      bigint(20)  NOT NULL AUTO_INCREMENT,
+  `created_at`              datetime    NOT NULL COMMENT 'Timestamp of the optimiser run',
+  `horizon_hours`           int(11)     NOT NULL COMMENT 'Forecast horizon used',
+  `a_cost_eur`              float       DEFAULT NULL COMMENT 'Scenario A total cost EUR',
+  `a_import_kwh`            float       DEFAULT NULL COMMENT 'Scenario A grid import kWh',
+  `a_export_kwh`            float       DEFAULT NULL COMMENT 'Scenario A grid export kWh',
+  `b_cost_eur`              float       DEFAULT NULL,
+  `b_import_kwh`            float       DEFAULT NULL,
+  `b_export_kwh`            float       DEFAULT NULL,
+  `c_cost_eur`              float       DEFAULT NULL,
+  `c_import_kwh`            float       DEFAULT NULL,
+  `c_export_kwh`            float       DEFAULT NULL,
+  `d_cost_eur`              float       DEFAULT NULL,
+  `d_import_kwh`            float       DEFAULT NULL,
+  `d_export_kwh`            float       DEFAULT NULL,
+  `saving_vs_baseline_eur`  float       DEFAULT NULL COMMENT 'Saving vs. no-battery baseline EUR',
+  `saving_dynamic_vs_fixed` float       DEFAULT NULL COMMENT 'Extra saving from dynamic vs. fixed pricing EUR',
+  `pv_total_kwh`            float       DEFAULT NULL COMMENT 'Total PV production kWh in horizon',
+
+  PRIMARY KEY (`id`),
+  KEY `created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- pv_solcast_forecast
+-- ---------------------------------------------------------------------------
+-- Per-quarter Solcast PV forecast, one row per slot (upsert: latest only).
+-- Written by battery_optimizer when Solcast API is available.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `pv_solcast_forecast` (
+  `slot_dt`    datetime  NOT NULL COMMENT 'Quarter-hour slot start (local time)',
+  `pv_kwh`     float     DEFAULT NULL COMMENT 'Solcast PV forecast for this slot kWh',
+  `created_at` datetime  NOT NULL COMMENT 'Timestamp of the optimiser run that wrote this',
+
+  PRIMARY KEY (`slot_dt`),
+  KEY `created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+
+-- ---------------------------------------------------------------------------
 -- energy_tariffs
 -- ---------------------------------------------------------------------------
 -- Contract tariffs per period (valid_from / valid_until).

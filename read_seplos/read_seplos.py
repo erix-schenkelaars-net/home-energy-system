@@ -19,6 +19,8 @@ Configuration via environment variables (see ../.env):
   DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, DB_TABLE
 """
 import os
+import sys
+from collections import deque
 from dotenv import load_dotenv
 from pathlib import Path
 import serial
@@ -26,6 +28,9 @@ import time
 from datetime import datetime
 from datetime import date
 import mysql.connector
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common.battery_alert import alert_trigger, alert_clear
+from common.battery_constants import SOC_LOW_STOP
 
 # Load .env from parent directory (x:/home/pi/docker/.env)
 env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -51,20 +56,20 @@ MAX_CHARGE_LIMIT = 60
 MAX_DISCHARGE_LIMIT = 60   # writing -60 to discharge register means 60 A discharge limit
 
 # Thresholds
-SOC_CHARGE_TAPER_START = 87    # % - begin reducing charge current
+SOC_CHARGE_TAPER_START = 88    # % - begin reducing charge current
 SOC_CHARGE_TAPER_END = 89.8    # % - minimum charge current
-SOC_DISCHARGE_TAPER_START = 23 # % - begin reducing discharge current
-SOC_DISCHARGE_TAPER_END = 20.2 # % - minimum discharge current
+SOC_DISCHARGE_TAPER_START = 17   # % - begin reducing discharge current
+SOC_DISCHARGE_TAPER_END = 15.2  # % - minimum discharge current
 
 VMAX_TAPER_START_MV = 3400     # mV - begin voltage charge taper
 VMAX_TAPER_END_MV = 3500       # mV - stop charging at cell level
 VMIN_TAPER_START_MV = 3150     # mV - begin voltage discharge taper
 VMIN_TAPER_END_MV = 2950       # mV - hard discharge floor
 
-VDELTA_TAPER_START_MV = 30     # mV - begin reducing both charge and discharge when cells diverge
-VDELTA_TAPER_END_MV   = 60     # mV - stop both completely (well below EVE MB31 BMS intervention ~100 mV)
+VDELTA_TAPER_START_MV = 25     # mV - begin reducing discharge when cells diverge
+VDELTA_TAPER_END_MV   = 35     # mV - discharge = 0A (well below EVE MB31 BMS intervention ~100 mV)
 
-TMAX_TAPER_START = 40          # °C - begin high-temp taper
+TMAX_TAPER_START = 50          # °C - begin high-temp taper (max in spec is 60)
 TMAX_CUTOFF = 55               # °C - stop all current above this
 TMIN_CHARGE_START = 10         # °C - begin cold charge taper
 TMIN_CHARGE_CUTOFF = 5         # °C - no charging below this (LFP cell damage risk)
@@ -338,9 +343,11 @@ def calculate_dynamic_limits(soc, vmin_mv, vmax_mv, vdiff_mv, tmax, tmin):
 
     # ----------------------------------------------------------------
     # 6. Cell voltage delta taper — imbalanced pack protection
-    #    High spread means one cell races ahead or lags behind;
-    #    both charge and discharge are unsafe at full rate until the
-    #    pack rebalances. Single symmetric threshold from EVE MB31 spec.
+    #    High spread means a weak cell lags behind on discharge; limit
+    #    discharge rate to protect it. Charge is NOT limited here:
+    #    at deep discharge with high spread we want to allow charging
+    #    to recover the pack — overcharging is already caught by the
+    #    vmax taper (section 3) when any cell approaches 3400 mV.
     # ----------------------------------------------------------------
     if vdiff_mv >= VDELTA_TAPER_START_MV:
         vdelta_limit = linear_taper(
@@ -350,7 +357,6 @@ def calculate_dynamic_limits(soc, vmin_mv, vmax_mv, vdiff_mv, tmax, tmin):
             limit_high=MAX_CHARGE_LIMIT,
             limit_low=0.0
         )
-        max_charge    = min(max_charge,    vdelta_limit)
         max_discharge = min(max_discharge, vdelta_limit)
 
     return int(round(max(max_charge, 0.0))), int(round(max(max_discharge, 0.0)))
@@ -622,6 +628,31 @@ def update_db(**v):
         dbg(1, DEBUG_DB, "DB", f"⛔ problem with database: {str(e)}")
 
 
+# ---------------- LP ACTION ----------------
+def _get_current_lp_action() -> str | None:
+    """Return the current LP action from battery_schedule, or None on error."""
+    try:
+        now     = datetime.now()
+        slot_dt = now.replace(minute=(now.minute // 15) * 15,
+                              second=0, microsecond=0)
+        db  = mysql.connector.connect(
+            host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
+            db=DB_NAME, connection_timeout=3
+        )
+        cur = db.cursor()
+        cur.execute(
+            "SELECT action FROM battery_schedule "
+            "WHERE slot_dt=%s ORDER BY created_at DESC LIMIT 1",
+            (slot_dt,)
+        )
+        row = cur.fetchone()
+        db.close()
+        return row[0] if row else None
+    except Exception as exc:
+        dbg(1, DEBUG_MAIN, "MAIN", f"LP action query failed: {exc}")
+        return None
+
+
 # ---------------- MAIN ----------------
 def main():
     ser = serial.Serial(PORT, BAUD, parity=PARITY, timeout=TIMEOUT)
@@ -646,6 +677,16 @@ def main():
         last_discharge_limit = None
         last_charge_write_ts = 0.0
         last_discharge_write_ts = 0.0
+        lp_action            = None   # cached LP action from battery_schedule
+        lp_action_ts         = 0.0    # timestamp of last DB query
+        LP_ACTION_INTERVAL   = 30.0   # seconds between battery_schedule queries
+        last_vdelta_taper_active = False
+        last_vmin_taper_active   = False
+        vdelta_taper_count  = 0   # consecutive readings >= VDELTA_TAPER_START_MV
+        vmin_taper_count    = 0   # consecutive readings <= VMIN_TAPER_START_MV
+        TAPER_DEBOUNCE      = 5   # readings (~10 s) before taper + alert activate
+        vdelta_window = deque(maxlen=TAPER_DEBOUNCE)  # last N vdelta readings
+        vmin_window   = deque(maxlen=TAPER_DEBOUNCE)  # last N vmin readings
         while True:
             pia = safe_modbus_read(ser, 0x1000, 18)
             pib = safe_modbus_read(ser, 0x1100, 26)
@@ -668,7 +709,63 @@ def main():
             pow_t = temp(pib[25])
 
             vmin, vmax = min(cell_v), max(cell_v)
+            vmin_idx  = cell_v.index(vmin) + 1   # 1-based cell number
+            vmax_idx  = cell_v.index(vmax) + 1
             tmin, tmax = min(cell_t), max(cell_t)
+            vdelta = vmax - vmin
+
+            # ------------------------------------------
+            # Debounce taper conditions (taper + alert
+            # only activate after TAPER_DEBOUNCE consecutive readings)
+            # ------------------------------------------
+            vdelta_window.append(vdelta)
+            vmin_window.append(vmin)
+
+            if vdelta >= VDELTA_TAPER_START_MV:
+                vdelta_taper_count = min(vdelta_taper_count + 1, TAPER_DEBOUNCE)
+            else:
+                vdelta_taper_count = 0
+
+            if vmin <= VMIN_TAPER_START_MV:
+                vmin_taper_count = min(vmin_taper_count + 1, TAPER_DEBOUNCE)
+            else:
+                vmin_taper_count = 0
+
+            vdelta_taper_active = vdelta_taper_count >= TAPER_DEBOUNCE
+            vmin_taper_active   = vmin_taper_count   >= TAPER_DEBOUNCE
+
+            # Worst-case values over debounce window (highest vdelta, lowest vmin)
+            vdelta_worst = max(vdelta_window)
+            vmin_worst   = min(vmin_window)
+
+            # State-change logging + alert (only when debounce threshold crossed)
+            # Messages use worst-case value from the debounce window
+            if vdelta_taper_active and not last_vdelta_taper_active:
+                msg = (f"Vdelta taper: {vdelta_worst} mV (grens {VDELTA_TAPER_START_MV} mV) "
+                       f"cel#{vmin_idx}={vmin_worst} mV cel#{vmax_idx}={vmax} mV soc={soc}%")
+                dbg(1, DEBUG_MAIN, "MAIN", f"⚠ VDELTA taper STARTED: {msg}")
+                alert_trigger('vdelta_taper', msg)
+            elif not vdelta_taper_active and last_vdelta_taper_active:
+                msg = f"Vdelta taper gestopt: {vdelta} mV cel#{vmin_idx}={vmin} mV soc={soc}%"
+                dbg(1, DEBUG_MAIN, "MAIN", f"✓ VDELTA taper STOPPED: {msg}")
+                alert_clear('vdelta_taper', msg)
+            last_vdelta_taper_active = vdelta_taper_active
+
+            if vmin_taper_active and not last_vmin_taper_active:
+                msg = (f"Vmin taper: cel#{vmin_idx}={vmin_worst} mV (grens {VMIN_TAPER_START_MV} mV) "
+                       f"vdelta={vdelta_worst} mV soc={soc}%")
+                dbg(1, DEBUG_MAIN, "MAIN", f"⚠ VMIN taper STARTED: {msg}")
+                alert_trigger('vmin_taper', msg)
+            elif not vmin_taper_active and last_vmin_taper_active:
+                msg = f"Vmin taper gestopt: cel#{vmin_idx}={vmin} mV soc={soc}%"
+                dbg(1, DEBUG_MAIN, "MAIN", f"✓ VMIN taper STOPPED: {msg}")
+                alert_clear('vmin_taper', msg)
+            last_vmin_taper_active = vmin_taper_active
+
+            # Effective values passed to taper calculation: worst-case over debounce window,
+            # suppressed (no taper) until the debounce count is reached
+            vdelta_eff = vdelta_worst if vdelta_taper_active else 0
+            vmin_eff   = vmin_worst   if vmin_taper_active   else VMIN_TAPER_START_MV + 1
 
             # ------------------------------------------
             # Dynamic PCS current limit control
@@ -676,12 +773,24 @@ def main():
 
             charge_limit, discharge_limit = calculate_dynamic_limits(
                 soc,
-                vmin,
+                vmin_eff,
                 vmax,
-                vmax - vmin,
+                vdelta_eff,
                 tmax,
                 tmin
             )
+
+            # Refresh LP action cache every 30s
+            now_ts = time.time()
+            if now_ts - lp_action_ts > LP_ACTION_INTERVAL:
+                lp_action    = _get_current_lp_action()
+                lp_action_ts = now_ts
+
+            # STANDBY: override BMS limits to 0A — sole writer for BMS registers.
+            # Skip override if SOC is critically low (emergency discharge protection).
+            if lp_action == 'STANDBY' and soc > SOC_LOW_STOP:
+                charge_limit    = 0
+                discharge_limit = 0
 
             # Write on change; also re-send periodically when actively restricting
             # so a Growatt reboot doesn't silently lose a taper limit.
@@ -765,7 +874,7 @@ def main():
             dbg(2, DEBUG_MAIN, "MAIN", f"active FET states     {active_FET_states}")
             dbg(2, DEBUG_MAIN, "MAIN", f"active hard faults    {active_hard_faults}")
             if charge_limit != MAX_CHARGE_LIMIT or discharge_limit != MAX_DISCHARGE_LIMIT:
-                dbg(1, DEBUG_MAIN, "MAIN", f"⛔ vmin {vmin} mV, vmax {vmax} mV, vdelta {vmax-vmin} mV, tmax {tmax} °C, soc {soc} %")
+                dbg(1, DEBUG_MAIN, "MAIN", f"⛔ cel#{vmin_idx}={vmin} mV, cel#{vmax_idx}={vmax} mV, vdelta {vmax-vmin} mV, tmax {tmax} °C, soc {soc} %")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⛔ charge_limit_A        {charge_limit} A discharge_limit_A {-discharge_limit} A")
 
             # ---- PIC byte explanation ----

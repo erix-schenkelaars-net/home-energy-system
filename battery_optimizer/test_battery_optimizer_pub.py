@@ -136,8 +136,10 @@ def prices_make(base=0.22, cheap=0.13, peak=0.33,
     if cheap_h is None: cheap_h = [2, 3, 4, 5]
     if peak_h  is None: peak_h  = [17, 18, 19, 20]
     p = {}
-    for idx in range(48):
-        h = idx % 24
+    # LP uses quarter-hour slots: idx 0 = 00:00, idx 4 = 01:00, idx 12 = 03:00, etc.
+    # Cover the full 2-day (192-slot) horizon so cheap/peak hours map to the right time.
+    for idx in range(192):
+        h = (idx // 4) % 24  # hour-of-day from quarter-slot index
         if h in cheap_h:
             p[idx] = cheap
         elif h in peak_h:
@@ -150,7 +152,7 @@ def prices_make(base=0.22, cheap=0.13, peak=0.33,
 
 
 def run_scenario(soc, rad, prices, ev_soc=None, start_h=0,
-                 mode="MINIMIZE_EXPORT", load=None):
+                 mode="DYNAMIC_PRICE", load=None):
     if load is None:
         load = LOAD_NORM
     return mod.optimise(
@@ -421,7 +423,7 @@ class TestS09NegativePrice(_ScenarioBase):
         self.assertLessEqual(self.max_soc, mod.BAT_MAX_SOC_PCT)
 
     def test_charges_at_negative_price(self):
-        # MINIMIZE_EXPORT mode: check any charging happens
+        # DYNAMIC_PRICE mode: check any charging happens
         charge_slots = [s for s in self.slots if "CHARGE" in s.action]
         self.assertGreater(len(charge_slots), 0, "LP should charge at negative all-in price")
 
@@ -642,6 +644,9 @@ class TestSocConstraintConstants(unittest.TestCase):
     def test_bat_min_soc_is_20(self):
         self.assertEqual(mod.BAT_MIN_SOC_PCT, 20.0)
 
+    def test_bat_min_soc_discharge_is_18(self):
+        self.assertEqual(mod.BAT_MIN_SOC_DISCHARGE_PCT, 18.0)
+
     def test_bat_max_soc_is_within_bms_limit(self):
         # Seplos BMS trips at 89.8%; optimizer uses 89.5% max
         self.assertGreaterEqual(mod.BAT_MAX_SOC_PCT, 85.0)
@@ -666,6 +671,139 @@ class TestSocConstraintConstants(unittest.TestCase):
 
     def test_bat_min_charge_kw_positive(self):
         self.assertGreater(mod.BAT_MIN_CHARGE_KW, 0.0)
+
+    def test_charge_grid_min_margin_is_02(self):
+        self.assertAlmostEqual(mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH, 0.02, places=6)
+
+    def test_charge_grid_min_margin_positive_and_small(self):
+        self.assertGreater(mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH, 0.0)
+        self.assertLess(mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH, 0.10)
+
+
+class TestComputeMaxWorthwhileChargePrice(unittest.TestCase):
+    """Unit tests for compute_max_worthwhile_charge_price; verifies margin is applied."""
+
+    def _make_slot(self, spot, pv_kwh=0.0, load_kwh=0.5):
+        slot = mod.HourSlot(dt=datetime(2026, 5, 8, 12, 0))
+        slot.price_eur_kwh = spot
+        slot.pv_kwh = pv_kwh
+        slot.load_kwh = load_kwh
+        return slot
+
+    def test_margin_subtracted_from_roundtrip_threshold(self):
+        # Two future deficit slots (load > pv); max import price drives the threshold.
+        slots = [
+            self._make_slot(spot=0.20, load_kwh=0.5, pv_kwh=0.0),  # t=0 current
+            self._make_slot(spot=0.30, load_kwh=0.5, pv_kwh=0.0),  # t=1 deficit
+            self._make_slot(spot=0.40, load_kwh=0.5, pv_kwh=0.0),  # t=2 deficit, higher
+        ]
+        ev_load = [0.0, 0.0, 0.0]
+        result = mod.compute_max_worthwhile_charge_price(slots, ev_load, from_t=0)
+
+        tariff = mod.tariff_for(date(2026, 5, 8))
+        max_future_all_in = mod.ec.all_in_import(0.40, tariff)
+        expected = max_future_all_in * mod.BAT_ROUNDTRIP_EFF - mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH
+        self.assertAlmostEqual(result, expected, places=6)
+
+    def test_surplus_slot_excluded_from_threshold(self):
+        # Surplus slot (pv > load) must NOT drive the max price.
+        slots = [
+            self._make_slot(spot=0.20, load_kwh=0.5, pv_kwh=0.0),  # t=0 current
+            self._make_slot(spot=0.50, load_kwh=0.1, pv_kwh=0.9),  # t=1 SURPLUS — excluded
+            self._make_slot(spot=0.30, load_kwh=0.5, pv_kwh=0.0),  # t=2 deficit
+        ]
+        ev_load = [0.0, 0.0, 0.0]
+        result = mod.compute_max_worthwhile_charge_price(slots, ev_load, from_t=0)
+
+        tariff = mod.tariff_for(date(2026, 5, 8))
+        # Only t=2 (spot=0.30) should count; t=1 surplus slot is excluded.
+        max_future_all_in = mod.ec.all_in_import(0.30, tariff)
+        expected = max_future_all_in * mod.BAT_ROUNDTRIP_EFF - mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH
+        self.assertAlmostEqual(result, expected, places=6)
+
+    def test_no_deficit_slots_returns_zero(self):
+        # All future slots have PV surplus → no deficit → return 0.0.
+        slots = [
+            self._make_slot(spot=0.20, load_kwh=0.1, pv_kwh=0.9),  # t=0 surplus
+            self._make_slot(spot=0.50, load_kwh=0.1, pv_kwh=0.9),  # t=1 surplus
+        ]
+        ev_load = [0.0, 0.0]
+        result = mod.compute_max_worthwhile_charge_price(slots, ev_load, from_t=0)
+        self.assertEqual(result, 0.0)
+
+    def test_margin_makes_threshold_strictly_less_than_raw_roundtrip(self):
+        # Threshold must be strictly below (max_future × eff) so 2 ct margin is real.
+        slots = [
+            self._make_slot(spot=0.10, load_kwh=0.5, pv_kwh=0.0),
+            self._make_slot(spot=0.35, load_kwh=0.5, pv_kwh=0.0),
+        ]
+        ev_load = [0.0, 0.0]
+        result = mod.compute_max_worthwhile_charge_price(slots, ev_load, from_t=0)
+
+        tariff = mod.tariff_for(date(2026, 5, 8))
+        raw_roundtrip = mod.ec.all_in_import(0.35, tariff) * mod.BAT_ROUNDTRIP_EFF
+        self.assertLess(result, raw_roundtrip)
+        self.assertAlmostEqual(raw_roundtrip - result,
+                               mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH, places=6)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# S17: Tight price spread — 2 ct/kWh margin prevents base-rate grid charging
+# ══════════════════════════════════════════════════════════════════════════════
+class TestS17MarginPreventsBaseRateCharge(_ScenarioBase):
+    """
+    No PV (100 % cloud), 50 % SoC.
+    cheap=0.03, base=0.18, peak=0.22.
+
+    With CHARGE_GRID_MIN_MARGIN_EUR_KWH = 0.02:
+      effective_base_import = all_in(0.18) + 0.02
+      max_worthwhile        = all_in(0.22) × BAT_ROUNDTRIP_EFF − 0.02
+    The margin makes effective base import exceed max_worthwhile, so the LP
+    must NOT charge from grid during base-rate hours.
+    Cheap hours (0.03, effective ≈ 0.15) remain well below the threshold.
+    """
+    CHEAP_H = {2, 3, 4, 5}
+    PEAK_H  = {17, 18, 19, 20}
+
+    @classmethod
+    def setUpClass(cls):
+        cls._run(
+            soc=50.0,
+            rad=_build_radiation(cloud_flat(100)),
+            prices=prices_make(base=0.18, cheap=0.03, peak=0.22,
+                               cheap_h=list(cls.CHEAP_H),
+                               peak_h=list(cls.PEAK_H)),
+            mode="DYNAMIC_PRICE",
+        )
+
+    def test_solver_ok(self):
+        self.assertEqual(self.st, "OK")
+
+    def test_soc_constraints_respected(self):
+        self.assertGreaterEqual(self.min_soc, mod.BAT_MIN_SOC_PCT)
+        self.assertLessEqual(self.max_soc, mod.BAT_MAX_SOC_PCT)
+
+    def test_charging_still_happens_at_cheap_hours(self):
+        # Cheap hours (0.03) are well below the threshold — LP must still charge there.
+        cheap_slots = [s for s in self.slots
+                       if s.dt.hour in self.CHEAP_H
+                       and s.action == "BATTERY_FIRST+CHARGE"]
+        self.assertGreater(len(cheap_slots), 0,
+                           "LP should charge at cheap hours even with 2ct margin")
+
+    def test_no_grid_charging_at_base_rate(self):
+        # Base rate (0.18) + 2ct margin → effective import exceeds max_worthwhile(peak=0.22).
+        # No BATTERY_FIRST+CHARGE expected outside cheap/peak windows.
+        # Note: "DISCHARGE" also contains "CHARGE" so we match the exact action name.
+        base_h = set(range(24)) - self.CHEAP_H - self.PEAK_H
+        base_charge = [s for s in self.slots
+                       if s.dt.hour in base_h
+                       and s.action == "BATTERY_FIRST+CHARGE"]
+        self.assertEqual(
+            base_charge, [],
+            f"LP must not charge from grid at base rate with 2ct margin; "
+            f"found: {[(s.dt, s.action, s.charge_kw) for s in base_charge]}"
+        )
 
 
 class TestHourSlotDefaults(unittest.TestCase):
