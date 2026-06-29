@@ -203,7 +203,6 @@ last_soc          = None
 SOC_HYST          = 2.0
 pdel_glob         = 0.0   # grid import W (positive = importing); updated each loop
 pret_glob         = 0.0   # grid export W (positive = exporting); updated each loop
-_bms_zeroed       = False  # True after set_in_standby zeros 0x1367; cleared by reset_bms_limits
 _meter_zero_count = 0      # consecutive meter=0.0 readings; alarm 401 fires after 5
 soc_schedule_lock: bool = False  # module-level init; main_loop() declares global
 vmin_glob: Optional[int] = None  # latest min cell voltage in mV from seplos DB; None if unavailable
@@ -671,42 +670,22 @@ def write_to_seplos_reg(ser, addr, value, label):
         dbg(1, "SEPLOS", f"CRC error writing {label}")
         return
 
-    dbg(2, "SEPLOS", f"Wrote {value} to {label} @0x{addr:04X}")
+    dbg(2, "SEPLOS", f"Wrote {value} to {label} ({addr})")
 
 
-def reset_bms_limits(seplos_ser):
-    """Restore normal BMS current limits (60A).
-    Called whenever we exit standby or change schedule/config."""
-    global _bms_zeroed
 
-    try:
-        dbg(1, "SEPLOS", "Resetting BMS charge/discharge limits to 60A")
-
-        write_to_seplos_reg(seplos_ser, 0x1366,  60, "PCS Charge Limit")
-        write_to_seplos_reg(seplos_ser, 0x1367, -60, "PCS Discharge Limit")
-
-        _bms_zeroed = False
-        return True
-
-    except Exception as e:
-        dbg(1, "SEPLOS", f"Failed resetting BMS limits: {e}")
-        return False
-
-
-def set_in_standby(sph_client, seplos_ser):
+def set_in_standby(sph_client):
     """Clean standby:
-    - Load-first priority
+    - Battery-first priority (SPH5000 respects BMS PCS limits in this mode, unlike load-first)
     - Remote enabled with 0 power
     - No AC charging
-    - BMS current limits = 0
+    BMS current limits are managed exclusively by read_seplos (no RS485 bus contention).
     """
-    global _bms_zeroed
-
     try:
-        dbg(1, "SPH", "STANDBY: load_first + no AC + 0 power + BMS limits 0A")
+        dbg(1, "SPH", "STANDBY: battery_first + no AC + 0 power")
 
-        # 1 Return inverter to normal load-first behaviour
-        write_sph5k_reg(sph_client, REG_ADDR["REG_Priority_of_work"], 0)
+        # 1 Battery-first so SPH5000 obeys BMS PCS limits (load-first ignores them)
+        write_sph5k_reg(sph_client, REG_ADDR["REG_Priority_of_work"], 1)
 
         # 2 Enable remote control
         write_sph5k_reg(sph_client, REG_ADDR["REG_Remote_power_control_enable"], _enable)
@@ -725,11 +704,6 @@ def set_in_standby(sph_client, seplos_ser):
             _disable
         )
 
-        # 5 Also block inverter via BMS
-        write_to_seplos_reg(seplos_ser, 0x1366, 0, "PCS Charge Limit")
-        write_to_seplos_reg(seplos_ser, 0x1367, 0, "PCS Discharge Limit")
-
-        _bms_zeroed = True
         return True
 
     except Exception as e:
@@ -1748,9 +1722,6 @@ def main_loop():
 
     ser = serial.Serial(PORT, BAUD, parity=PARITY, timeout=TIMEOUT)
 
-    dbg(1, "SEPLOS", "Resetting PCS limits at startup")
-    reset_bms_limits(ser)
-
     dbg(2, "SPH", "Growatt control loop started")
 
     # --------------------------------------------------
@@ -1856,17 +1827,15 @@ def main_loop():
 
         # Release SOC lock when slot time expires
         if soc_schedule_lock and active_run.end_time and now >= active_run.end_time:
-            dbg(1, "SPH", "SOC lock released and Seplos limits reset: schedule end reached")
+            dbg(1, "SPH", "SOC lock released: schedule end reached")
             soc_schedule_lock = False
-            reset_bms_limits(ser)
             elapsed = time.time() - loop_start
             sleep(max(0, CHECK_INTERVAL - elapsed))
             continue
 
         if source != Source.SCHEDULE:
             if soc_schedule_lock:
-                dbg(1, "SPH", "SOC lock released and Seplos limits reset: schedule no longer active")
-                reset_bms_limits(ser)
+                dbg(1, "SPH", "SOC lock released: schedule no longer active")
             soc_schedule_lock = False
 
         final_cmd = build_final_command(active_run, soc_glob, vmin_glob)
@@ -1930,7 +1899,7 @@ def main_loop():
         if soc_schedule_lock:
             dbg(2, "SPH", "SOC lock active -> standby")
 
-            set_in_standby(client, ser)
+            set_in_standby(client)
 
             elapsed = time.time() - loop_start
             sleep(max(0, CHECK_INTERVAL - elapsed))
@@ -1940,17 +1909,11 @@ def main_loop():
         # Normal command execution
         # --------------------------------------------------
         if final_cmd.mode == RunMode.STANDBY:
-            # Must go through set_in_standby() — applies both Growatt registers
-            # AND Seplos BMS current limits (zeroed). apply_command_to_inverter
-            # only writes Growatt registers and would leave BMS limits active.
-            dbg(1, "SPH", "STANDBY action -> set_in_standby() (Growatt + Seplos BMS)")
-            set_in_standby(client, ser)
+            # set_in_standby writes SPH5000 registers only.
+            # BMS limits are managed exclusively by read_seplos.
+            dbg(1, "SPH", "STANDBY action -> set_in_standby()")
+            set_in_standby(client)
         else:
-            # Restore BMS limits if set_in_standby or SOC-lock previously zeroed them
-            if _bms_zeroed:
-                dbg(1, "SEPLOS", "BMS limits were zeroed -> reset_bms_limits() before command")
-                reset_bms_limits(ser)
-
             apply_command_to_inverter(client, final_cmd)
 
         _active_cmd = final_cmd

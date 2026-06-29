@@ -30,6 +30,7 @@ from datetime import date
 import mysql.connector
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from common.battery_alert import alert_trigger, alert_clear
+from common.battery_constants import SOC_LOW_STOP
 
 # Load .env from parent directory (x:/home/pi/docker/.env)
 env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -627,6 +628,31 @@ def update_db(**v):
         dbg(1, DEBUG_DB, "DB", f"⛔ problem with database: {str(e)}")
 
 
+# ---------------- LP ACTION ----------------
+def _get_current_lp_action() -> str | None:
+    """Return the current LP action from battery_schedule, or None on error."""
+    try:
+        now     = datetime.now()
+        slot_dt = now.replace(minute=(now.minute // 15) * 15,
+                              second=0, microsecond=0)
+        db  = mysql.connector.connect(
+            host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
+            db=DB_NAME, connection_timeout=3
+        )
+        cur = db.cursor()
+        cur.execute(
+            "SELECT action FROM battery_schedule "
+            "WHERE slot_dt=%s ORDER BY created_at DESC LIMIT 1",
+            (slot_dt,)
+        )
+        row = cur.fetchone()
+        db.close()
+        return row[0] if row else None
+    except Exception as exc:
+        dbg(1, DEBUG_MAIN, "MAIN", f"LP action query failed: {exc}")
+        return None
+
+
 # ---------------- MAIN ----------------
 def main():
     ser = serial.Serial(PORT, BAUD, parity=PARITY, timeout=TIMEOUT)
@@ -651,6 +677,9 @@ def main():
         last_discharge_limit = None
         last_charge_write_ts = 0.0
         last_discharge_write_ts = 0.0
+        lp_action            = None   # cached LP action from battery_schedule
+        lp_action_ts         = 0.0    # timestamp of last DB query
+        LP_ACTION_INTERVAL   = 30.0   # seconds between battery_schedule queries
         last_vdelta_taper_active = False
         last_vmin_taper_active   = False
         vdelta_taper_count  = 0   # consecutive readings >= VDELTA_TAPER_START_MV
@@ -750,6 +779,18 @@ def main():
                 tmax,
                 tmin
             )
+
+            # Refresh LP action cache every 30s
+            now_ts = time.time()
+            if now_ts - lp_action_ts > LP_ACTION_INTERVAL:
+                lp_action    = _get_current_lp_action()
+                lp_action_ts = now_ts
+
+            # STANDBY: override BMS limits to 0A — sole writer for BMS registers.
+            # Skip override if SOC is critically low (emergency discharge protection).
+            if lp_action == 'STANDBY' and soc > SOC_LOW_STOP:
+                charge_limit    = 0
+                discharge_limit = 0
 
             # Write on change; also re-send periodically when actively restricting
             # so a Growatt reboot doesn't silently lose a taper limit.
