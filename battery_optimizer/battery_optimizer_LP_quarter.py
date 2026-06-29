@@ -45,7 +45,8 @@ import numpy as np
 for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-from common import energy_cost as ec   # gedeelde, canonieke kostenberekening
+from common import energy_cost as ec          # gedeelde, canonieke kostenberekening
+from common import battery_constants as bc    # gedeelde accu/omvormer constanten
 from scipy.optimize import milp, LinearConstraint, Bounds
 import paho.mqtt.client as paho_mqtt
 import requests
@@ -86,28 +87,64 @@ PEAK_MEASURED_KW = 5.2
 SOLAR_NOON_CET  = 12.5
 SOLAR_NOON_CEST = 13.5
 
-# Performance ratio for GTI-based PV estimate.
-# Covers system losses only (inverter efficiency, cable losses, soiling ~0.80-0.85).
-# Recalibrate on clear days: PR = actual_kWh / ((gti_e*kwp_e + gti_w*kwp_w) / 1000)
-PANEL_PR_GTI = 0.80
+# Performance ratio for GTI-based PV estimate — system losses only, NO temperature derating.
+# Temperature is modelled explicitly via PANEL_NOCT_C / PANEL_TEMP_COEFF below.
+# Recalibrate on clear days: PR = actual_kWh / (GTI_yield × temp_factor)
+# Derived: at 27°C ambient (Jun-17 benchmark), 0.93 × temp_factor(54°C) ≈ 0.80 (old implicit PR)
+PANEL_PR_GTI = 0.93
+
+# TS-M260B datasheet: NOCT=47°C, power temperature coefficient=-0.48%/K
+PANEL_NOCT_C     = 47.0   # Nominal Operating Cell Temperature (°C)
+PANEL_TEMP_COEFF = 0.0048 # Power loss per kelvin above STC 25°C (fraction, 0.48%/K)
+
+# Local-horizon correction: KNMI GTI has no knowledge of nearby obstructions.
+# East and west panels have DIFFERENT obstruction profiles (calibrated June 2026):
+#
+#   East (morning): gradual ramp — trees/terrain, blocks sun until ~20° elevation.
+#     actual/forecast: ~5% at 8°, ~40% at 12°, ~84% at 17°, ~100% at 21°
+#
+#   West (evening): sharp cutoff — neighbor's roof at ~20 m / ~3 m above sightline
+#     → apparent obstruction angle arctan(3/20) ≈ 8.5°, confirmed by measured PV
+#     collapse at 20:50 CEST June 21: 0.46 kW → 0.07 kW in 5 minutes.
+#
+# Both sides share ELEV_ZERO (below which factor=0); the ELEV_FULL differs.
+PV_HORIZON_ELEV_ZERO      = 5.0   # both sides: elevation (°) → factor = 0.0
+PV_HORIZON_EAST_ELEV_FULL = 20.0  # east / morning: full forecast above this
+PV_HORIZON_WEST_ELEV_FULL =  9.0  # west / evening: full forecast above this (narrow ramp)
 
 SLOT_H = 0.25  # slot duration: 15 minutes = 0.25 hours
 
-BAT_CAPACITY_KWH     = 16.0
-BAT_MIN_SOC_PCT      = 20.0   # hard LP / dispatch floor (BMS protection margin)
-BAT_MAX_SOC_PCT      = 89.5   # Seplos BMS trips at 89.8%; 89.5% is safely reachable
-BAT_MAX_CHARGE_KW    = 3.0
-BAT_MIN_CHARGE_KW    = 0.3
-BAT_MAX_DISCHARGE_KW = 3.0
-BAT_CHARGE_EFF       = 0.95
-BAT_DISCHARGE_EFF    = 0.95
-BAT_ROUNDTRIP_EFF    = BAT_CHARGE_EFF * BAT_DISCHARGE_EFF
+BAT_CAPACITY_KWH     = bc.BAT_CAPACITY_KWH
+BAT_MIN_SOC_PCT      = bc.BAT_MIN_SOC_PCT           # 20.0% — LP floor (raised from 15% to prevent SOC_LOW_LOCK at 14%)
+BAT_MIN_SOC_DISCHARGE_PCT = bc.BAT_MIN_SOC_DISCHARGE_PCT  # 18.0% — DISCHARGE floor (doc)
+BAT_DAWN_SOC_PCT     = bc.BAT_DAWN_SOC_PCT              # 20.0% — minimum SoC at 06:00
+BAT_MAX_SOC_PCT      = bc.BAT_MAX_SOC_PCT
+BAT_MAX_CHARGE_KW    = bc.BAT_MAX_CHARGE_KW
+BAT_MIN_CHARGE_KW    = bc.BAT_MIN_CHARGE_KW
+BAT_MAX_DISCHARGE_KW = bc.BAT_MAX_DISCHARGE_KW
+INV_EFF              = bc.INV_EFF
+BAT_CHARGE_EFF       = bc.BAT_CHARGE_EFF
+BAT_DISCHARGE_EFF    = bc.BAT_DISCHARGE_EFF
+BAT_ROUNDTRIP_EFF    = bc.BAT_ROUNDTRIP_EFF
 BAT_MIN_KWH          = BAT_CAPACITY_KWH * BAT_MIN_SOC_PCT / 100.0
 BAT_MAX_KWH          = BAT_CAPACITY_KWH * BAT_MAX_SOC_PCT / 100.0
 
 LP_DISCHARGE_MIN_KW  = 0.30
 
+# SPH5000 inverter parasitic DC-bus draw: ~70 W measured overnight even when the
+# Seplos BMS is commanded to 0 A.  The LP raises its SoC floor by this amount × the
+# hours until the next PV-charge event so the battery always has enough headroom to
+# survive until PV (or cheap grid) tops it back up.
+SPH_STANDBY_KW    = 0.070   # measured parasitic draw (W → kW)
+SPH_STANDBY_MAX_H = 10.0    # cap: never reserve more than 10 h of standby
+
 LP_CHARGE_INCENTIVE     = 0.001
+# Minimum net profit required before using grid to charge the battery (€/kWh of grid import).
+# Adds 2 ct/kWh to the effective grid-import cost in the LP objective so the solver only
+# charges from grid when the roundtrip margin (future_discharge_price × eff − import_price)
+# exceeds this threshold. Prevents marginal daytime supplemental charging where the net gain
+# is only a few cents (e.g. fill 30 min earlier to enable slightly earlier PV export).
+CHARGE_GRID_MIN_MARGIN_EUR_KWH = 0.02
 PV_ROOM_PENALTY_EUR_KWH = 0.08
 PV_SURPLUS_THRESHOLD_KWH = 0.3
 
@@ -721,6 +758,38 @@ def _fetch_knmi_gti(tilt: int, azimuth: int) -> dict[str, float]:
     }
 
 
+def _fetch_knmi_temperature() -> dict[str, float]:
+    """Ambient temperature (°C) at 2 m height from KNMI HARMONIE AROME Netherlands.
+    Same model and resolution as _fetch_knmi_gti — keeps temperature source consistent.
+    Returns {iso_hour: temp_c} for current and future hours."""
+    params = {
+        "latitude":      LAT,
+        "longitude":     LON,
+        "hourly":        "temperature_2m",
+        "models":        "knmi_harmonie_arome_netherlands",
+        "timezone":      "Europe/Amsterdam",
+        "forecast_days": 3,
+    }
+    now_iso = datetime.now().strftime("%Y-%m-%dT%H:00")
+    try:
+        r = requests.get(OPEN_METEO_URL, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.warning("KNMI temperature fetch failed: %s", exc)
+        return {}
+    hourly = data.get("hourly", {})
+    times  = hourly.get("time", [])
+    temps  = hourly.get("temperature_2m", [])
+    result = {
+        t: float(temps[i])
+        for i, t in enumerate(times)
+        if t >= now_iso and i < len(temps) and temps[i] is not None
+    }
+    log.info("KNMI temperature: %d slots (model=knmi_harmonie_arome_netherlands)", len(result))
+    return result
+
+
 def fetch_weather() -> tuple[dict, dict[int, float]]:
     skip              = _read_load_skip_days()
     effective_history = max(HISTORY_DAYS, skip) if skip > 0 else HISTORY_DAYS
@@ -807,6 +876,9 @@ def fetch_weather() -> tuple[dict, dict[int, float]]:
     for iso, val in gti_west.items():
         radiation.setdefault(iso, {})["gti_west"] = val
     log.info("KNMI GTI: %d east slots  %d west slots merged", len(gti_oost), len(gti_west))
+    knmi_temp = _fetch_knmi_temperature()
+    for iso, temp in knmi_temp.items():
+        radiation.setdefault(iso, {})["knmi_temp_c"] = temp
 
     try:
         _WEATHER_CACHE.write_text(json.dumps({
@@ -832,6 +904,54 @@ def _solar_noon(d) -> float:
     aware      = datetime(d.year, d.month, d.day, 12, tzinfo=tz)
     dst_offset = aware.dst()
     return SOLAR_NOON_CEST if dst_offset is not None and dst_offset.total_seconds() > 0 else SOLAR_NOON_CET
+
+
+def _solar_elevation_deg(dt_local: datetime, lat: float = LAT, lon: float = LON) -> float:
+    """Approximate solar elevation angle (degrees) above horizon for dt_local.
+
+    Uses Spencer/Duffie equations, accurate to ~0.5° for our purposes.
+    dt_local may be timezone-naive (assumed Europe/Amsterdam) or tz-aware.
+    """
+    from zoneinfo import ZoneInfo
+    if dt_local.tzinfo is None:
+        dt_local = dt_local.replace(tzinfo=ZoneInfo("Europe/Amsterdam"))
+    doy = dt_local.timetuple().tm_yday
+    # Solar declination (degrees)
+    decl = math.radians(23.45 * math.sin(math.radians(360 / 365 * (doy - 81))))
+    # Equation of time (minutes)
+    B = math.radians(360 / 365 * (doy - 81))
+    eot_min = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
+    # Solar noon in UTC hours
+    solar_noon_utc_h = 12.0 - eot_min / 60.0 - lon / 15.0
+    # Decimal UTC hour
+    utc_offset_h = dt_local.utcoffset().total_seconds() / 3600.0
+    utc_h = dt_local.hour + dt_local.minute / 60.0 - utc_offset_h
+    hour_angle = math.radians((utc_h - solar_noon_utc_h) * 15.0)
+    lat_r = math.radians(lat)
+    sin_elev = (math.sin(lat_r) * math.sin(decl) +
+                math.cos(lat_r) * math.cos(decl) * math.cos(hour_angle))
+    return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
+
+
+def _pv_horizon_factor(dt_local: datetime) -> float:
+    """Scale factor [0..1] for local horizon obstruction — morning and evening.
+
+    Before solar noon (east panels): gradual ramp 5°→20°  (trees/terrain).
+    After solar noon  (west panels): narrow ramp  5°→9°   (building roofline).
+
+    Both sides share PV_HORIZON_ELEV_ZERO as the hard floor; the ceiling differs.
+    Season-agnostic: solar elevation is recomputed for every slot.
+    """
+    solar_noon_h = _solar_noon(dt_local)
+    current_h = dt_local.hour + dt_local.minute / 60.0
+    elev_full = (PV_HORIZON_EAST_ELEV_FULL if current_h < solar_noon_h
+                 else PV_HORIZON_WEST_ELEV_FULL)
+    elev = _solar_elevation_deg(dt_local)
+    if elev <= PV_HORIZON_ELEV_ZERO:
+        return 0.0
+    if elev >= elev_full:
+        return 1.0
+    return (elev - PV_HORIZON_ELEV_ZERO) / (elev_full - PV_HORIZON_ELEV_ZERO)
 
 
 def _clearsky_ghi(terrestrial_wm2: float) -> float:
@@ -881,13 +1001,15 @@ def estimate_pv_kwh_per_hour(radiation: dict, dt: datetime) -> float:
     gti_w = rad_gti.get("gti_west")
 
     if gti_e is not None and gti_w is not None:
-        pv_kwh = min(
-            (gti_e / 1000.0 * PANEL_EAST_KWP + gti_w / 1000.0 * PANEL_WEST_KWP) * PANEL_PR_GTI,
-            PEAK_MEASURED_KW,
-        )
+        raw_pv   = (gti_e / 1000.0 * PANEL_EAST_KWP + gti_w / 1000.0 * PANEL_WEST_KWP) * PANEL_PR_GTI
+        t_amb    = rad_gti.get("knmi_temp_c", rad_gti.get("temp_c", 25.0))
+        t_panel  = t_amb + (PANEL_NOCT_C - 20.0) * min(1.0, (gti_e + gti_w) / 800.0)
+        t_factor = max(0.60, 1.0 - max(0.0, (t_panel - 25.0) * PANEL_TEMP_COEFF))
+        pv_kwh   = min(raw_pv * t_factor, PEAK_MEASURED_KW)
         dbg(3, DEBUG_SOLAR, "SOLAR",
             f"PV {dt.strftime('%d %H:00')}  GTI-e={gti_e:.0f} GTI-w={gti_w:.0f}"
-            f"  PR={PANEL_PR_GTI}  pv_kwh={pv_kwh:.3f}")
+            f"  PR={PANEL_PR_GTI}  T_amb={t_amb:.1f}°C  T_panel={t_panel:.1f}°C"
+            f"  t_factor={t_factor:.3f}  pv_kwh={pv_kwh:.3f}")
         return pv_kwh
 
     # Fallback: Open-Meteo horizontal GHI (timestamp +1 hour for end-of-hour label)
@@ -936,17 +1058,19 @@ def estimate_pv_kwh_per_quarter(radiation: dict, dt: datetime, qtr: int) -> floa
         gti_e = r.get("gti_east")
         gti_w = r.get("gti_west")
         if gti_e is not None and gti_w is not None:
-            return max(0.0, min(
-                (gti_e / 1000.0 * PANEL_EAST_KWP + gti_w / 1000.0 * PANEL_WEST_KWP) * PANEL_PR_GTI,
-                PEAK_MEASURED_KW,
-            ))
+            raw_pv   = (gti_e / 1000.0 * PANEL_EAST_KWP + gti_w / 1000.0 * PANEL_WEST_KWP) * PANEL_PR_GTI
+            t_amb    = r.get("knmi_temp_c", r.get("temp_c", 25.0))
+            t_panel  = t_amb + (PANEL_NOCT_C - 20.0) * min(1.0, (gti_e + gti_w) / 800.0)
+            t_factor = max(0.60, 1.0 - max(0.0, (t_panel - 25.0) * PANEL_TEMP_COEFF))
+            return max(0.0, min(raw_pv * t_factor, PEAK_MEASURED_KW))
         return None
 
     pv_curr = _hourly_pv(dt_h)
 
     if pv_curr is None:
         # KNMI GTI unavailable for this hour -> OM GHI fallback (no interpolation)
-        return estimate_pv_kwh_per_hour(radiation, dt) * SLOT_H
+        raw = estimate_pv_kwh_per_hour(radiation, dt) * SLOT_H
+        return raw * _pv_horizon_factor(dt)
 
     pv_prev = _hourly_pv(dt_h - timedelta(hours=1))
     pv_next = _hourly_pv(dt_h + timedelta(hours=1))
@@ -966,12 +1090,14 @@ def estimate_pv_kwh_per_quarter(radiation: dict, dt: datetime, qtr: int) -> floa
     else:  # qtr == 3
         pv_h_interp = 0.625 * pv_curr + 0.375 * pv_next
 
+    morning_factor = _pv_horizon_factor(dt)
     dbg(3, DEBUG_SOLAR, "SOLAR",
         f"PV-interp {dt.strftime('%d %H:%M')} qtr={qtr}"
         f"  prev={pv_prev:.3f}  curr={pv_curr:.3f}  next={pv_next:.3f}"
-        f"  interp={pv_h_interp:.3f}  slot={pv_h_interp * SLOT_H:.4f} kWh")
+        f"  interp={pv_h_interp:.3f}  mf={morning_factor:.2f}"
+        f"  slot={pv_h_interp * SLOT_H * morning_factor:.4f} kWh")
 
-    return min(pv_h_interp, PEAK_MEASURED_KW) * SLOT_H
+    return min(pv_h_interp, PEAK_MEASURED_KW) * SLOT_H * morning_factor
 
 
 def get_slot_weather_attrs(radiation: dict, dt: datetime) -> tuple[float, float]:
@@ -1459,6 +1585,37 @@ def compute_load_until_pv_surplus(slots: list[HourSlot],
     return total
 
 
+def compute_soc_floor_schedule(slots: list[HourSlot], ev_load: list[float]) -> list[float]:
+    """Return per-slot SoC floor (kWh) for soc_lb[0..n].
+
+    For each SoC checkpoint t the floor is:
+        BAT_MIN_KWH + SPH_STANDBY_KW × min(hours_until_next_PV_surplus(t), SPH_STANDBY_MAX_H)
+
+    A slot at 23:00 (8.5 h to sunrise) therefore keeps ~3.7% more headroom than one
+    at 05:30 (2 h to PV).  Because the value changes by at most SLOT_H × SPH_STANDBY_KW
+    ≈ 0.018 kWh (0.11%) per slot the LP stays feasible — no large jumps.
+
+    Implementation: O(n) backward scan to propagate the nearest PV surplus slot.
+    """
+    n = len(slots)
+    hours_to_pv: list[float] = [SPH_STANDBY_MAX_H] * (n + 1)
+
+    next_pv_t: Optional[int] = None
+    for t in range(n - 1, -1, -1):
+        net_pv = slots[t].pv_kwh - slots[t].load_kwh - ev_load[t]
+        if net_pv >= PV_SURPLUS_THRESHOLD_KWH:
+            next_pv_t = t
+        hours_to_pv[t] = (
+            min((next_pv_t - t) * SLOT_H, SPH_STANDBY_MAX_H)
+            if next_pv_t is not None else SPH_STANDBY_MAX_H
+        )
+
+    # soc[n] sits beyond the last slot — inherit the last slot's distance
+    hours_to_pv[n] = hours_to_pv[n - 1] if n > 0 else SPH_STANDBY_MAX_H
+
+    return [BAT_MIN_KWH + SPH_STANDBY_KW * h for h in hours_to_pv]
+
+
 def compute_max_worthwhile_charge_price(slots: list[HourSlot],
                                          ev_load: list[float],
                                          from_t: int) -> float:
@@ -1469,7 +1626,7 @@ def compute_max_worthwhile_charge_price(slots: list[HourSlot],
     ]
     if not future_import_prices:
         return 0.0
-    return max(future_import_prices) * BAT_ROUNDTRIP_EFF
+    return max(future_import_prices) * BAT_ROUNDTRIP_EFF - CHARGE_GRID_MIN_MARGIN_EUR_KWH
 
 
 # ---------------------------------------------------------------------------
@@ -1594,10 +1751,14 @@ def optimise(  # noqa: C901
     sb_base  = 7 * n + 1
     total_vars = 8 * n + 1
 
-    # Objective coefficients
+    # Objective coefficients.
+    # Grid import is priced at (import_price + CHARGE_GRID_MIN_MARGIN_EUR_KWH): the LP
+    # only uses grid when the net benefit (future discharge revenue minus import cost)
+    # exceeds the 2 ct/kWh minimum margin. This suppresses marginal daytime grid-supplement
+    # charging where the only gain is slightly earlier PV export at the same low price.
     c_obj = np.zeros(total_vars)
     for t, slot in enumerate(slots):
-        c_obj[gi_base + t] =  slot.import_price()
+        c_obj[gi_base + t] =  slot.import_price() + CHARGE_GRID_MIN_MARGIN_EUR_KWH
         c_obj[ge_base + t] = -slot.export_price()
         c_obj[bd_base + t] += 1e-4  # tiny: discourage unnecessary battery cycling
         net_demand_t = slot.load_kwh + ev_load[t] - slot.pv_kwh
@@ -1608,6 +1769,11 @@ def optimise(  # noqa: C901
         if discharge_target_t is not None and t == discharge_target_t:
             c_obj[soc_base + t] += PV_ROOM_PENALTY_EUR_KWH / BAT_CAPACITY_KWH
         c_obj[ct_base + t] = 1e-6  # tiny curtailment penalty
+        if LP_STANDBY_ENABLED and pv_surplus[t] == 0:
+            # Prefer STANDBY over phantom LOAD_FIRST at night: both cost the same (grid covers
+            # load), but STANDBY correctly models battery-at-rest while LOAD_FIRST physically
+            # drains the battery. Tiny reward ensures LP always picks STANDBY when indifferent.
+            c_obj[sb_base + t] -= 1e-4
 
     # Equality constraints: energy balance + SoC update + initial SoC (2n+1 rows).
     # Energy balance per slot (kWh):
@@ -1632,20 +1798,21 @@ def optimise(  # noqa: C901
     A_eq[2 * n, soc_base] = 1.0
     b_eq[2 * n]           = initial_soc_kwh
 
-    # Flat SoC floor: LP optimizes over the full 2-day horizon and keeps enough energy
-    # for overnight on its own.  A dynamic reserve-until-PV floor creates infeasibility
-    # when the peak discharge window spans the PV-end transition (floor jumps from 20%
-    # to 70%+ in a single slot), so we keep the floor flat at the hard BMS minimum.
+    # Flat 20% SoC floor.  Register 30406 (LOAD_FIRST discharge cutoff) is set to 20%
+    # so the SPH stops autonomous discharge at 20% — overnight load is covered by grid.
+    # No standby reserve headroom needed; the LP can discharge to 20% in the evening
+    # and the battery genuinely stays at 20% until PV arrives in the morning.
+    _pct = lambda k: k / BAT_CAPACITY_KWH * 100
+    log.info("SoC floor: flat %.1f%% (%.2f kWh); Seplos taper 17%%→15.2%%, 30406=14%% hardware",
+             _pct(BAT_MIN_KWH), BAT_MIN_KWH)
+
     soc_lb = []
     soc_ub = []
     for t in range(n + 1):
+        # t=0: clamp so the LP is always feasible if actual SoC is already below floor
         lo = min(BAT_MIN_KWH, initial_soc_kwh) if t == 0 else BAT_MIN_KWH
         soc_lb.append(lo)
         soc_ub.append(max(BAT_MAX_KWH, initial_soc_kwh) if t == 0 else BAT_MAX_KWH)
-
-    _pct = lambda k: k / BAT_CAPACITY_KWH * 100
-    log.info("SoC floor: flat %.1f%% (%.2f kWh) throughout horizon",
-             _pct(soc_lb[1]), soc_lb[1])
 
     # Variable bounds
     M = BAT_MAX_DISCHARGE_KW + BAT_MAX_CHARGE_KW  # big-M for LOAD_FIRST constraints
@@ -1664,9 +1831,10 @@ def optimise(  # noqa: C901
                                 else 0.0)
     if LP_STANDBY_ENABLED:
         for t in range(n):
-            # STANDBY only meaningful when PV is present; at night it would mean "use grid
-            # instead of battery" which is not the intended semantics.
-            ub_vars[sb_base + t] = 1.0 if pv_surplus[t] > 0 else 0.0
+            # STANDBY allowed at any hour: at night it means "grid covers load, battery rests".
+            # The LP uses STANDBY when preserving SOC is more valuable than using the battery
+            # (e.g. overnight before the dawn SOC constraint at 06:00).
+            ub_vars[sb_base + t] = 1.0
 
     integrality = np.zeros(total_vars)
     integrality[co_base : co_base + n] = 1
@@ -1693,7 +1861,13 @@ def optimise(  # noqa: C901
     # 4. ck + BAT_MAX*sb ≤ BAT_MAX    → sb=1 forces ck = 0
     # 5. bd + BAT_MAX_D*sb ≤ BAT_MAX_D → sb=1 forces bd = 0
     # 6. co + sb ≤ 1                   → can't be both BATTERY_FIRST and STANDBY
-    n_ineq = 3 * n + (3 * n if LP_STANDBY_ENABLED else 0)
+    # Dawn SOC constraint: soc[t] >= 20% at each 06:00 slot in the horizon.
+    # Prevents overnight LOAD_FIRST drain to the 14% lock level when PV=0.
+    # Implemented as explicit A_ub rows (-soc[t] <= -dawn_kwh) for hard enforcement.
+    _dawn_kwh   = BAT_CAPACITY_KWH * BAT_DAWN_SOC_PCT / 100.0
+    _dawn_slots = [t for t, slot in enumerate(slots)
+                   if slot.dt.hour == 6 and slot.dt.minute == 0]
+    n_ineq = 3 * n + (3 * n if LP_STANDBY_ENABLED else 0) + len(_dawn_slots)
     A_ub = np.zeros((n_ineq, total_vars))
     b_ub = np.zeros(n_ineq)
 
@@ -1729,6 +1903,14 @@ def optimise(  # noqa: C901
             A_ub[r + 2, co_base + t] =  1.0
             A_ub[r + 2, sb_base + t] =  1.0
             b_ub[r + 2]              =  1.0
+
+    # Dawn SOC constraints: -soc[t_dawn] <= -_dawn_kwh  ↔  soc[t_dawn] >= _dawn_kwh
+    _dawn_base = 3 * n + (3 * n if LP_STANDBY_ENABLED else 0)
+    for i, t in enumerate(_dawn_slots):
+        A_ub[_dawn_base + i, soc_base + t] = -1.0
+        b_ub[_dawn_base + i]               = -_dawn_kwh
+        log.info("Dawn SOC constraint: soc[%d] @ %s >= %.2f kWh (%.0f%%)",
+                 t, slots[t].dt.strftime('%Y-%m-%d %H:%M'), _dawn_kwh, BAT_DAWN_SOC_PCT)
 
     _n_bin = n + (n if LP_STANDBY_ENABLED else 0)
     dbg(1, DEBUG_OPT, "OPT",
@@ -1769,6 +1951,11 @@ def optimise(  # noqa: C901
     pv_curtail_sol = x[ct_base  : ct_base + n]
     standby_sol    = (x[sb_base : sb_base + n] if LP_STANDBY_ENABLED else np.zeros(n))
 
+    for t in _dawn_slots:
+        log.info("Dawn check (LP solution): soc[%d] @ %s = %.3f kWh (%.1f%%) — constraint=%.2f kWh",
+                 t, slots[t].dt.strftime('%Y-%m-%d %H:%M'),
+                 soc_kwh[t], soc_kwh[t] / BAT_CAPACITY_KWH * 100.0, _dawn_kwh)
+
     obj_value = result.fun
     dbg(1, DEBUG_OPT, "OPT",
         f"MILP solved  objective=€{obj_value:.4f}  status={result.status}")
@@ -1791,9 +1978,15 @@ def optimise(  # noqa: C901
             slot.action    = "BATTERY_FIRST+DISCHARGE"
             slot.charge_kw = 0.0
         elif co == 1 and ck >= BAT_MIN_CHARGE_KW * 0.5:
-            slot.action    = ("BATTERY_FIRST+CHARGE" if ck > sur + 0.05
-                              else "BATTERY_FIRST+PV_CHARGE")
-            slot.charge_kw = min(ck, BAT_MAX_CHARGE_KW)
+            if ck > sur + 0.05:
+                # LP planned charge exceeds PV surplus → grid must supplement → BATTERY_FIRST
+                slot.action    = "BATTERY_FIRST+CHARGE"
+                slot.charge_kw = min(ck, BAT_MAX_CHARGE_KW)
+            else:
+                # PV surplus covers the charge → LOAD_FIRST lets SPH handle
+                # PV→load→battery→grid naturally with zero grid pull-in
+                slot.action    = "LOAD_FIRST"
+                slot.charge_kw = min(ck, sur)
         elif co == 0:
             slot.action    = "LOAD_FIRST"
             slot.charge_kw = min(ck, sur)  # = pv_surplus (forced by constraint 2)
@@ -1832,20 +2025,6 @@ def optimise(  # noqa: C901
             grid_net       = total_demand + actual_kwh - effective_pv
             gi             = max(grid_net, 0.0)
             ge             = max(-grid_net, 0.0)
-            slot.charge_kw = actual_kwh / SLOT_H
-
-        elif slot.action == "BATTERY_FIRST+PV_CHARGE":
-            # Charge at LP-planned rate from PV; export the remainder — NOT 100% absorption.
-            room           = BAT_MAX_KWH - running_soc
-            actual_kwh     = min(slot.charge_kw * SLOT_H,
-                                 room / BAT_CHARGE_EFF,
-                                 BAT_MAX_CHARGE_KW * SLOT_H,
-                                 max(net, 0.0))
-            actual_kwh     = max(actual_kwh, 0.0)
-            bat_stored     = actual_kwh * BAT_CHARGE_EFF
-            running_soc    = min(running_soc + bat_stored, BAT_MAX_KWH)
-            gi             = max(total_demand - effective_pv, 0.0)
-            ge             = max(net - actual_kwh, 0.0)
             slot.charge_kw = actual_kwh / SLOT_H
 
         elif slot.action == "BATTERY_FIRST+DISCHARGE":
