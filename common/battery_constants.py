@@ -10,8 +10,8 @@ Physical system:
 SPH5000 truncation note:
   The inverter stores SoC as a truncated integer in its Modbus registers.
   register = 17  means actual SoC 17.0–17.9%.
-  The 1% offset between LP floats (18.0, 15.0) and controller integers (17, 14)
-  is intentional: the LP plans conservatively, the controller is the actual catch.
+  The LP floor (BAT_MIN_SOC_PCT=20%) is set well above SOC_LOW_STOP=14% to prevent
+  the 0.9% truncation gap (14.9% → 14 integer) from triggering the emergency lock.
 """
 
 # ── Battery hardware ──────────────────────────────────────────────────────────
@@ -30,10 +30,11 @@ BAT_ROUNDTRIP_EFF= BAT_CHARGE_EFF * BAT_DISCHARGE_EFF   # ≈ 0.832 AC→AC
 
 # ── SoC operating limits (LP optimizer — floating-point %) ───────────────────
 BAT_MAX_SOC_PCT           = 89.5  # LP upper bound (Seplos BMS trips at ~89.8%)
-BAT_MIN_SOC_PCT           = 15.0  # LP floor for LOAD_FIRST passive drain
+BAT_MIN_SOC_PCT           = 20.0  # LP floor — raised from 15% to match dawn constraint and give margin above SOC_LOW_STOP=14%
 BAT_MIN_SOC_DISCHARGE_PCT = 18.0  # LP floor for active BATTERY_FIRST+DISCHARGE
                                    # (currently enforced by controller SOC_DISCHARGE_STOP=17;
                                    #  kept here as documentation / future LP constraint)
+BAT_DAWN_SOC_PCT          = 20.0  # minimum SoC at 06:00 — prevents overnight drain to lock level
 
 # ── Controller register thresholds (integer, SPH5000 truncated SoC) ──────────
 # In LOAD_FIRST mode the SPH5000 ignores Seplos limits and only respects
