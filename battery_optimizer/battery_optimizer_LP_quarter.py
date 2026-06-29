@@ -131,6 +131,13 @@ BAT_MAX_KWH          = BAT_CAPACITY_KWH * BAT_MAX_SOC_PCT / 100.0
 
 LP_DISCHARGE_MIN_KW  = 0.30
 
+# Below this net DC movement (kWh/slot) a slot is treated as battery-at-rest.
+# The MILP can leave co/sb in a degenerate state at the SoC cap (e.g. label
+# BATTERY_FIRST+CHARGE on a full battery where 0 kWh is actually stored), causing
+# cosmetic mode flapping. A slot whose dispatch sim yields |bat_kwh| below this is
+# relabelled STANDBY — physically identical (grid covers any deficit) but stable.
+LP_IDLE_BAT_KWH      = 0.02   # 20 Wh: well under the smallest real charge (~70 Wh)
+
 # SPH5000 inverter parasitic DC-bus draw: ~70 W measured overnight even when the
 # Seplos BMS is commanded to 0 A.  The LP raises its SoC floor by this amount × the
 # hours until the next PV-charge event so the battery always has enough headroom to
@@ -2066,6 +2073,15 @@ def optimise(  # noqa: C901
         slot.grid_kwh       = gi - ge
         slot.cost_eur       = gi * slot.import_price() - ge * slot.export_price()
         slot.cost_fixed_eur = gi * FIXED_TARIFF_EUR_KWH - ge * FIXED_EXPORT_EUR_KWH
+
+        # Tie-break: relabel a battery-at-rest slot to STANDBY. The dispatch sim has
+        # the physical truth (bat_kwh); a charge/discharge label that moved no energy
+        # (e.g. BATTERY_FIRST+CHARGE pinned at the SoC cap) is degenerate churn. STANDBY
+        # is cost-identical here (grid covers any deficit) but stable across re-runs.
+        if abs(slot.bat_kwh) < LP_IDLE_BAT_KWH and slot.action != "STANDBY":
+            slot.action    = "STANDBY"
+            slot.charge_kw = 0.0
+
         action_counts[slot.action] = action_counts.get(slot.action, 0) + 1
         curtail_str = f"  [curtail={slot.pv_curtail_kwh:.3f}kWh]" if slot.pv_curtail_kwh >= PV_CURTAIL_MIN_KWH else ""
         dbg(3, DEBUG_OPT, "OPT",
