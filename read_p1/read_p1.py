@@ -342,7 +342,78 @@ def update_erix_db_data(data):
     finally:
         try: cur.close(); db.close()
         except Exception: pass
+    fill_null_p1_rows(since_minutes=24*60)
 
+
+
+
+# ---------------------------
+# NULL P1 ROW INTERPOLATOR
+# ---------------------------
+def fill_null_p1_rows(since_minutes=24*60):
+    """Fill NULL P1 rows via linear interpolation between surrounding non-NULL rows."""
+    try:
+        db = mysql.connector.connect(
+            host=MYSQL_HOST, user=MYSQL_USER,
+            passwd=MYSQL_PASSWD, db=MYSQL_DB_NAME)
+        cur = db.cursor()
+        time_cond = f"AND ts >= NOW() - INTERVAL {since_minutes} MINUTE" if since_minutes else ""
+        cur.execute(f"""
+            SELECT id, ts FROM {MYSQL_TABLE_NAME}
+            WHERE p1_energy_import_high_kwh IS NULL {time_cond}
+            ORDER BY ts""")
+        null_rows = cur.fetchall()
+        if not null_rows:
+            db.close(); return
+        repaired = 0
+        for null_id, null_ts in null_rows:
+            cur.execute(f"""
+                SELECT ts, p1_energy_import_low_kwh, p1_energy_import_high_kwh,
+                       p1_energy_export_low_kwh, p1_energy_export_high_kwh, p1_gas_total_m3
+                FROM {MYSQL_TABLE_NAME}
+                WHERE ts < %s AND p1_energy_import_high_kwh IS NOT NULL
+                ORDER BY ts DESC LIMIT 1""", (null_ts,))
+            prev = cur.fetchone()
+            cur.execute(f"""
+                SELECT ts, p1_energy_import_low_kwh, p1_energy_import_high_kwh,
+                       p1_energy_export_low_kwh, p1_energy_export_high_kwh, p1_gas_total_m3
+                FROM {MYSQL_TABLE_NAME}
+                WHERE ts > %s AND p1_energy_import_high_kwh IS NOT NULL
+                ORDER BY ts ASC LIMIT 1""", (null_ts,))
+            nxt = cur.fetchone()
+            if prev is None and nxt is None:
+                continue
+            elif prev is None:
+                vals = nxt[1:]
+            elif nxt is None:
+                vals = prev[1:]
+            else:
+                pt, p_il, p_ih, p_el, p_eh, p_g = prev
+                nt, n_il, n_ih, n_el, n_eh, n_g = nxt
+                total = (nt - pt).total_seconds()
+                frac  = (null_ts - pt).total_seconds() / total if total > 0 else 0.0
+                frac  = max(0.0, min(1.0, frac))
+                vals  = (round(float(p_il) + (float(n_il) - float(p_il)) * frac, 3),
+                         round(float(p_ih) + (float(n_ih) - float(p_ih)) * frac, 3),
+                         round(float(p_el) + (float(n_el) - float(p_el)) * frac, 3),
+                         round(float(p_eh) + (float(n_eh) - float(p_eh)) * frac, 3),
+                         round(float(p_g)  + (float(n_g)  - float(p_g))  * frac, 3))
+            cur.execute(f"""
+                UPDATE {MYSQL_TABLE_NAME}
+                SET p1_energy_import_low_kwh  = %s,
+                    p1_energy_import_high_kwh = %s,
+                    p1_energy_export_low_kwh  = %s,
+                    p1_energy_export_high_kwh = %s,
+                    p1_gas_total_m3           = %s
+                WHERE id = %s""", (*vals, null_id))
+            repaired += 1
+        db.commit()
+        if repaired:
+            dbg(1, DEBUG_DB_UPDATE, "DB",
+                f"✓ {repaired} NULL P1 rij(en) geinterpoleerd (laatste {since_minutes} min)")
+        db.close()
+    except Exception as e:
+        dbg(1, DEBUG_DB_UPDATE, "DB", f"⛔ fill_null_p1_rows FAILED: {e}")
 
 def init_cost_calc():
     """Laad gedeelde tarieven/vaste kosten en seed de vorige telwerkstand (na read_last_db_state)."""
