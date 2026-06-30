@@ -690,7 +690,9 @@ def update_solcast_cache(conn) -> None:
     for slot in sorted(set(east) | set(west)):
         e_kw, hrs = east.get(slot, (0.0, 0.5))
         w_kw, _   = west.get(slot, (0.0, 0.5))
-        rows.append((slot, (e_kw + w_kw) * hrs, run_ts))   # kWh in deze periode (oost+west)
+        # oost+west kWh in deze periode, mét lokale-horizon correctie (Solcast kent de lokale
+        # obstructie niet) — zelfde _pv_horizon_factor als de optimizer en CAMS-cache.
+        rows.append((slot, (e_kw + w_kw) * hrs * _pv_horizon_factor(slot), run_ts))
     if not rows:
         return
     cur = conn.cursor()
@@ -792,7 +794,9 @@ def update_cams_cache(conn) -> None:
         return
     run_ts = datetime.now()
     kwp    = PANEL_EAST_KWP + PANEL_WEST_KWP
-    rows   = [(slot, (ghi_wh / 1000.0) * kwp * PANEL_EFF_CAL, ghi_wh, run_ts)
+    # pv_kwh = horizontale GHI → PV, mét lokale-horizon correctie (oost-ochtend / west-namiddag),
+    # identiek aan wat de optimizer op zijn eigen schatting toepast. ghi_wh_m2 blijft ruw bewaard.
+    rows   = [(slot, (ghi_wh / 1000.0) * kwp * PANEL_EFF_CAL * _pv_horizon_factor(slot), ghi_wh, run_ts)
               for slot, ghi_wh in sorted(ghi.items())]
     cur = conn.cursor()
     cur.executemany("""
