@@ -515,6 +515,14 @@ SOLCAST_SITE_EAST     = os.environ.get("SOLCAST_SITE_EAST", "")
 SOLCAST_SITE_WEST     = os.environ.get("SOLCAST_SITE_WEST", "")
 SOLCAST_MIN_REFRESH_H = 6.0   # niet vaker ophalen dan dit (API-limiet sparen)
 
+# --- CAMS Radiation (Copernicus / SoDa) — satelliet-GEMETEN instraling, ~2 dagen latency.
+# Vergelijkings-/analysebron; verandert de optimizer NIET. Gated op env.
+# Gratis SoDa-account → het geregistreerde e-mailadres is de 'username'. Max ~100 req/dag.
+CAMS_USERNAME      = os.environ.get("CAMS_USERNAME", "")   # geregistreerd SoDa e-mailadres
+CAMS_MIN_REFRESH_H = 12.0    # CAMS ververst ~1×/dag; 12 u spaart requests
+CAMS_BACKFILL_DAYS = 7       # rollend venster: laatste N dagen t/m 2 dagen geleden
+CAMS_URL           = "https://api.soda-solardata.com/service/wps"
+
 
 def _load_weather_cache() -> tuple[dict, dict[int, float]]:
     try:
@@ -694,6 +702,108 @@ def update_solcast_cache(conn) -> None:
     conn.commit()
     cur.close()
     log.info("Solcast cache updated: %d periods (oost+west)", len(rows))
+
+
+def ensure_cams_cache_table(conn):
+    """Cache van CAMS satelliet-instraling, omgerekend naar geschatte PV-kWh per 15-min slot.
+    Eén rij per slot_dt; upsert. Analyse-only — raakt de optimizer NIET."""
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pv_cams_radiation (
+            slot_dt    DATETIME NOT NULL PRIMARY KEY,
+            pv_kwh     FLOAT,
+            ghi_wh_m2  FLOAT,
+            created_at DATETIME NOT NULL,
+            INDEX (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    conn.commit()
+    cur.close()
+
+
+def _fetch_cams_radiation(date_begin: str, date_end: str) -> dict:
+    """Haal CAMS Radiation (GHI, Wh/m² per 15-min) op voor [date_begin, date_end] (YYYY-MM-DD).
+    Returnt {naïef-lokale slot_start: ghi_wh_m2}. CAMS-tijden zijn UT → omgezet naar lokaal.
+    CSV: '#'-headerregels, dan kolomkop-regel, dan ';'-gescheiden data; 'Observation period'
+    = 'start/eind' ISO-UT, kolom 'GHI' = Wh/m² over de periode (verbose=false → integrated)."""
+    user = CAMS_USERNAME.replace("@", "%2540")     # @ dubbel-encoded zoals SoDa vereist
+    data_inputs = (
+        f"latitude={LAT};longitude={LON};altitude=-999;"
+        f"date_begin={date_begin};date_end={date_end};"
+        f"time_ref=UT;summarization=PT15M;username={user};verbose=false"
+    )
+    url = (f"{CAMS_URL}?Service=WPS&Request=Execute&Identifier=get_cams_radiation"
+           f"&version=1.0.0&RawDataOutput=irradiation&DataInputs={data_inputs}")
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    out: dict = {}
+    ghi_idx = None
+    for line in r.text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        if raw.startswith("#"):
+            # De kolomkop is de comment-regel die met 'Observation period' begint
+            # (pvlib-conventie). 'GHI' op naam zoeken — robuust tegen kolom-volgorde.
+            header = raw.lstrip("# ").strip()
+            if header.startswith("Observation period"):
+                hdr = [c.strip() for c in header.split(";")]
+                if "GHI" in hdr:
+                    ghi_idx = hdr.index("GHI")
+            continue
+        if ghi_idx is None:                         # data vóór de header: overslaan
+            continue
+        cols   = [c.strip() for c in raw.split(";")]
+        period = cols[0] if cols else ""
+        if "/" not in period or ghi_idx >= len(cols):
+            continue
+        try:
+            start_iso = period.split("/")[0].split(".")[0]    # 'YYYY-MM-DDTHH:MM:SS'
+            start_utc = datetime.fromisoformat(start_iso).replace(tzinfo=timezone.utc)
+            local     = start_utc.astimezone().replace(tzinfo=None)
+            out[local] = float(cols[ghi_idx])
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def update_cams_cache(conn) -> None:
+    """Ververs (max. elke CAMS_MIN_REFRESH_H) de CAMS-cache. Satelliet-gemeten GHI → geschatte
+    PV-kWh per 15-min slot via dezelfde GHI-fallback als de optimizer (PANEL_EFF_CAL, horizontaal).
+    Analyse-only; raakt de optimizer-beslissingen NIET. Gated op CAMS_USERNAME."""
+    if not CAMS_USERNAME:
+        return
+    ensure_cams_cache_table(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(created_at) FROM pv_cams_radiation")
+    last = cur.fetchone()[0]
+    cur.close()
+    if last is not None and (datetime.now() - last).total_seconds() < CAMS_MIN_REFRESH_H * 3600:
+        return  # nog vers genoeg -> spaar API-calls
+    date_end   = date.today() - timedelta(days=2)            # CAMS-data t/m ~2 dagen geleden
+    date_begin = date_end - timedelta(days=CAMS_BACKFILL_DAYS)
+    try:
+        ghi = _fetch_cams_radiation(date_begin.isoformat(), date_end.isoformat())
+    except Exception as exc:
+        log.warning("CAMS fetch failed: %s — keeping cached curve", exc)
+        return
+    if not ghi:
+        log.warning("CAMS: geen rijen geparsed — cache ongewijzigd")
+        return
+    run_ts = datetime.now()
+    kwp    = PANEL_EAST_KWP + PANEL_WEST_KWP
+    rows   = [(slot, (ghi_wh / 1000.0) * kwp * PANEL_EFF_CAL, ghi_wh, run_ts)
+              for slot, ghi_wh in sorted(ghi.items())]
+    cur = conn.cursor()
+    cur.executemany("""
+        INSERT INTO pv_cams_radiation (slot_dt, pv_kwh, ghi_wh_m2, created_at)
+        VALUES (%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE pv_kwh=VALUES(pv_kwh), ghi_wh_m2=VALUES(ghi_wh_m2),
+                                created_at=VALUES(created_at)
+    """, rows)
+    conn.commit()
+    cur.close()
+    log.info("CAMS cache updated: %d slots (%s..%s)", len(rows), date_begin, date_end)
 
 
 def _fetch_forecast_solar() -> dict:
@@ -1344,6 +1454,9 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
 
     # Solcast-vergelijkingsforecast (alleen als geconfigureerd; max. elke 6 u; raakt optimizer niet)
     update_solcast_cache(conn)
+
+    # CAMS satelliet-gemeten instraling (analyse-only, ~2 dagen latency; raakt optimizer niet)
+    update_cams_cache(conn)
 
     # Tag this run's today-rows with both totals so the dashboard can plot the
     # forecast's evolution (one point per created_at).
