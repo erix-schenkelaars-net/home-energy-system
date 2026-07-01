@@ -590,7 +590,15 @@ def update_db(**v):
             seplos_error_tb07_FET_state=%s,
             seplos_error_tb15_hardfault=%s,
             seplos_energy_charged_kwh=%s,
-            seplos_energy_discharged_kwh=%s
+            seplos_energy_discharged_kwh=%s,
+            seplos_cel1_voltage_v=%s,  seplos_cel2_voltage_v=%s,
+            seplos_cel3_voltage_v=%s,  seplos_cel4_voltage_v=%s,
+            seplos_cel5_voltage_v=%s,  seplos_cel6_voltage_v=%s,
+            seplos_cel7_voltage_v=%s,  seplos_cel8_voltage_v=%s,
+            seplos_cel9_voltage_v=%s,  seplos_cel10_voltage_v=%s,
+            seplos_cel11_voltage_v=%s, seplos_cel12_voltage_v=%s,
+            seplos_cel13_voltage_v=%s, seplos_cel14_voltage_v=%s,
+            seplos_cel15_voltage_v=%s, seplos_cel16_voltage_v=%s
         ORDER BY id DESC LIMIT 1
         """
 
@@ -617,7 +625,8 @@ def update_db(**v):
             int(v["tb07_fet"]),                # seplos_error_tb07_FET_state tinyint
             int(v["tb15_hard_faults"]),        # seplos_error_tb15_hardfault tinyint
             float(v["e_chg"]),                 # seplos_energy_charged_kwh double
-            float(v["e_dis"])                  # seplos_energy_discharged_kwh double
+            float(v["e_dis"]),                 # seplos_energy_discharged_kwh double
+            *[round(mv / 1000.0, 3) for mv in v["cells"]]  # seplos_cel1..16_voltage_v (mV->V)
         ))
 
         db.commit()
@@ -908,7 +917,8 @@ def main():
                 tb07_fet=tb07_FET_state,
                 tb15_hard_faults=tb15_hard_faults,
                 e_chg=energy_charged_kwh,   # today
-                e_dis=energy_discharged_kwh  # today
+                e_dis=energy_discharged_kwh,  # today
+                cells=cell_v                 # 16 celspanningen (mV) -> seplos_cel1..16_voltage_v
             )
 
             time.sleep(2)
