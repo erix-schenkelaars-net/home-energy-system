@@ -148,11 +148,6 @@ def elec_var_eur(import_kwh: float, export_kwh: float, spot: float, t: Tariff) -
 def gas_var_eur(m3: float, gas_spot: float, t: Tariff) -> float:
     return m3 * (gas_spot + t.gas_inkoop_m3 + t.gas_energiebelasting_m3)
 
-
-def elec_fix_eur(days: float, f: FixedCosts) -> float:
-    """Vaste stroomkost € over `days` dagen (incl. negatieve vermindering energiebelasting)."""
-    return days * (f.elec_lev_day + f.elec_sys_day + f.verm_eb_day)
-
-
-def gas_fix_eur(days: float, f: FixedCosts) -> float:
-    return days * (f.gas_lev_day + f.gas_sys_day)
+# NB: vaste kosten worden NIET hier berekend — ze worden bij weergave afgeleid uit de
+# fixed_costs-tabel (zie Energiekosten-GC.php / functions.php). De oude elec_fix_eur/
+# gas_fix_eur-helpers zijn verwijderd (waren dood; niemand riep ze aan).
