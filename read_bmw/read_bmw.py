@@ -366,6 +366,19 @@ def _publish_discovery(local: mqtt.Client, vin: str):
                 f"{{% set v = value_json.{nkey} | string | lower %}}"
                 "{% if v in ('true','open','on','1') %}true{% else %}false{% endif %}"
             )
+            # Trunk: BMW streams the real-time value under a DIFFERENT descriptor
+            # (vehicle.body.trunk.door.isOpen, boolean) than the 30-min REST poll
+            # (vehicle.body.trunk.isOpen, OPEN/CLOSED). Both land in the same state
+            # blob, so prefer the streaming key for a real-time pocket-dial alarm and
+            # fall back to REST until streaming has sent a value. default(none) is
+            # needed because a missing key is Undefined (Undefined is not none == True).
+            if nkey == "vehicle_body_trunk_isOpen":
+                cfg["value_template"] = (
+                    "{% set s = value_json.vehicle_body_trunk_door_isOpen | default(none) %}"
+                    "{% set r = value_json.vehicle_body_trunk_isOpen | default(none) %}"
+                    "{% set v = (s if s is not none else r) | string | lower %}"
+                    "{% if v in ('true','open','on','1') %}true{% else %}false{% endif %}"
+                )
             cfg["payload_on"]  = "true"
             cfg["payload_off"] = "false"
         if unit:      cfg["unit_of_measurement"] = unit
