@@ -87,6 +87,25 @@ DB_PASSWD = os.environ["DB_PASSWORD"]
 DB_NAME   = os.environ["DB_NAME"]
 DB_TABLE  = os.environ["DB_TABLE"]
 
+# ---------------- DEBUG TABLE ----------------
+# battery_debugging houdt de per-cel 5-min min/max celspanning bij (debug-only, geen
+# regel-consumer). Losgekoppeld van read_resol: read_seplos bezit z'n eigen 5-min-rij
+# via ts (UNIQUE, = energy.ts-bucket). De eerste write in een bucket doet een INSERT
+# (seed), elke volgende ~2s-write accumuleert de worst-case via ON DUPLICATE KEY UPDATE
+# met LEAST/GREATEST — geen COALESCE/sentinel/NULL-default nodig. Reset = nieuwe bucket.
+DB_DEBUG_TABLE   = "battery_debugging"
+_DEBUG_CELL_COLS = [f"seplos_cel{n}_voltage_{k}_v"
+                    for n in range(1, 17) for k in ("min", "max")]
+_DEBUG_SQL = (
+    f"INSERT INTO {DB_DEBUG_TABLE} (ts, " + ", ".join(_DEBUG_CELL_COLS) + ")\n"
+    "VALUES (%s, " + ", ".join(["%s"] * len(_DEBUG_CELL_COLS)) + ")\n"
+    "ON DUPLICATE KEY UPDATE\n  " + ",\n  ".join(
+        (f"{col}=LEAST({col}, VALUES({col}))" if col.endswith("min_v")
+         else f"{col}=GREATEST({col}, VALUES({col}))")
+        for col in _DEBUG_CELL_COLS
+    )
+)
+
 # ---------------- MODE ----------------
 MODE_MAP = {
     0x00: "Idle",
@@ -570,10 +589,11 @@ def update_db(**v):
         # Diverse kolommen accumuleren de WORST-CASE over de 5-min DB-rij via
         # LEAST/GREATEST, i.p.v. de 2s-momentopname te overschrijven — zo mist de
         # grafiek de dips/pieken niet meer:
-        #   - laagste soc (diepste dip), vmin, temp_cell_min, per-cel _min_v -> LEAST
-        #   - hoogste vmax, vdelta, temp_cell_max, temp_env/pow, per-cel _max_v -> GREATEST
-        # De 16 celN_voltage_min/max_v vervangen de oude 2s-snapshot celN_voltage_v,
-        # zodat de per-cel min/max consistent is met de aggregaat vmin/vmax (debug).
+        #   - laagste soc (diepste dip), vmin, temp_cell_min -> LEAST
+        #   - hoogste vmax, vdelta, temp_cell_max, temp_env/pow -> GREATEST
+        # De per-cel min/max celspanning staat NIET meer hier maar in battery_debugging
+        # (debug-only, losgekoppeld). De aggregaat vmin/vmax hier blijft consistent:
+        # MIN(cel*_min) in battery_debugging == seplos_cell_voltage_min_v op dezelfde ts.
         # Reset per rij gebeurt vanzelf: read_resol INSERT een nieuwe rij met NULL
         # seplos-kolommen, en COALESCE(...,sentinel) start dan opnieuw. Temp-sentinels
         # zijn -999 zodat ook negatieve omgevingstemp correct accumuleert.
@@ -603,39 +623,7 @@ def update_db(**v):
             seplos_error_tb07_FET_state=%s,
             seplos_error_tb15_hardfault=%s,
             seplos_energy_charged_kwh=%s,
-            seplos_energy_discharged_kwh=%s,
-            seplos_cel1_voltage_min_v=LEAST(COALESCE(seplos_cel1_voltage_min_v, 9.999), %s),
-            seplos_cel1_voltage_max_v=GREATEST(COALESCE(seplos_cel1_voltage_max_v, 0), %s),
-            seplos_cel2_voltage_min_v=LEAST(COALESCE(seplos_cel2_voltage_min_v, 9.999), %s),
-            seplos_cel2_voltage_max_v=GREATEST(COALESCE(seplos_cel2_voltage_max_v, 0), %s),
-            seplos_cel3_voltage_min_v=LEAST(COALESCE(seplos_cel3_voltage_min_v, 9.999), %s),
-            seplos_cel3_voltage_max_v=GREATEST(COALESCE(seplos_cel3_voltage_max_v, 0), %s),
-            seplos_cel4_voltage_min_v=LEAST(COALESCE(seplos_cel4_voltage_min_v, 9.999), %s),
-            seplos_cel4_voltage_max_v=GREATEST(COALESCE(seplos_cel4_voltage_max_v, 0), %s),
-            seplos_cel5_voltage_min_v=LEAST(COALESCE(seplos_cel5_voltage_min_v, 9.999), %s),
-            seplos_cel5_voltage_max_v=GREATEST(COALESCE(seplos_cel5_voltage_max_v, 0), %s),
-            seplos_cel6_voltage_min_v=LEAST(COALESCE(seplos_cel6_voltage_min_v, 9.999), %s),
-            seplos_cel6_voltage_max_v=GREATEST(COALESCE(seplos_cel6_voltage_max_v, 0), %s),
-            seplos_cel7_voltage_min_v=LEAST(COALESCE(seplos_cel7_voltage_min_v, 9.999), %s),
-            seplos_cel7_voltage_max_v=GREATEST(COALESCE(seplos_cel7_voltage_max_v, 0), %s),
-            seplos_cel8_voltage_min_v=LEAST(COALESCE(seplos_cel8_voltage_min_v, 9.999), %s),
-            seplos_cel8_voltage_max_v=GREATEST(COALESCE(seplos_cel8_voltage_max_v, 0), %s),
-            seplos_cel9_voltage_min_v=LEAST(COALESCE(seplos_cel9_voltage_min_v, 9.999), %s),
-            seplos_cel9_voltage_max_v=GREATEST(COALESCE(seplos_cel9_voltage_max_v, 0), %s),
-            seplos_cel10_voltage_min_v=LEAST(COALESCE(seplos_cel10_voltage_min_v, 9.999), %s),
-            seplos_cel10_voltage_max_v=GREATEST(COALESCE(seplos_cel10_voltage_max_v, 0), %s),
-            seplos_cel11_voltage_min_v=LEAST(COALESCE(seplos_cel11_voltage_min_v, 9.999), %s),
-            seplos_cel11_voltage_max_v=GREATEST(COALESCE(seplos_cel11_voltage_max_v, 0), %s),
-            seplos_cel12_voltage_min_v=LEAST(COALESCE(seplos_cel12_voltage_min_v, 9.999), %s),
-            seplos_cel12_voltage_max_v=GREATEST(COALESCE(seplos_cel12_voltage_max_v, 0), %s),
-            seplos_cel13_voltage_min_v=LEAST(COALESCE(seplos_cel13_voltage_min_v, 9.999), %s),
-            seplos_cel13_voltage_max_v=GREATEST(COALESCE(seplos_cel13_voltage_max_v, 0), %s),
-            seplos_cel14_voltage_min_v=LEAST(COALESCE(seplos_cel14_voltage_min_v, 9.999), %s),
-            seplos_cel14_voltage_max_v=GREATEST(COALESCE(seplos_cel14_voltage_max_v, 0), %s),
-            seplos_cel15_voltage_min_v=LEAST(COALESCE(seplos_cel15_voltage_min_v, 9.999), %s),
-            seplos_cel15_voltage_max_v=GREATEST(COALESCE(seplos_cel15_voltage_max_v, 0), %s),
-            seplos_cel16_voltage_min_v=LEAST(COALESCE(seplos_cel16_voltage_min_v, 9.999), %s),
-            seplos_cel16_voltage_max_v=GREATEST(COALESCE(seplos_cel16_voltage_max_v, 0), %s)
+            seplos_energy_discharged_kwh=%s
         ORDER BY id DESC LIMIT 1
         """
 
@@ -663,11 +651,19 @@ def update_db(**v):
             int(v["tb15_hard_faults"]),        # seplos_error_tb15_hardfault tinyint
             float(v["e_chg"]),                 # seplos_energy_charged_kwh double
             float(v["e_dis"]),                 # seplos_energy_discharged_kwh double
-            # per cel de 2s-waarde 2x: eerst voor _min_v (LEAST), dan _max_v (GREATEST)
-            *[x for mv in v["cells"] for x in (round(mv / 1000.0, 3),) * 2]
         ))
-
         db.commit()
+
+        # --- battery_debugging: per-cel 5-min min/max celspanning ---------------------
+        # Eigen 5-min-rij op ts-bucket (UNIQUE), losgekoppeld van read_resol. Elke cel
+        # levert dezelfde 2s-waarde voor z'n _min_v én _max_v; ON DUPLICATE KEY UPDATE
+        # met LEAST/GREATEST accumuleert de worst-case tot de bucket rolt.
+        now = datetime.now()
+        ts_bucket = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        cell_v = [round(mv / 1000.0, 3) for mv in v["cells"]]
+        c.execute(_DEBUG_SQL, (ts_bucket, *[x for cv in cell_v for x in (cv, cv)]))
+        db.commit()
+
         c.close()
         db.close()
 
