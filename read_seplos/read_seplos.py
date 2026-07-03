@@ -567,6 +567,17 @@ def update_db(**v):
         )
         c = db.cursor()
 
+        # Diverse kolommen accumuleren de WORST-CASE over de 5-min DB-rij via
+        # LEAST/GREATEST, i.p.v. de 2s-momentopname te overschrijven — zo mist de
+        # grafiek de dips/pieken niet meer:
+        #   - laagste soc (diepste dip), vmin, temp_cell_min      -> LEAST
+        #   - hoogste vmax, vdelta, temp_cell_max, temp_env/pow   -> GREATEST
+        # Reset per rij gebeurt vanzelf: read_resol INSERT een nieuwe rij met NULL
+        # seplos-kolommen, en COALESCE(...,sentinel) start dan opnieuw. Temp-sentinels
+        # zijn -999 zodat ook negatieve omgevingstemp correct accumuleert.
+        # LET OP: seplos_soc_pct heeft column-default 0 (niet NULL), dus de reset moet
+        # die 0 als "leeg" behandelen -> NULLIF(...,0), anders latcht LEAST de rij op 0.
+        # Een echte SOC van exact 0.0% is onbereikbaar (LP-floor 20% + LFP).
         sql = f"""
         UPDATE {DB_TABLE}
         SET seplos_alarm_active=%s,
@@ -575,15 +586,15 @@ def update_db(**v):
             seplos_current_a=%s,
             seplos_direction=%s,
             seplos_power_w=%s,
-            seplos_soc_pct=%s,
+            seplos_soc_pct=LEAST(COALESCE(NULLIF(seplos_soc_pct, 0), 999), %s),
             seplos_mode=%s,
-            seplos_cell_voltage_min_v=%s,
-            seplos_cell_voltage_max_v=%s,
-            seplos_cell_voltage_delta_mv=%s,
-            seplos_temp_cell_min_c=%s,
-            seplos_temp_cell_max_c=%s,
-            seplos_temp_env_c=%s,
-            seplos_temp_pow_c=%s,
+            seplos_cell_voltage_min_v=LEAST(COALESCE(seplos_cell_voltage_min_v, 9.999), %s),
+            seplos_cell_voltage_max_v=GREATEST(COALESCE(seplos_cell_voltage_max_v, 0), %s),
+            seplos_cell_voltage_delta_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_mv, 0), %s),
+            seplos_temp_cell_min_c=LEAST(COALESCE(seplos_temp_cell_min_c, 999), %s),
+            seplos_temp_cell_max_c=GREATEST(COALESCE(seplos_temp_cell_max_c, -999), %s),
+            seplos_temp_env_c=GREATEST(COALESCE(seplos_temp_env_c, -999), %s),
+            seplos_temp_pow_c=GREATEST(COALESCE(seplos_temp_pow_c, -999), %s),
             seplos_error_tb02_voltage=%s,
             seplos_error_tb03_temp=%s,
             seplos_error_tb05_current=%s,
