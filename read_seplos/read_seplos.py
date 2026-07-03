@@ -570,8 +570,10 @@ def update_db(**v):
         # Diverse kolommen accumuleren de WORST-CASE over de 5-min DB-rij via
         # LEAST/GREATEST, i.p.v. de 2s-momentopname te overschrijven — zo mist de
         # grafiek de dips/pieken niet meer:
-        #   - laagste soc (diepste dip), vmin, temp_cell_min      -> LEAST
-        #   - hoogste vmax, vdelta, temp_cell_max, temp_env/pow   -> GREATEST
+        #   - laagste soc (diepste dip), vmin, temp_cell_min, per-cel _min_v -> LEAST
+        #   - hoogste vmax, vdelta, temp_cell_max, temp_env/pow, per-cel _max_v -> GREATEST
+        # De 16 celN_voltage_min/max_v vervangen de oude 2s-snapshot celN_voltage_v,
+        # zodat de per-cel min/max consistent is met de aggregaat vmin/vmax (debug).
         # Reset per rij gebeurt vanzelf: read_resol INSERT een nieuwe rij met NULL
         # seplos-kolommen, en COALESCE(...,sentinel) start dan opnieuw. Temp-sentinels
         # zijn -999 zodat ook negatieve omgevingstemp correct accumuleert.
@@ -602,14 +604,38 @@ def update_db(**v):
             seplos_error_tb15_hardfault=%s,
             seplos_energy_charged_kwh=%s,
             seplos_energy_discharged_kwh=%s,
-            seplos_cel1_voltage_v=%s,  seplos_cel2_voltage_v=%s,
-            seplos_cel3_voltage_v=%s,  seplos_cel4_voltage_v=%s,
-            seplos_cel5_voltage_v=%s,  seplos_cel6_voltage_v=%s,
-            seplos_cel7_voltage_v=%s,  seplos_cel8_voltage_v=%s,
-            seplos_cel9_voltage_v=%s,  seplos_cel10_voltage_v=%s,
-            seplos_cel11_voltage_v=%s, seplos_cel12_voltage_v=%s,
-            seplos_cel13_voltage_v=%s, seplos_cel14_voltage_v=%s,
-            seplos_cel15_voltage_v=%s, seplos_cel16_voltage_v=%s
+            seplos_cel1_voltage_min_v=LEAST(COALESCE(seplos_cel1_voltage_min_v, 9.999), %s),
+            seplos_cel1_voltage_max_v=GREATEST(COALESCE(seplos_cel1_voltage_max_v, 0), %s),
+            seplos_cel2_voltage_min_v=LEAST(COALESCE(seplos_cel2_voltage_min_v, 9.999), %s),
+            seplos_cel2_voltage_max_v=GREATEST(COALESCE(seplos_cel2_voltage_max_v, 0), %s),
+            seplos_cel3_voltage_min_v=LEAST(COALESCE(seplos_cel3_voltage_min_v, 9.999), %s),
+            seplos_cel3_voltage_max_v=GREATEST(COALESCE(seplos_cel3_voltage_max_v, 0), %s),
+            seplos_cel4_voltage_min_v=LEAST(COALESCE(seplos_cel4_voltage_min_v, 9.999), %s),
+            seplos_cel4_voltage_max_v=GREATEST(COALESCE(seplos_cel4_voltage_max_v, 0), %s),
+            seplos_cel5_voltage_min_v=LEAST(COALESCE(seplos_cel5_voltage_min_v, 9.999), %s),
+            seplos_cel5_voltage_max_v=GREATEST(COALESCE(seplos_cel5_voltage_max_v, 0), %s),
+            seplos_cel6_voltage_min_v=LEAST(COALESCE(seplos_cel6_voltage_min_v, 9.999), %s),
+            seplos_cel6_voltage_max_v=GREATEST(COALESCE(seplos_cel6_voltage_max_v, 0), %s),
+            seplos_cel7_voltage_min_v=LEAST(COALESCE(seplos_cel7_voltage_min_v, 9.999), %s),
+            seplos_cel7_voltage_max_v=GREATEST(COALESCE(seplos_cel7_voltage_max_v, 0), %s),
+            seplos_cel8_voltage_min_v=LEAST(COALESCE(seplos_cel8_voltage_min_v, 9.999), %s),
+            seplos_cel8_voltage_max_v=GREATEST(COALESCE(seplos_cel8_voltage_max_v, 0), %s),
+            seplos_cel9_voltage_min_v=LEAST(COALESCE(seplos_cel9_voltage_min_v, 9.999), %s),
+            seplos_cel9_voltage_max_v=GREATEST(COALESCE(seplos_cel9_voltage_max_v, 0), %s),
+            seplos_cel10_voltage_min_v=LEAST(COALESCE(seplos_cel10_voltage_min_v, 9.999), %s),
+            seplos_cel10_voltage_max_v=GREATEST(COALESCE(seplos_cel10_voltage_max_v, 0), %s),
+            seplos_cel11_voltage_min_v=LEAST(COALESCE(seplos_cel11_voltage_min_v, 9.999), %s),
+            seplos_cel11_voltage_max_v=GREATEST(COALESCE(seplos_cel11_voltage_max_v, 0), %s),
+            seplos_cel12_voltage_min_v=LEAST(COALESCE(seplos_cel12_voltage_min_v, 9.999), %s),
+            seplos_cel12_voltage_max_v=GREATEST(COALESCE(seplos_cel12_voltage_max_v, 0), %s),
+            seplos_cel13_voltage_min_v=LEAST(COALESCE(seplos_cel13_voltage_min_v, 9.999), %s),
+            seplos_cel13_voltage_max_v=GREATEST(COALESCE(seplos_cel13_voltage_max_v, 0), %s),
+            seplos_cel14_voltage_min_v=LEAST(COALESCE(seplos_cel14_voltage_min_v, 9.999), %s),
+            seplos_cel14_voltage_max_v=GREATEST(COALESCE(seplos_cel14_voltage_max_v, 0), %s),
+            seplos_cel15_voltage_min_v=LEAST(COALESCE(seplos_cel15_voltage_min_v, 9.999), %s),
+            seplos_cel15_voltage_max_v=GREATEST(COALESCE(seplos_cel15_voltage_max_v, 0), %s),
+            seplos_cel16_voltage_min_v=LEAST(COALESCE(seplos_cel16_voltage_min_v, 9.999), %s),
+            seplos_cel16_voltage_max_v=GREATEST(COALESCE(seplos_cel16_voltage_max_v, 0), %s)
         ORDER BY id DESC LIMIT 1
         """
 
@@ -637,7 +663,8 @@ def update_db(**v):
             int(v["tb15_hard_faults"]),        # seplos_error_tb15_hardfault tinyint
             float(v["e_chg"]),                 # seplos_energy_charged_kwh double
             float(v["e_dis"]),                 # seplos_energy_discharged_kwh double
-            *[round(mv / 1000.0, 3) for mv in v["cells"]]  # seplos_cel1..16_voltage_v (mV->V)
+            # per cel de 2s-waarde 2x: eerst voor _min_v (LEAST), dan _max_v (GREATEST)
+            *[x for mv in v["cells"] for x in (round(mv / 1000.0, 3),) * 2]
         ))
 
         db.commit()
