@@ -21,7 +21,7 @@ Control sources (sph5k.conf control_source key):
 
 SOC guards (always active, override schedule):
   LOW  lock (<= 18%): force BATTERY_FIRST+CHARGE 50%; releases >= 25%
-  HIGH lock (>= 90%): force BATTERY_FIRST+DISCHARGE 50%; releases <= 88%
+  HIGH lock (>= 90%): force REG_Load_priority_discharge_cut_off_SOC+DISCHARGE 50%; releases <= 88%
 
 PV curtailment:
   Triggered by battery_schedule.pv_curtail_kwh > 0.05 OR pv_off_at_x_perc_soc in sph5k.conf.
@@ -307,7 +307,7 @@ SPH_REG_LIST = [
     R("REG_Battery_cluster_index              ", 30300, 3, "UINT16", False, 1,   "[0,3] cluster select"),
     R("REG_Charging_cut_off_SOC               ", 30404, 2, "UINT8",  False, 1,   "Stop % charging at SOC"),
     R("REG_Disharging_cut_off_SOC             ", 30405, 2, "UINT8",  False, 1,   "Stop % discharging at SOC"),
-    R("REG_Load_priority_discharge_cut_off_SOC", 30406, 2, "UINT8",  False, 1,   "%"),
+    R("REG_Load_priority_discharge_cut_off_SOC", 30406, 2, "UINT8",  False, 1,   "Stop % load_first at SOC"),
     R("REG_Remote_power_control_enable        ", 30407, 1, "UINT8",  False, 1,   "1=enable 0=disable"),
     R("REG_Remote_power_control_charging_time ", 30408, 1, "UINT8",  False, 1,   "minutes"),
     R("REG_Remote_charge_and_discharge_power  ", 30409, 1, "INT16",  True,  1,   "+-percent"),
@@ -601,13 +601,15 @@ def modbus_write_init_registers(client):
     try:
         dbg(1, "SPH", "*WRITE INIT REGISTERS*")
         write_sph5k_reg(client, REG_ADDR["REG_Charging_cut_off_SOC"],                90)
-        write_sph5k_reg(client, REG_ADDR["REG_Disharging_cut_off_SOC"],              20)
-        # 30405/30406 raised 14 -> 20 to match the LP floor (BAT_MIN_SOC_PCT=20%).
+        write_sph5k_reg(client, REG_ADDR["REG_Disharging_cut_off_SOC"],              19)
+        # 3-tier discharge floor (2026-07-07): optimizer PLANS for 20% (BAT_MIN_SOC_PCT).
+        # These registers are the HARDWARE BACKSTOP at 19% → the SPH stops discharging at
+        # actual ~19.9% (SOC integer-truncation: reg 19 fires as int SOC hits 19). This
+        # catches a quarter that drains a touch deeper than planned, 1% below the plan.
+        # If the SPH ever ignores these registers, SOC_LOW_STOP=14% (~14.9%) forces noodlading.
         # Crucial for LOAD_FIRST: the SPH5000 IGNORES the Seplos BMS current-taper in
-        # LOAD_FIRST, so the cell-voltage taper cannot protect the weakest cell there —
-        # only this SOC cutoff stops it. Keeping it at 20% keeps the pack out of the
-        # low-SOC zone where the weak cell hits the vmin taper (2026-07-03 night issue).
-        write_sph5k_reg(client, REG_ADDR["REG_Load_priority_discharge_cut_off_SOC"], 20)
+        # LOAD_FIRST, so only this SOC cutoff protects the weakest cell there.
+        write_sph5k_reg(client, REG_ADDR["REG_Load_priority_discharge_cut_off_SOC"], 19)
         return True
     except Exception as e:
         traceback.print_exc()
