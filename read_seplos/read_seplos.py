@@ -565,6 +565,7 @@ def update_db(**v):
         dbg(4, DEBUG_DB, "DB", f"seplos_cell_voltage_min_v {v['vmin']:.3f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_cell_voltage_max_v {v['vmax']:.3f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_cell_voltage_delta_mv {v['vdiff']:.2f}")
+        dbg(4, DEBUG_DB, "DB", f"seplos_cell_voltage_delta_sustained_mv {v['vdiff_sustained']:.2f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_temp_cell_min_c {v['tmin']:.1f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_temp_cell_max_c {v['tmax']:.1f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_temp_env_c {v['tenv']:.1f}")
@@ -613,6 +614,7 @@ def update_db(**v):
             seplos_cell_voltage_min_v=LEAST(COALESCE(seplos_cell_voltage_min_v, 9.999), %s),
             seplos_cell_voltage_max_v=GREATEST(COALESCE(seplos_cell_voltage_max_v, 0), %s),
             seplos_cell_voltage_delta_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_mv, 0), %s),
+            seplos_cell_voltage_delta_sustained_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_sustained_mv, 0), %s),
             seplos_temp_cell_min_c=LEAST(COALESCE(seplos_temp_cell_min_c, 999), %s),
             seplos_temp_cell_max_c=GREATEST(COALESCE(seplos_temp_cell_max_c, -999), %s),
             seplos_temp_env_c=GREATEST(COALESCE(seplos_temp_env_c, -999), %s),
@@ -640,6 +642,7 @@ def update_db(**v):
             float(v["vmin"]),                  # seplos_cell_voltage_min_v float
             float(v["vmax"]),                  # seplos_cell_voltage_max_v float
             float(v["vdiff"]),                 # seplos_cell_voltage_delta_mv float
+            float(v["vdiff_sustained"]),       # seplos_cell_voltage_delta_sustained_mv float
             float(v["tmin"]),                  # seplos_temp_cell_min_c   float
             float(v["tmax"]),                  # seplos_temp_cell_max_c   float
             float(v["tenv"]),                  # seplos_temp_env_c        float
@@ -780,6 +783,13 @@ def main():
             # Worst-case values over debounce window (highest vdelta, lowest vmin)
             vdelta_worst = max(vdelta_window)
             vmin_worst   = min(vmin_window)
+
+            # Sustained vdelta = LOWEST vdelta over the debounce window (~10 s floor).
+            # A 1-2 sample transient spike leaves the window min low; only genuinely
+            # sustained divergence raises it. This is exactly the taper decision var:
+            # vdelta_taper_active <=> min(window) >= VDELTA_TAPER_START_MV. Stored as
+            # 5-min MAX-HOLD → peak sustained level per DB row (graph: solid vs dotted).
+            vdelta_sustained = min(vdelta_window)
 
             # State-change logging + alert (only when debounce threshold crossed)
             # Messages use worst-case value from the debounce window
@@ -941,6 +951,7 @@ def main():
                 vmin=vmin /1000,
                 vmax=vmax / 1000,
                 vdiff=(vmax - vmin),
+                vdiff_sustained=vdelta_sustained,
                 tmin=tmin,
                 tmax=tmax,
                 tenv = env_t,
