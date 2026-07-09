@@ -225,6 +225,13 @@ INDAY_FACTOR_MIN        = 0.7   # #1: clamp ondergrens
 INDAY_FACTOR_MAX        = 1.4   # #1: clamp bovengrens
 INDAY_DAMPING           = 0.7   # #1: demping richting 1.0 (0=geen correctie, 1=volledig)
 
+# Cooling (airco) load forecast — DRY-RUN (analyse 2026-07-08). Dagverbruik is ~71%
+# temp-gedreven; een EWMA cooling-degree-hours model halveert de forecast-MAPE (42->13%).
+# Zolang COOLING_DRYRUN=True wordt ALLEEN gelogd (temp-blind vs temp-aware), niks toegepast.
+COOLING_DRYRUN          = True
+COOLING_CDH_THRESHOLD_C = 21.0  # graden waarboven koellast telt (cooling-degree-hours)
+COOLING_EWMA_ALPHA      = 0.5   # thermische-massa decay per dag (0.5 = half-life ~1 dag)
+
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER", "YOUR_MQTT_BROKER_IP")
 MQTT_BROKER_PORT = int(os.environ.get("MQTT_PORT", 1883))
 MQTT_BROKER_USER = os.environ.get("MQTT_USERNAME", "")
@@ -1611,6 +1618,54 @@ def compute_inday_load_factor(conn, profile: dict[tuple[bool, int], float], now:
 
 
 # ---------------------------------------------------------------------------
+# 5a2.  COOLING (AIRCO) LOAD FORECAST — DRY-RUN (alleen loggen, niet toegepast)
+# ---------------------------------------------------------------------------
+def log_cooling_dryrun(conn, load_prof, now):
+    """Logt de temp-blinde (huidige) vs temp-aware dagvoorspelling zodat we het
+    live-effect kunnen zien. Past de LP-load NIET aan. Puur read-only + log;
+    faalt stil (nooit de optimizer breken)."""
+    if not COOLING_DRYRUN:
+        return
+    try:
+        import statistics as _st
+        th, alpha = COOLING_CDH_THRESHOLD_C, COOLING_EWMA_ALPHA
+        is_weekend = now.weekday() >= 5
+        base_kwh = sum(load_prof.get((is_weekend, h), 0.0) for h in range(24))  # huidige temp-blinde dag-forecast
+        since = now - timedelta(days=35)
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT DATE(slot_dt) d, AVG(GREATEST(forecast_temp_c-%s,0))*24 cdh, COUNT(*) n "
+            "FROM battery_schedule WHERE slot_dt >= %s GROUP BY DATE(slot_dt)", (th, since))
+        cdh = {r["d"]: float(r["cdh"]) for r in cur.fetchall()
+               if r["n"] and r["n"] >= 48 and r["cdh"] is not None}
+        cur.execute(
+            "SELECT DATE(ts) d, AVG(p1_power_import_w+COALESCE(sph_pv_power_tot_w,0)"
+            "-p1_power_export_w-COALESCE(sph_bat_act_charge_discharge_power_w,0))*24/1000 kwh, COUNT(*) n "
+            "FROM energy WHERE ts >= %s AND p1_power_import_w IS NOT NULL GROUP BY DATE(ts)", (since,))
+        act = {r["d"]: float(r["kwh"]) for r in cur.fetchall()
+               if r["n"] and r["n"] > 250 and r["kwh"] is not None}
+        cur.close()
+        acc, prev = {}, None                       # EWMA thermische-massa accumulator
+        for d in sorted(cdh):
+            acc[d] = cdh[d] if prev is None else cdh[d] + (alpha ** (d - prev).days) * acc[prev]
+            prev = d
+        today = now.date()
+        fit_days = [d for d in sorted(act) if d < today and d in acc][-14:]
+        if len(fit_days) >= 4 and today in acc:
+            X = [acc[d] for d in fit_days]; Y = [act[d] for d in fit_days]; n = len(X)
+            mx, my, vx = _st.mean(X), _st.mean(Y), _st.pvariance(X)
+            if vx > 0:
+                b = sum((x - mx) * (y - my) for x, y in zip(X, Y)) / n / vx
+                ta_kwh = (my - b * mx) + b * acc[today]
+                log.info("COOLING dry-run: temp-blind=%.1f kWh  temp-aware(EWMA a=%.1f)=%.1f kWh  "
+                         "acc=%.1f b=%.2f  (NIET toegepast)", base_kwh, alpha, ta_kwh, acc[today], b)
+                return
+        log.info("COOLING dry-run: temp-blind=%.1f kWh  (te weinig data voor temp-aware fit)", base_kwh)
+    except Exception as e:
+        log.warning("COOLING dry-run faalde (genegeerd): %s", e)
+
+
+# ---------------------------------------------------------------------------
 # 5b.  HEAT PUMP LOAD CORRECTION
 # ---------------------------------------------------------------------------
 
@@ -2704,6 +2759,7 @@ def main(dry_run: bool = False):
     base_load    = read_avg_consumption(conn)
     load_prof    = build_load_profile(conn, base_load)
     inday_factor = compute_inday_load_factor(conn, load_prof, now)
+    log_cooling_dryrun(conn, load_prof, now)   # DRY-RUN: alleen loggen, geen invloed op sturing
 
     mode = "DYNAMIC_PRICE"
     log.info("Optimizer mode: %s", mode)
