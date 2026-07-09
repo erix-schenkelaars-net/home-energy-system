@@ -24,7 +24,7 @@ from common import energy_cost as ec
 TARGET_DATE = date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else date(2026, 6, 19)
 
 DB = dict(
-    host=os.getenv("DB_HOST", "192.168.178.240"),
+    host=os.getenv("DB_HOST", "127.0.0.1"),
     user=os.getenv("DB_USER", "erix"),
     passwd=os.getenv("DB_PASSWORD", "UK2204uk."),
     db=os.getenv("DB_NAME", "erix_db"),

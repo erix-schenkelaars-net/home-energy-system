@@ -16,7 +16,7 @@ import json
 import os
 from datetime import datetime
 
-MQTT_HOST  = os.getenv('MQTT_BROKER',   '192.168.178.251')
+MQTT_HOST  = os.getenv('MQTT_BROKER',   '127.0.0.1')
 MQTT_PORT  = int(os.getenv('MQTT_PORT', '1883'))
 MQTT_USER  = os.getenv('MQTT_USERNAME')
 MQTT_PASS  = os.getenv('MQTT_PASSWORD')

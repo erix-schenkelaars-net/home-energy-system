@@ -72,8 +72,8 @@ DB_CONFIG = {
     "password": DB_PASSWD,
 }
 
-LAT = float(os.environ.get("SYSTEM_LAT", "51.44"))
-LON = float(os.environ.get("SYSTEM_LON", "5.47"))
+LAT = float(os.environ.get("SYSTEM_LAT", "52.0"))
+LON = float(os.environ.get("SYSTEM_LON", "5.0"))
 
 PANEL_EAST_KWP  = 3.12
 PANEL_WEST_KWP  = 3.12
@@ -207,8 +207,8 @@ BMW_READY_BY_HOUR           = 9
 BMW_SOC_START_THRESHOLD_PCT = 95.0   # start a new charge cycle below this level
 EV_CHARGE_DETECT_W          = 100    # minimum power (W) to confirm BMW is charging
 EV_POWER_CHECK_WAIT_S       = 60     # wait time (s) after plug-on before power check
-BMW_HOME_LAT                = float(os.environ.get("BMW_HOME_LAT", "51.44"))
-BMW_HOME_LON                = float(os.environ.get("BMW_HOME_LON", "5.47"))
+BMW_HOME_LAT                = float(os.environ.get("BMW_HOME_LAT", "52.0"))
+BMW_HOME_LON                = float(os.environ.get("BMW_HOME_LON", "5.0"))
 BMW_HOME_RADIUS_M           = 200    # maximum distance from home (metres)
 
 HISTORY_DAYS  = 4
