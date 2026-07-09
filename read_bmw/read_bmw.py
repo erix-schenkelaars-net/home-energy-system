@@ -309,6 +309,14 @@ HA_ENTITIES: dict[str, tuple] = {
         ("sensor",        "Door Lock State",      None,  None,       "mdi:car-key"),
     "vehicle_body_trunk_isLocked":
         ("binary_sensor", "Trunk Locked",         None,  "lock",     None),
+    # ── Door status (arm proxy — streams LOCKED/SECURED real-time) ──────────────
+    # Op deze F45 (225XE) streamen armStatus/anti-theft NIET (bevestigd 2026-07-04
+    # met alle 245 descriptors aan + een ritje) en individuele deur-isOpen geven
+    # nooit 'open' af. vehicle.cabin.door.status doet dat wél: real-time LOCKED ↔
+    # SECURED. SECURED = volledig vergrendeld/scherp → beste "arm"-signaal dat de
+    # auto verstuurt. Alarm triggert op 'verlaat SECURED'.
+    "vehicle_cabin_door_status":
+        ("sensor",        "Door Status",          None,  None,       "mdi:car-door-lock"),
     # ── Windows (confirmed) ────────────────────────────────────────────────────
     "vehicle_cabin_window_row1_driver_status":
         ("sensor",        "Window Front Left",    None,  None,       "mdi:car-door"),
@@ -584,6 +592,8 @@ _REST_KEYS = [
     "vehicle.body.trunk.isLocked",
     "vehicle.body.hood.isOpen",
     "vehicle.cabin.door.lock.status",
+    # Door status (arm proxy — streams real-time LOCKED/SECURED)
+    "vehicle.cabin.door.status",
     # Windows
     "vehicle.cabin.window.row1.driver.status",
     "vehicle.cabin.window.row1.passenger.status",
