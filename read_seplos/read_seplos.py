@@ -63,8 +63,10 @@ SOC_DISCHARGE_TAPER_END = 15.2  # % - minimum discharge current
 
 VMAX_TAPER_START_MV = 3400     # mV - begin voltage charge taper
 VMAX_TAPER_END_MV = 3500       # mV - stop charging at cell level
-VMIN_TAPER_START_MV = 3150     # mV - begin voltage discharge taper
-VMIN_TAPER_END_MV = 2950       # mV - hard discharge floor
+VMIN_TAPER_START_MV = 3120     # mV - begin voltage discharge taper. Must stay below the cell
+                               #      voltage reached at the planned 20% SoC floor (~3146 mV
+                               #      measured), else it fires every cycle at ~0% throttle.
+VMIN_TAPER_END_MV = 2950       # mV - hard discharge floor (0 A)
 
 VDELTA_TAPER_START_MV = 25     # mV - begin reducing discharge when cells diverge
 VDELTA_TAPER_END_MV   = 35     # mV - discharge = 0A (well below EVE MB31 BMS intervention ~100 mV)

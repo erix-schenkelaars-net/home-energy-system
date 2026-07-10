@@ -57,9 +57,10 @@ SOC_HIGH_RESUME    = 88  # releases high-SoC lock (2% hysteresis)
 # SoC is unreliable at low charge (coulomb counter drift, sudden BMS recalibration).
 # These voltage thresholds are read from seplos_cell_voltage_min_v in the DB and
 # mirror the SoC guards above. OR-logic: whichever fires first wins.
-# These sit BELOW the read_seplos vmin taper start (3150 mV): the taper eases the
+# These sit BELOW the read_seplos vmin taper start (3120 mV): the taper eases the
 # discharge current first, and only if the weakest cell keeps sagging do these hard
 # guards fire (3080 → stop discharge, 3020 → emergency charge).
 VMIN_DISCHARGE_STOP_MV = 3080  # stop BATTERY_FIRST+DISCHARGE  (parallel to SOC_DISCHARGE_STOP=17%)
 VMIN_LOW_STOP_MV       = 3020  # emergency forced charge        (parallel to SOC_LOW_STOP=14%)
-VMIN_LOW_RESUME_MV     = 3150  # release low-vmin lock          (matches read_seplos VMIN_TAPER_START)
+VMIN_LOW_RESUME_MV     = 3150  # release low-vmin lock — the cell voltage reached at the planned
+                               # 20% SoC floor, i.e. "recovered to normal operating level"
