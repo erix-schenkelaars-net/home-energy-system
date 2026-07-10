@@ -1125,6 +1125,7 @@ def run_data_collection(client):
                 sph_pv_power_2_w=%s,
                 used_energy_today_kwh=%s,
                 sph_bat_act_charge_discharge_power_w=%s,
+                sph_bat_voltage_v=%s,
                 sph_bat_charge_today_kwh=%s,
                 sph_bat_charge_total_kwh=%s,
                 sph_bat_discharge_today_kwh=%s,
@@ -1152,6 +1153,7 @@ def run_data_collection(client):
             f"{pv2w:.1f}",
             f"{e_used_today:.1f}",
             f"{regs.get('REG_Charge_discharge_power', 0):.1f}",
+            f"{regs.get('REG_Battery_voltage', 0):.1f}",
             f"{regs.get('REG_Daily_charge_of_battery', 0):.1f}",
             f"{regs.get('REG_Cummulative_charge_of_battery', 0):.1f}",
             f"{regs.get('REG_Daily_discharge_of_battery', 0):.1f}",
@@ -1172,6 +1174,7 @@ def run_data_collection(client):
         dbg(3, "DB", f"PV Today:    {PV_Etoday:.1f} kWh")
         dbg(3, "DB", f"PV Total:    {PV_Etotal:.1f} kWh")
         dbg(3, "DB", f"Inverter T:  {pvtemp:.1f} C")
+        dbg(3, "DB", f"Battery V:   {regs.get('REG_Battery_voltage', 0):.1f} V (SPH side)")
 
         cursor.execute(sql, data)
         db.commit()
