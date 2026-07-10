@@ -71,6 +71,11 @@ VMIN_TAPER_END_MV = 2950       # mV - hard discharge floor (0 A)
 VDELTA_TAPER_START_MV = 25     # mV - begin reducing discharge when cells diverge
 VDELTA_TAPER_END_MV   = 35     # mV - discharge = 0A (well below EVE MB31 BMS intervention ~100 mV)
 
+REST_CURRENT_A = 2.0           # A  - |I| below this counts as "at rest" (worst cell's extra
+                               #      internal resistance, ~0.15 mOhm, then drops < 0.5 mV)
+REST_DEBOUNCE  = 30            # samples (~60 s) of continuous rest before the spread is recorded;
+                               #      cells keep relaxing for minutes after a heavy discharge
+
 TMAX_TAPER_START = 50          # °C - begin high-temp taper (max in spec is 60)
 TMAX_CUTOFF = 55               # °C - stop all current above this
 TMIN_CHARGE_START = 10         # °C - begin cold charge taper
@@ -568,6 +573,7 @@ def update_db(**v):
         dbg(4, DEBUG_DB, "DB", f"seplos_cell_voltage_max_v {v['vmax']:.3f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_cell_voltage_delta_mv {v['vdiff']:.2f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_cell_voltage_delta_sustained_mv {v['vdiff_sustained']:.2f}")
+        dbg(4, DEBUG_DB, "DB", f"seplos_cell_voltage_delta_rest_mv {v['vdiff_rest']}")
         dbg(4, DEBUG_DB, "DB", f"seplos_temp_cell_min_c {v['tmin']:.1f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_temp_cell_max_c {v['tmax']:.1f}")
         dbg(4, DEBUG_DB, "DB", f"seplos_temp_env_c {v['tenv']:.1f}")
@@ -617,6 +623,8 @@ def update_db(**v):
             seplos_cell_voltage_max_v=GREATEST(COALESCE(seplos_cell_voltage_max_v, 0), %s),
             seplos_cell_voltage_delta_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_mv, 0), %s),
             seplos_cell_voltage_delta_sustained_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_sustained_mv, 0), %s),
+            seplos_cell_voltage_delta_rest_mv=IF(%s IS NULL, seplos_cell_voltage_delta_rest_mv,
+                LEAST(COALESCE(seplos_cell_voltage_delta_rest_mv, 65535), %s)),
             seplos_temp_cell_min_c=LEAST(COALESCE(seplos_temp_cell_min_c, 999), %s),
             seplos_temp_cell_max_c=GREATEST(COALESCE(seplos_temp_cell_max_c, -999), %s),
             seplos_temp_env_c=GREATEST(COALESCE(seplos_temp_env_c, -999), %s),
@@ -645,6 +653,8 @@ def update_db(**v):
             float(v["vmax"]),                  # seplos_cell_voltage_max_v float
             float(v["vdiff"]),                 # seplos_cell_voltage_delta_mv float
             float(v["vdiff_sustained"]),       # seplos_cell_voltage_delta_sustained_mv float
+            v["vdiff_rest"],                   # seplos_cell_voltage_delta_rest_mv  float or None
+            v["vdiff_rest"],                   #   (same value: NULL-check + LEAST accumulation)
             float(v["tmin"]),                  # seplos_temp_cell_min_c   float
             float(v["tmax"]),                  # seplos_temp_cell_max_c   float
             float(v["tenv"]),                  # seplos_temp_env_c        float
@@ -735,6 +745,7 @@ def main():
         TAPER_DEBOUNCE      = 5   # readings (~10 s) before taper + alert activate
         vdelta_window = deque(maxlen=TAPER_DEBOUNCE)  # last N vdelta readings
         vmin_window   = deque(maxlen=TAPER_DEBOUNCE)  # last N vmin readings
+        rest_count    = 0   # consecutive readings with |I| < REST_CURRENT_A
         while True:
             pia = safe_modbus_read(ser, 0x1000, 18)
             pib = safe_modbus_read(ser, 0x1100, 26)
@@ -792,6 +803,14 @@ def main():
             # vdelta_taper_active <=> min(window) >= VDELTA_TAPER_START_MV. Stored as
             # 5-min MAX-HOLD → peak sustained level per DB row (graph: solid vs dotted).
             vdelta_sustained = min(vdelta_window)
+
+            # Rest spread = cell divergence with (almost) no current. Under load vdelta is
+            # dominated by differences in internal resistance (cell 9 sags ~9 mV extra at
+            # 60 A) and says nothing about balance. At rest that term vanishes, so this is
+            # the metric that tracks true SoC balance / cell ageing. Stored as the 5-min
+            # MINIMUM = the most relaxed instant in the row.
+            rest_count  = rest_count + 1 if abs(pack_current) < REST_CURRENT_A else 0
+            vdelta_rest = float(vdelta) if rest_count >= REST_DEBOUNCE else None
 
             # State-change logging + alert (only when debounce threshold crossed)
             # Messages use worst-case value from the debounce window
@@ -954,6 +973,7 @@ def main():
                 vmax=vmax / 1000,
                 vdiff=(vmax - vmin),
                 vdiff_sustained=vdelta_sustained,
+                vdiff_rest=vdelta_rest,
                 tmin=tmin,
                 tmax=tmax,
                 tenv = env_t,
