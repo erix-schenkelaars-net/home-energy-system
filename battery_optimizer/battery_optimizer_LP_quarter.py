@@ -1977,12 +1977,14 @@ def optimise(  # noqa: C901
     A_eq[2 * n, soc_base] = 1.0
     b_eq[2 * n]           = initial_soc_kwh
 
-    # Flat 20% SoC floor.  Register 30406 (LOAD_FIRST discharge cutoff) is set to 20%
-    # so the SPH stops autonomous discharge at 20% — overnight load is covered by grid.
-    # No standby reserve headroom needed; the LP can discharge to 20% in the evening
-    # and the battery genuinely stays at 20% until PV arrives in the morning.
+    # Flat 20% SoC floor — this is the LP *plan*. control_growatt writes registers
+    # 30405/30406 (discharge cutoffs) = 19, which fire at actual ~19.9% (SPH truncation):
+    # a 1% hardware backstop for a quarter that drains deeper than planned. No standby
+    # reserve headroom needed; overnight load is covered by grid and the battery genuinely
+    # stays at ~20% until PV arrives in the morning.
     _pct = lambda k: k / BAT_CAPACITY_KWH * 100
-    log.info("SoC floor: flat %.1f%% (%.2f kWh); Seplos taper 17%%→15.2%%, 30406=14%% hardware",
+    log.info("SoC floor: plan %.1f%% (%.2f kWh); Seplos taper 17%%→15.2%%; "
+             "30405/30406=19%% hardware backstop (fires ~19.9%%)",
              _pct(BAT_MIN_KWH), BAT_MIN_KWH)
 
     soc_lb = []

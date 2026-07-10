@@ -2,14 +2,15 @@
 energy_cost.py — gedeelde, CANONIEKE energie-kostenberekening.
 
 Eén bron van waarheid voor de all-in prijsopbouw + saldering, gebruikt door:
-  - battery_optimizer  -> prijssignaal / geplande kost (import_price / export_price)
-  - read_p1            -> werkelijke (realized) kost per 5-min-rij in de energy-tabel
+  - battery_optimizer        -> prijssignaal / geplande kost (import_price / export_price)
+  - read_p1                  -> werkelijke (realized) kost per 5-min-rij in de energy-tabel
+  - tools/backfill_cost_*.py -> herberekening van historische kost (dryrun + apply)
 
 Tarieven uit erix_db.energy_tariffs, vaste kosten uit erix_db.fixed_costs.
 Alle bedragen incl. 21% BTW. WIJZIG DE FORMULE ALLEEN HIER.
 
-Wordt read-only in beide containers gemount op /app/common (zie docker-compose.yml),
-zodat beide exact dezelfde berekening gebruiken.
+Wordt read-only in de containers gemount op /app/common (zie docker-compose.yml),
+zodat alle consumers exact dezelfde berekening gebruiken.
 """
 from dataclasses import dataclass
 from datetime import date, datetime

@@ -12,6 +12,12 @@ SPH5000 truncation note:
   register = 17  means actual SoC 17.0–17.9%.
   The LP floor (BAT_MIN_SOC_PCT=20%) is set well above SOC_LOW_STOP=14% to prevent
   the 0.9% truncation gap (14.9% → 14 integer) from triggering the emergency lock.
+
+3-tier discharge floor (since 2026-07-07):
+  1. plan        : BAT_MIN_SOC_PCT = 20%  — the LP never plans below this.
+  2. hw backstop : SPH registers 30405 + 30406 = 19 — fire at actual ~19.9% (truncation),
+                   catching a quarter that drains a touch deeper than planned.
+  3. emergency   : SOC_LOW_STOP = 14 — forced charge if the SPH ignores its registers.
 """
 
 # ── Battery hardware ──────────────────────────────────────────────────────────
@@ -31,14 +37,16 @@ BAT_ROUNDTRIP_EFF= BAT_CHARGE_EFF * BAT_DISCHARGE_EFF   # ≈ 0.832 AC→AC
 # ── SoC operating limits (LP optimizer — floating-point %) ───────────────────
 BAT_MAX_SOC_PCT           = 89.5  # LP upper bound (Seplos BMS trips at ~89.8%)
 BAT_MIN_SOC_PCT           = 20.0  # LP floor — raised from 15% to match dawn constraint and give margin above SOC_LOW_STOP=14%
-BAT_MIN_SOC_DISCHARGE_PCT = 18.0  # LP floor for active BATTERY_FIRST+DISCHARGE
-                                   # (currently enforced by controller SOC_DISCHARGE_STOP=17;
-                                   #  kept here as documentation / future LP constraint)
+BAT_MIN_SOC_DISCHARGE_PCT = 18.0  # LP floor for active BATTERY_FIRST+DISCHARGE.
+                                   # NB: in practice the SPH registers (=19, firing at ~19.9%)
+                                   # stop discharge before SOC_DISCHARGE_STOP=17 is ever reached,
+                                   # so 18/17 are deeper backstops, not the working floor.
 BAT_DAWN_SOC_PCT          = 20.0  # minimum SoC at 06:00 — prevents overnight drain to lock level
 
 # ── Controller register thresholds (integer, SPH5000 truncated SoC) ──────────
-# In LOAD_FIRST mode the SPH5000 ignores Seplos limits and only respects
-# register 30406 (hardware floor, set to 14).
+# In LOAD_FIRST mode the SPH5000 ignores the Seplos current-taper and only respects
+# register 30406 (LOAD_FIRST discharge cutoff). control_growatt writes both 30405 and
+# 30406 = 19, which fire at actual ~19.9% — see the 3-tier floor in the docstring.
 SOC_DISCHARGE_STOP = 17  # stop BATTERY_FIRST+DISCHARGE → LOAD_FIRST (actual 17.0–17.9%)
 SOC_LOW_STOP       = 14  # emergency forced-charge floor  (actual 14.0–14.9%)
 SOC_LOW_RESUME     = 20  # releases emergency lock (6% hysteresis above 14)
@@ -49,7 +57,9 @@ SOC_HIGH_RESUME    = 88  # releases high-SoC lock (2% hysteresis)
 # SoC is unreliable at low charge (coulomb counter drift, sudden BMS recalibration).
 # These voltage thresholds are read from seplos_cell_voltage_min_v in the DB and
 # mirror the SoC guards above. OR-logic: whichever fires first wins.
-# Thresholds are above read_seplos taper start (3150 mV) to catch problems early.
+# These sit BELOW the read_seplos vmin taper start (3150 mV): the taper eases the
+# discharge current first, and only if the weakest cell keeps sagging do these hard
+# guards fire (3080 → stop discharge, 3020 → emergency charge).
 VMIN_DISCHARGE_STOP_MV = 3080  # stop BATTERY_FIRST+DISCHARGE  (parallel to SOC_DISCHARGE_STOP=17%)
 VMIN_LOW_STOP_MV       = 3020  # emergency forced charge        (parallel to SOC_LOW_STOP=14%)
 VMIN_LOW_RESUME_MV     = 3150  # release low-vmin lock          (matches read_seplos VMIN_TAPER_START)
