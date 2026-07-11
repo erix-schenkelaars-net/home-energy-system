@@ -1563,7 +1563,11 @@ def dbg_controller_state(cmd, soc):
         mins_end = "-"
         end      = "-"
         if cmd.soc_end is not None:
-            end = f"SOC_END {cmd.soc_end}"
+            # SOC_LOW_STOP (14) as soc_end is the LOAD_FIRST dormant-latch safety floor,
+            # not an operational target -> flag it so the log distinguishes it from the
+            # active discharge (17) / charge (90) targets.
+            label = "safety SOC_END" if cmd.soc_end == SOC_LOW_STOP else "SOC_END"
+            end = f"{label} {cmd.soc_end}"
         if cmd.ends_on == Ends_on.TIME and cmd.end_time:
             end      = f"{cmd.end_time.strftime('TIME %H:%M')} / {end}"
             mins     = int((cmd.end_time - datetime.now()).total_seconds() / 60)
