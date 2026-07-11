@@ -204,6 +204,9 @@ SOC_HYST          = 2.0
 pdel_glob         = 0.0   # grid import W (positive = importing); updated each loop
 pret_glob         = 0.0   # grid export W (positive = exporting); updated each loop
 _meter_zero_count = 0      # consecutive meter=0.0 readings; alarm 401 fires after 5
+_deadband_last_slot = None # slot_dt of the quarter the discharge deadband last fired (dedup)
+_deadband_day       = None # date of the running deadband counter
+_deadband_count     = 0    # discharge-deadband firings so far today (one per quarter)
 soc_schedule_lock: bool = False  # module-level init; main_loop() declares global
 vmin_glob: Optional[int] = None  # latest min cell voltage in mV from seplos DB; None if unavailable
 
@@ -925,8 +928,20 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
     # guard ignores a glitched 0-read so a genuine high-SoC discharge is never halted.
     if action in ("BATTERY_FIRST+DISCHARGE", "EXPORT") \
             and soc_glob is not None and 0 < soc_glob < SOC_DISCHARGE_DEADBAND:
-        dbg(1, "CONF", f"DISCHARGE deadband: live SoC {soc_glob}% < {SOC_DISCHARGE_DEADBAND}% "
-                       f"-> STANDBY this quarter (hold, export PV directly)")
+        # Log once per quarter (slot_to_conf runs every control cycle) with a running
+        # daily tally, so `grep 'DISCHARGE deadband FIRED'` gives the day's count and
+        # each line marks a real intercepted charge->export oscillation.
+        global _deadband_last_slot, _deadband_day, _deadband_count
+        slot_key = str(slot.get("slot_dt"))
+        if slot_key != _deadband_last_slot:
+            _deadband_last_slot = slot_key
+            if now.date() != _deadband_day:
+                _deadband_day, _deadband_count = now.date(), 0
+            _deadband_count += 1
+            dbg(1, "CONF", f"DISCHARGE deadband FIRED #{_deadband_count} today @ "
+                           f"{now.strftime('%H:%M')}: live SoC {soc_glob}% < "
+                           f"{SOC_DISCHARGE_DEADBAND}% -> STANDBY (hold, export PV directly; "
+                           f"oscillation intercepted)")
         action = "STANDBY"
 
     cfg = Conf(
