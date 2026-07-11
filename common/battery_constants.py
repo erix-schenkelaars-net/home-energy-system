@@ -53,6 +53,18 @@ SOC_LOW_RESUME     = 20  # releases emergency lock (6% hysteresis above 14)
 SOC_HIGH_STOP      = 90  # emergency forced-discharge
 SOC_HIGH_RESUME    = 88  # releases high-SoC lock (2% hysteresis)
 
+# Discharge deadband (controller execution — NOT the LP plan). The optimizer's
+# quarter-price arbitrage can schedule BATTERY_FIRST+DISCHARGE while SoC sits just above
+# the 20% floor. With PV lower / load higher than forecast the battery barely charges and
+# each discharge slot dumps it straight back to ~19.9%: a charge→export sawtooth that fires
+# the vmin taper and cycles the weakest cell for ~zero € gain (the 17% round-trip loss is
+# already priced into the LP physics, so the intra-quarter arbitrage margin here is nil).
+# Below this SoC the controller substitutes STANDBY (hold + export PV directly). Non-latching:
+# re-evaluated every control cycle against the live SPH SoC, so discharge resumes on its own
+# once SoC recovers above it. Sits well above SOC_DISCHARGE_STOP=17 so it never fights the
+# hardware floor guards.
+SOC_DISCHARGE_DEADBAND = 23  # min SPH SoC (integer %) to allow BATTERY_FIRST+DISCHARGE
+
 # ── Cell-voltage guards (mV) — controller fallback when SoC coulomb counter drifts ──
 # SoC is unreliable at low charge (coulomb counter drift, sudden BMS recalibration).
 # These voltage thresholds are read from seplos_cell_voltage_min_v in the DB and

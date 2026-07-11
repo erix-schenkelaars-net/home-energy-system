@@ -225,6 +225,7 @@ SOC_HIGH_RESUME    = bc.SOC_HIGH_RESUME    # 88  (2% hysteresis)
 SOC_DISCHARGE_STOP = bc.SOC_DISCHARGE_STOP # 17  (actual 17.0–17.9%)
 SOC_LOW_STOP       = bc.SOC_LOW_STOP       # 14  (actual 14.0–14.9%)
 SOC_LOW_RESUME     = bc.SOC_LOW_RESUME     # 20  (6% hysteresis)
+SOC_DISCHARGE_DEADBAND = bc.SOC_DISCHARGE_DEADBAND  # 23  (below -> STANDBY, non-latching)
 
 # --------------------------------------------------
 # CELL-VOLTAGE GUARDS — mV, parallel to SoC guards above
@@ -905,11 +906,28 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
     DISCHARGE -> same as LOAD_FIRST
     NORMAL    -> same as LOAD_FIRST
 
+    Floor deadband: a BATTERY_FIRST+DISCHARGE/EXPORT slot is downgraded to STANDBY when
+    the live SoC is below SOC_DISCHARGE_DEADBAND (23%), to stop the near-floor charge→
+    export sawtooth. Non-latching — re-evaluated every cycle against live soc_glob.
+
     minutes_end is set to the remaining minutes in the current quarter so the
     inverter timer stays accurate and expires naturally at the top of the quarter.
     """
     action         = (slot.get("action") or "NORMAL").upper().strip()
     mins_remaining = max(1, 15 - now.minute % 15)
+
+    # Floor deadband (execution-time, non-latching): below SOC_DISCHARGE_DEADBAND the
+    # optimizer's quarter-price arbitrage would drain the battery straight back to the
+    # ~19.9% floor for ~zero € gain (round-trip loss is already priced in the LP, so the
+    # intra-quarter margin here is nil) while firing the vmin taper and cycling the weakest
+    # cell. Substitute STANDBY = hold + export PV directly (no round-trip loss). soc_glob is
+    # the live SPH SoC, refreshed by run_data_collection() earlier in this cycle; the 0<
+    # guard ignores a glitched 0-read so a genuine high-SoC discharge is never halted.
+    if action in ("BATTERY_FIRST+DISCHARGE", "EXPORT") \
+            and soc_glob is not None and 0 < soc_glob < SOC_DISCHARGE_DEADBAND:
+        dbg(1, "CONF", f"DISCHARGE deadband: live SoC {soc_glob}% < {SOC_DISCHARGE_DEADBAND}% "
+                       f"-> STANDBY this quarter (hold, export PV directly)")
+        action = "STANDBY"
 
     cfg = Conf(
         check_interval=base_cfg.check_interval,
