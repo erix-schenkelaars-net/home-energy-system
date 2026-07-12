@@ -1,5 +1,7 @@
 # Home Energy System — Docker Services
 
+This is my personal home-energy setup, shared openly in case it's useful or inspiring to others. It's provided as-is: feel free to look around and borrow ideas, but I'm not taking contributions or providing support.
+
 A set of containerised Python services that monitor, optimise, and control a home energy system built around a Growatt SPH5000 hybrid inverter, a 16 kWh Seplos LiFePO4 battery, and 6.24 kWp of solar PV.
 
 # Home Energy System
