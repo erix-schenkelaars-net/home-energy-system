@@ -77,7 +77,9 @@ REST_DEBOUNCE  = 30            # samples (~60 s) of continuous rest before the s
                                #      cells keep relaxing for minutes after a heavy discharge
 
 TMAX_TAPER_START = 50          # °C - begin high-temp taper (max in spec is 60)
-TMAX_CUTOFF = 55               # °C - stop all current above this
+TMAX_CUTOFF = 53               # °C - stop all current above this. Kept 2 °C below the Seplos
+                               #      BMS chg_ot_protect (55 °C) so the software cuts first and
+                               #      the BMS charge-overtemp cutoff never has to intervene.
 TMIN_CHARGE_START = 10         # °C - begin cold charge taper
 TMIN_CHARGE_CUTOFF = 5         # °C - no charging below this (LFP cell damage risk)
 
