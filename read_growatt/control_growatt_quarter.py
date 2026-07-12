@@ -1559,6 +1559,32 @@ def select_config(now: datetime, cfg: Conf) -> tuple[Conf | Schedule, Source, Op
     return cfg, Source.BASE, None
 
 
+def cmd_to_action(cmd) -> str:
+    """Canonieke actie-string van het WERKELIJK uitgevoerde commando (ná deadband + guards),
+    in dezelfde vocabulaire als battery_schedule.action. Zo kan het dashboard plan vs
+    uitvoering 1-op-1 vergelijken zonder zelf control-logica te herleiden."""
+    if cmd.priority == Priority.LOAD_FIRST:
+        return "LOAD_FIRST"
+    mode = cmd.mode.name if cmd.mode else "STANDBY"
+    return "STANDBY" if mode == "STANDBY" else f"BATTERY_FIRST+{mode}"
+
+
+def store_control_action(action: str) -> None:
+    """Schrijf de uitgevoerde actie naar de laatste energy-rij (kolom control_action).
+    De 'intelligentie' (deadband/guards) is hier al opgelost -> de DB bevat de waarheid,
+    het dashboard leest 'm er dom uit. Faalt stil: control mag nooit breken op een DB-fout."""
+    try:
+        db = mysql.connector.connect(host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
+                                     db=DB_NAME, ssl_disabled=True, connection_timeout=5)
+        cur = db.cursor()
+        cur.execute("UPDATE energy SET control_action=%s ORDER BY id DESC LIMIT 1", (action,))
+        db.commit()
+        cur.close()
+        db.close()
+    except Exception as e:
+        dbg(1, "DB", f"control_action write failed: {e}")
+
+
 def dbg_controller_state(cmd, soc):
 
     try:
@@ -1885,6 +1911,7 @@ def main_loop():
         final_cmd = build_final_command(active_run, soc_glob, vmin_glob)
 
         dbg_controller_state(final_cmd, soc_glob)
+        store_control_action(cmd_to_action(final_cmd))   # persist executed action for the dashboard
 
         # --------------------------------------------------
         # PV CURTAILMENT CHECK
