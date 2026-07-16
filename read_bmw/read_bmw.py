@@ -412,6 +412,19 @@ def _publish_discovery(local: mqtt.Client, vin: str):
 _state:           dict[str, dict] = {}   # vin → {normalized_key: value}
 _discovery_done:  set[str]        = set()
 _seen_keys:       set[str]        = set()  # log new keys once
+# Diagnostic watchlist: log every VALUE CHANGE of the keys we might use to tell
+# "car in use / driving" from "parked & unsecured" (for the false 5-min-unlocked alert).
+_WATCH_KEYS = {
+    "vehicle.drivetrain.engine.isIgnitionOn",
+    "vehicle.drivetrain.engine.isActive",
+    "vehicle.cabin.door.status",
+    "vehicle.cabin.door.lock.status",
+    "vehicle.body.trunk.isOpen",
+    "vehicle.vehicle.travelledDistance",
+    "vehicle.cabin.infotainment.navigation.currentLocation.latitude",
+    "vehicle.body.lights.isRunningOn",
+}
+_prev_watch:      dict            = {}
 
 
 def _on_bmw_message(local: mqtt.Client, topic: str, payload: dict):
@@ -440,6 +453,11 @@ def _on_bmw_message(local: mqtt.Client, topic: str, payload: dict):
             _seen_keys.add(raw_key)
 
         state[nk] = val
+
+        # Diagnostic: log value CHANGES for watched keys (find a reliable "in use" signal)
+        if raw_key in _WATCH_KEYS and _prev_watch.get(raw_key) != val:
+            log.info(f"  [watch] {raw_key} = {val!r}  (was {_prev_watch.get(raw_key)!r})")
+            _prev_watch[raw_key] = val
 
         if raw_key.endswith(".latitude"):
             try:
