@@ -1,0 +1,14 @@
+services:
+  knmi_reader:
+    build: .
+    container_name: knmi_reader
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: "host"        # outbound to KNMI API + reach the MariaDB like the other readers
+    environment:
+      - TZ=Europe/Amsterdam
+    env_file:
+      - ../.env
+    volumes:
+      - .:/app
+      - ./logs:/logs
