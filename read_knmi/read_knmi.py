@@ -103,14 +103,11 @@ def _pv_horizon_factor(dt_local):
         return 1.0
     return (elev - PV_HORIZON_ELEV_ZERO) / (elev_full - PV_HORIZON_ELEV_ZERO)
 
-os.makedirs("/logs", exist_ok=True)
+# Log to stdout only; entrypoint.sh tees it into /logs/debug_<date>.log, like the other services.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [KNMI] %(levelname)-7s %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(f"/logs/debug_{dt.date.today()}.log"),
-    ],
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("read_knmi")
 
@@ -169,6 +166,20 @@ def download(filename, dest):
 
 
 # ── GRIB2 parse ─────────────────────────────────────────────────────────────────
+def _acc_to_wm2(acc):
+    """Cumulative ssrd (J/m², accumulated from the run time) -> per-slot average GHI (W/m²).
+
+    acc is [(validity_dt, cumulative_J), ...] in ascending time order. Each slot is the
+    difference against the previous message over SLOT_H (900 s); the first message is
+    measured against the run time itself, where the accumulation starts at zero.
+    """
+    out, prev = [], 0.0
+    for vdt, val in acc:
+        out.append((vdt, max((val - prev) / 900.0, 0.0)))
+        prev = val
+    return out
+
+
 def parse(path):
     """Return (run_dt, [(slot_dt_utc, ghi_wm2), ...]) — GHI per 15-min slot at the site."""
     f = open(path, "rb")
@@ -188,13 +199,7 @@ def parse(path):
         ec.codes_release(gid)
     f.close()
     acc.sort(key=lambda x: x[0])
-    # cumulative J/m2 from run time -> per-slot W/m2 = delta/900s (first vs run=0)
-    out, prev = [], 0.0
-    for vdt, val in acc:
-        wm2 = max((val - prev) / 900.0, 0.0)
-        out.append((vdt, wm2))
-        prev = val
-    return run_dt, out
+    return run_dt, _acc_to_wm2(acc)
 
 
 # ── store ───────────────────────────────────────────────────────────────────────
@@ -232,9 +237,12 @@ def cycle():
         ensure_table(conn)
         n = store(conn, run_dt, slots)
         conn.close()
+        # Log in local time: the GRIB times are UTC, but store() writes local — a log that
+        # reports UTC would sit two hours off the rows it just wrote.
         log.info("Stored %d slots  run=%s  %s..%s  GHI %.0f..%.0f W/m2  (%s)",
-                 n, run_dt.strftime("%H:%M"),
-                 slots[0][0].strftime("%H:%M"), slots[-1][0].strftime("%H:%M"),
+                 n, _to_local(run_dt).strftime("%H:%M"),
+                 _to_local(slots[0][0]).strftime("%H:%M"),
+                 _to_local(slots[-1][0]).strftime("%H:%M"),
                  slots[0][1], slots[-1][1], fn)
     except Exception as exc:
         log.error("cycle failed: %s", exc, exc_info=True)

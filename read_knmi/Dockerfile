@@ -12,4 +12,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV TZ=Europe/Amsterdam
 WORKDIR /app
 # read_knmi.py is bind-mounted (.:/app) — edit + restart, no rebuild needed.
-CMD ["python3", "read_knmi.py"]
+CMD ["/bin/sh", "entrypoint.sh"]
