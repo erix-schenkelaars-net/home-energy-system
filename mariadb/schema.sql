@@ -353,6 +353,50 @@ CREATE TABLE IF NOT EXISTS `pv_solcast_forecast` (
 
 
 -- ---------------------------------------------------------------------------
+-- pv_knmi_nowcast
+-- ---------------------------------------------------------------------------
+-- KNMI satellite-based solar radiation nowcast (0-4h ahead, 15-min steps).
+-- Written by read_knmi. ANALYSIS-ONLY: nothing reads this for control, it exists to
+-- backtest KNMI against Solcast/CAMS and the real PV before it may ever be trusted.
+-- Keyed on (run_dt, slot_dt) so every run is kept, which allows measuring accuracy per
+-- lead time. Consumers wanting the freshest view take MAX(run_dt) per slot_dt.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `pv_knmi_nowcast` (
+  `run_dt`     datetime  NOT NULL COMMENT 'Nowcast run time (local time)',
+  `slot_dt`    datetime  NOT NULL COMMENT 'Validity of this lead time = quarter-hour slot (local)',
+  `ghi_wm2`    float     DEFAULT NULL COMMENT 'Global horizontal irradiance W/m2, 15-min average',
+  `pv_kwh`     float     DEFAULT NULL COMMENT 'PV estimate for this slot kWh (GHI x kWp x cal x horizon)',
+  `created_at` timestamp NULL DEFAULT current_timestamp(),
+
+  PRIMARY KEY (`run_dt`,`slot_dt`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- predicted_grid_snapshot
+-- ---------------------------------------------------------------------------
+-- The optimiser's plan for a day, frozen once at the start of that day.
+-- Written by battery_optimizer (--snapshot / the daily run); read by the dashboard to
+-- draw the "predicted" line against the realised one.
+-- Deliberately grid-only: cost_eur is the hard euro from and to the grid, NOT a
+-- mark-to-market valuation of what is sitting in the battery. That is what makes the
+-- predicted-vs-actual comparison honest -- both lines then measure the same thing.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `predicted_grid_snapshot` (
+  `snapshot_date` date      NOT NULL COMMENT 'The day this plan is for',
+  `slot_dt`       datetime  NOT NULL COMMENT 'Quarter-hour slot start (local time)',
+  `action`        varchar(32) DEFAULT NULL COMMENT 'Planned action for this slot',
+  `pv_kwh`        float     DEFAULT NULL COMMENT 'Forecast PV for this slot kWh',
+  `load_kwh`      float     DEFAULT NULL COMMENT 'Forecast load for this slot kWh',
+  `grid_kwh`      float     DEFAULT NULL COMMENT 'Planned net grid kWh (+ = import, - = export)',
+  `cost_eur`      float     DEFAULT NULL COMMENT 'Planned grid cost for this slot EUR',
+  `created_at`    timestamp NULL DEFAULT current_timestamp(),
+
+  PRIMARY KEY (`snapshot_date`,`slot_dt`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+-- ---------------------------------------------------------------------------
 -- energy_tariffs
 -- ---------------------------------------------------------------------------
 -- Contract tariffs per period (valid_from / valid_until).
