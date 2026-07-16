@@ -76,6 +76,24 @@ runs it as advisory (it cannot block, since a push may come from a machine witho
 Take definitions from `SHOW CREATE TABLE`, and write down *why* the table is shaped that way —
 the column list is already in the database; the reasoning is not.
 
+### Writing to `energy`
+
+One row per 5-minute interval, six services, and **nobody owns the row**. Address it by its
+timestamp — never by "the newest row":
+
+```python
+from common import energy_row as er
+cur.execute(er.upsert_sql(["my_col", ...]), (er.bucket(), value, ...))
+```
+
+`er.bucket()` is the interval, `er.upsert_sql()` names only your own columns, so whoever runs
+first creates the row and nobody can blank out another service's data. A service that misses a
+cycle leaves its own columns NULL, which is honest; `UPDATE ... ORDER BY id DESC LIMIT 1` instead
+wrote to whatever row was newest and silently landed on the previous interval whenever this one
+did not exist yet. That cost ~1.4% of realised cost every day until 2026-07-16.
+
+Reading the newest row is fine — it is writing to it that is the bug.
+
 ## Where things live
 
 - Compute in the software, before the DB write. The dashboard reads the resolved answer out of
