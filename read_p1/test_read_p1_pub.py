@@ -316,14 +316,27 @@ class TestUpdateDbData(unittest.TestCase):
         )
 
     def test_calls_execute_on_success(self):
+        # fill_null_p1_rows() runs at the end of update_erix_db_data and queries on the same
+        # mocked connection; patch it out so this test sees only the UPDATE itself.
         mock_db  = MagicMock()
         mock_cur = MagicMock()
         mock_db.cursor.return_value = mock_cur
         import mysql.connector as _mc
-        with patch.object(_mc, "connect", return_value=mock_db):
+        with patch.object(_mc, "connect", return_value=mock_db), \
+             patch.object(mod, "fill_null_p1_rows"):
             mod.update_erix_db_data(self._sample_data())
         mock_cur.execute.assert_called_once()
         mock_db.commit.assert_called_once()
+
+    def test_triggers_the_null_interpolator(self):
+        """Every write sweeps the last 24 h for NULL P1 rows left by a reader outage."""
+        mock_db = MagicMock()
+        mock_db.cursor.return_value = MagicMock()
+        import mysql.connector as _mc
+        with patch.object(_mc, "connect", return_value=mock_db), \
+             patch.object(mod, "fill_null_p1_rows") as mock_fill:
+            mod.update_erix_db_data(self._sample_data())
+        mock_fill.assert_called_once()
 
     def test_no_crash_on_db_exception(self):
         import mysql.connector as _mc

@@ -537,15 +537,9 @@ class TestSlotToConfActions(unittest.TestCase):
         self.assertEqual(cfg.mode,     ctrl.RunMode.CHARGE)
 
     def test_charge_power_from_kw(self):
-        # Test de onderliggende kw->pct conversie met de tijdelijke FORCE_MAX_CHARGE-override UIT.
-        _saved = ctrl.FORCE_MAX_CHARGE
-        ctrl.FORCE_MAX_CHARGE = False
-        try:
-            cfg = ctrl.slot_to_conf({"action": "BATTERY_FIRST+CHARGE", "charge_kw": 1.5},
-                                     self.now, self.base)
-            self.assertEqual(cfg.power, 50)   # 1500/3000 * 100
-        finally:
-            ctrl.FORCE_MAX_CHARGE = _saved
+        cfg = ctrl.slot_to_conf({"action": "BATTERY_FIRST+CHARGE", "charge_kw": 1.5},
+                                 self.now, self.base)
+        self.assertEqual(cfg.power, 50)   # 1500/3000 * 100
 
     def test_charge_kw_3_gives_100pct(self):
         cfg = ctrl.slot_to_conf({"action": "BATTERY_FIRST+CHARGE", "charge_kw": 3.0},
@@ -592,20 +586,20 @@ class TestSetInStandby(unittest.TestCase):
 
     def _run(self):
         mock_sph = MagicMock()
-        mock_ser = MagicMock()
         with patch.object(ctrl, "write_sph5k_reg") as mock_sph_write, \
              patch.object(ctrl, "write_to_seplos_reg") as mock_sep_write:
-            result = ctrl.set_in_standby(mock_sph, mock_ser)
+            result = ctrl.set_in_standby(mock_sph)
         return result, mock_sph_write.call_args_list, mock_sep_write.call_args_list
 
     def test_returns_true(self):
         ok, _, _ = self._run()
         self.assertTrue(ok)
 
-    def test_growatt_priority_load_first(self):
+    def test_growatt_priority_battery_first(self):
+        """Battery-first, not load-first: the SPH5000 only obeys the BMS PCS limits here."""
         _, sph_calls, _ = self._run()
         self.assertIn(
-            call(unittest.mock.ANY, ctrl.REG_ADDR["REG_Priority_of_work"], 0),
+            call(unittest.mock.ANY, ctrl.REG_ADDR["REG_Priority_of_work"], 1),
             sph_calls
         )
 
@@ -616,56 +610,27 @@ class TestSetInStandby(unittest.TestCase):
             sph_calls
         )
 
-    def test_seplos_charge_limit_zeroed(self):
-        _, _, sep_calls = self._run()
-        regs = [c.args[1] for c in sep_calls]
-        self.assertIn(0x1366, regs)
+    def test_remote_power_forced_to_zero(self):
+        _, sph_calls, _ = self._run()
+        self.assertIn(
+            call(unittest.mock.ANY, ctrl.REG_ADDR["REG_Remote_charge_and_discharge_power"], 0),
+            sph_calls
+        )
 
-    def test_seplos_discharge_limit_zeroed(self):
+    def test_bms_limits_are_left_alone(self):
+        """read_seplos owns the BMS current limits; writing them here would contend on RS485."""
         _, _, sep_calls = self._run()
-        regs = [c.args[1] for c in sep_calls]
-        self.assertIn(0x1367, regs)
+        self.assertEqual(sep_calls, [])
 
     def test_returns_false_on_exception(self):
         mock_sph = MagicMock()
-        mock_ser = MagicMock()
         with patch.object(ctrl, "write_sph5k_reg", side_effect=Exception("boom")):
-            result = ctrl.set_in_standby(mock_sph, mock_ser)
+            result = ctrl.set_in_standby(mock_sph)
         self.assertFalse(result)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# L.  reset_bms_limits
-# ══════════════════════════════════════════════════════════════════════════════
-class TestResetBmsLimits(unittest.TestCase):
-
-    def _run(self):
-        mock_ser = MagicMock()
-        with patch.object(ctrl, "write_to_seplos_reg") as mock_sep:
-            ctrl.reset_bms_limits(mock_ser)
-        return mock_sep.call_args_list
-
-    def test_charge_limit_written(self):
-        regs = [c.args[1] for c in self._run()]
-        self.assertIn(0x1366, regs)
-
-    def test_discharge_limit_written(self):
-        regs = [c.args[1] for c in self._run()]
-        self.assertIn(0x1367, regs)
-
-    def test_charge_limit_restored_to_60(self):
-        for c in self._run():
-            if c.args[1] == 0x1366:
-                self.assertEqual(c.args[2], 60)
-
-    def test_discharge_limit_nonzero(self):
-        for c in self._run():
-            if c.args[1] == 0x1367:
-                self.assertNotEqual(c.args[2], 0)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# M.  Routing logic
+# L.  Routing logic
 # ══════════════════════════════════════════════════════════════════════════════
 def _route(final_cmd, active_cmd, mock_client, mock_ser,
            mock_standby, mock_reset, mock_apply):
