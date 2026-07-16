@@ -1,0 +1,33 @@
+#!/bin/sh
+# pre-push — nothing reaches GitHub before the suite is green.
+#
+# Lives here rather than in .git/hooks because that directory is not versioned and would
+# be lost on a fresh clone. Activate once with:
+#     git config core.hooksPath githooks
+#
+# The whole suite runs in seconds, so this costs nothing on a normal push.
+# Bypass only when you mean it (and know why):  git push --no-verify
+
+REPO="$(git rev-parse --show-toplevel)"
+
+echo "pre-push: running the test suite…"
+if ! "$REPO/test-all.sh" >/tmp/pre-push-tests.$$ 2>&1; then
+    echo ""
+    grep -E "✗|FAILED|Results:" /tmp/pre-push-tests.$$
+    echo ""
+    echo "pre-push: BLOCKED — tests are red. Full output: /tmp/pre-push-tests.$$"
+    echo "          Fix the tests (or the code) first; see CLAUDE.md."
+    echo "          Override with: git push --no-verify"
+    exit 1
+fi
+grep -E "Results:" /tmp/pre-push-tests.$$
+rm -f /tmp/pre-push-tests.$$
+
+# Schema drift is advisory: it needs the live database, so it must never block a push
+# from a machine that cannot reach it. check_schema.py exits 0 when the DB is absent.
+python3 "$REPO/tools/check_schema.py" --quiet || {
+    echo "pre-push: schema.sql is out of date (see above). Not blocking — fix it soon."
+}
+
+echo "pre-push: OK"
+exit 0

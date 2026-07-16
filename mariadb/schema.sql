@@ -353,6 +353,75 @@ CREATE TABLE IF NOT EXISTS `pv_solcast_forecast` (
 
 
 -- ---------------------------------------------------------------------------
+-- pv_cams_radiation
+-- ---------------------------------------------------------------------------
+-- Per-quarter CAMS radiation forecast cache (upsert: latest only).
+-- Written by battery_optimizer as a fallback/comparison source next to Open-Meteo,
+-- Solcast and the KNMI nowcast -- see pv_knmi_nowcast and the PV-forecast notes.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `pv_cams_radiation` (
+  `slot_dt`    datetime  NOT NULL COMMENT 'Quarter-hour slot start (local time)',
+  `pv_kwh`     float     DEFAULT NULL COMMENT 'PV estimate derived from the radiation for this slot kWh',
+  `ghi_wh_m2`  float     DEFAULT NULL COMMENT 'Global horizontal irradiance for this slot Wh/m2',
+  `created_at` datetime  NOT NULL COMMENT 'Timestamp of the optimiser run that wrote this',
+
+  PRIMARY KEY (`slot_dt`),
+  KEY `created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- battery_debugging
+-- ---------------------------------------------------------------------------
+-- Per-cell voltage min/max for all 16 cells, one row per 5-minute interval.
+-- Written by read_seplos. Separate from `energy` on purpose: 32 columns of cell-level
+-- detail that only matter for cell-health analysis (drift, delta-IR, resting spread)
+-- would otherwise bloat the table every service writes to.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `battery_debugging` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `ts` datetime    NOT NULL COMMENT '5-minute interval timestamp',
+
+  -- one min/max pair per cell, 1..16
+  `seplos_cel1_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel1_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel2_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel2_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel3_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel3_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel4_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel4_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel5_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel5_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel6_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel6_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel7_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel7_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel8_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel8_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel9_voltage_min_v`  float DEFAULT NULL,
+  `seplos_cel9_voltage_max_v`  float DEFAULT NULL,
+  `seplos_cel10_voltage_min_v` float DEFAULT NULL,
+  `seplos_cel10_voltage_max_v` float DEFAULT NULL,
+  `seplos_cel11_voltage_min_v` float DEFAULT NULL,
+  `seplos_cel11_voltage_max_v` float DEFAULT NULL,
+  `seplos_cel12_voltage_min_v` float DEFAULT NULL,
+  `seplos_cel12_voltage_max_v` float DEFAULT NULL,
+  `seplos_cel13_voltage_min_v` float DEFAULT NULL,
+  `seplos_cel13_voltage_max_v` float DEFAULT NULL,
+  `seplos_cel14_voltage_min_v` float DEFAULT NULL,
+  `seplos_cel14_voltage_max_v` float DEFAULT NULL,
+  `seplos_cel15_voltage_min_v` float DEFAULT NULL,
+  `seplos_cel15_voltage_max_v` float DEFAULT NULL,
+  `seplos_cel16_voltage_min_v` float DEFAULT NULL,
+  `seplos_cel16_voltage_max_v` float DEFAULT NULL,
+
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_ts` (`ts`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+
+-- ---------------------------------------------------------------------------
 -- pv_knmi_nowcast
 -- ---------------------------------------------------------------------------
 -- KNMI satellite-based solar radiation nowcast (0-4h ahead, 15-min steps).
@@ -417,3 +486,39 @@ CREATE TABLE IF NOT EXISTS `energy_tariffs` (
   PRIMARY KEY (`id`),
   KEY `idx_valid_from` (`valid_from`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- v_daily_cost  (VIEW)
+-- ---------------------------------------------------------------------------
+-- Per-day cost roll-up: the variable cost summed from `energy` (written per 5 min by
+-- common/energy_cost.py) joined to the fixed daily cost valid on that date.
+-- Read by the WordPress Energiekosten page on pi5; nothing in this repo consumes it.
+--
+-- The join is on the fixed_costs validity window, and the GROUP BY carries `f`.`id` so
+-- a day on which the tariff period changes yields one row per period rather than
+-- silently mixing two fixed rates into one day.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE VIEW `v_daily_cost` AS
+SELECT
+    CAST(`e`.`ts` AS date)                                AS `dag`,
+    ROUND(SUM(`e`.`cost_elec_var_eur`), 4)                AS `var_elec_eur`,
+    ROUND(SUM(`e`.`cost_gas_var_eur`), 4)                 AS `var_gas_eur`,
+    ROUND(`f`.`elec_leveringskosten_day`
+        + `f`.`elec_systeembeheer_day`
+        + `f`.`vermindering_energiebelasting_day`, 4)     AS `fix_elec_eur`,
+    ROUND(`f`.`gas_leveringskosten_day`
+        + `f`.`gas_systeembeheer_day`, 4)                 AS `fix_gas_eur`,
+    ROUND(SUM(`e`.`cost_elec_var_eur`)
+        + `f`.`elec_leveringskosten_day`
+        + `f`.`elec_systeembeheer_day`
+        + `f`.`vermindering_energiebelasting_day`, 4)     AS `total_elec_eur`,
+    ROUND(SUM(`e`.`cost_gas_var_eur`)
+        + `f`.`gas_leveringskosten_day`
+        + `f`.`gas_systeembeheer_day`, 4)                 AS `total_gas_eur`
+FROM `energy` `e`
+LEFT JOIN `fixed_costs` `f`
+       ON CAST(`e`.`ts` AS date) >= `f`.`valid_from`
+      AND (`f`.`valid_until` IS NULL OR CAST(`e`.`ts` AS date) <= `f`.`valid_until`)
+GROUP BY CAST(`e`.`ts` AS date), `f`.`id`
+ORDER BY CAST(`e`.`ts` AS date) DESC;
