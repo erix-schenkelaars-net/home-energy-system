@@ -19,11 +19,9 @@ Covers:
   I.  slot_to_conf — STANDBY
   J.  slot_to_conf — all canonical actions
   K.  set_in_standby
-  L.  reset_bms_limits
-  M.  Routing logic
-  N.  Utility functions (as_int, as_time, as_mode, as_priority, in_time_window, kw_to_pct)
-  O.  read_conf — config file parser
-  P.  select_config — schedule window selection
+  L.  Utility functions (as_int, as_time, as_mode, as_priority, in_time_window, kw_to_pct)
+  M.  read_conf — config file parser
+  N.  select_config — schedule window selection
 """
 
 import json
@@ -586,41 +584,40 @@ class TestSetInStandby(unittest.TestCase):
 
     def _run(self):
         mock_sph = MagicMock()
-        with patch.object(ctrl, "write_sph5k_reg") as mock_sph_write, \
-             patch.object(ctrl, "write_to_seplos_reg") as mock_sep_write:
+        with patch.object(ctrl, "write_sph5k_reg") as mock_sph_write:
             result = ctrl.set_in_standby(mock_sph)
-        return result, mock_sph_write.call_args_list, mock_sep_write.call_args_list
+        return result, mock_sph_write.call_args_list
 
     def test_returns_true(self):
-        ok, _, _ = self._run()
+        ok, _ = self._run()
         self.assertTrue(ok)
 
     def test_growatt_priority_battery_first(self):
         """Battery-first, not load-first: the SPH5000 only obeys the BMS PCS limits here."""
-        _, sph_calls, _ = self._run()
+        _, sph_calls = self._run()
         self.assertIn(
             call(unittest.mock.ANY, ctrl.REG_ADDR["REG_Priority_of_work"], 1),
             sph_calls
         )
 
     def test_growatt_ac_charge_disabled(self):
-        _, sph_calls, _ = self._run()
+        _, sph_calls = self._run()
         self.assertIn(
             call(unittest.mock.ANY, ctrl.REG_ADDR["REG_AC_charging_enable"], 0),
             sph_calls
         )
 
     def test_remote_power_forced_to_zero(self):
-        _, sph_calls, _ = self._run()
+        _, sph_calls = self._run()
         self.assertIn(
             call(unittest.mock.ANY, ctrl.REG_ADDR["REG_Remote_charge_and_discharge_power"], 0),
             sph_calls
         )
 
-    def test_bms_limits_are_left_alone(self):
-        """read_seplos owns the BMS current limits; writing them here would contend on RS485."""
-        _, _, sep_calls = self._run()
-        self.assertEqual(sep_calls, [])
+    def test_no_bms_write_path_exists(self):
+        """read_seplos owns the BMS registers and the RS485 bus. control_growatt must keep no
+        write path of its own -- not even an unused one, since sharing the adapter contends."""
+        self.assertFalse(hasattr(ctrl, "write_to_seplos_reg"))
 
     def test_returns_false_on_exception(self):
         mock_sph = MagicMock()
@@ -630,86 +627,7 @@ class TestSetInStandby(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# L.  Routing logic
-# ══════════════════════════════════════════════════════════════════════════════
-def _route(final_cmd, active_cmd, mock_client, mock_ser,
-           mock_standby, mock_reset, mock_apply):
-    if final_cmd.mode == ctrl.RunMode.STANDBY:
-        mock_standby(mock_client, mock_ser)
-    else:
-        if active_cmd and active_cmd.mode == ctrl.RunMode.STANDBY:
-            mock_reset(mock_ser)
-        mock_apply(mock_client, final_cmd)
-
-
-class TestStandbyRouting(unittest.TestCase):
-
-    def setUp(self):
-        self.client     = MagicMock()
-        self.ser        = MagicMock()
-        self.standby_fn = MagicMock()
-        self.reset_fn   = MagicMock()
-        self.apply_fn   = MagicMock()
-
-    def _route(self, final_cmd, active_cmd):
-        _route(final_cmd, active_cmd, self.client, self.ser,
-               self.standby_fn, self.reset_fn, self.apply_fn)
-
-    def test_standby_calls_set_in_standby(self):
-        cmd = make_control_command(mode=ctrl.RunMode.STANDBY)
-        self._route(cmd, None)
-        self.standby_fn.assert_called_once()
-        self.apply_fn.assert_not_called()
-
-    def test_charge_after_standby_resets_bms_first(self):
-        prev = make_control_command(mode=ctrl.RunMode.STANDBY)
-        cmd  = make_control_command(mode=ctrl.RunMode.CHARGE)
-        call_order = []
-        self.reset_fn.side_effect = lambda *_: call_order.append("reset")
-        self.apply_fn.side_effect = lambda *_: call_order.append("apply")
-        self._route(cmd, prev)
-        self.assertEqual(call_order, ["reset", "apply"])
-
-    def test_pv_charge_after_standby_resets_bms(self):
-        prev = make_control_command(mode=ctrl.RunMode.STANDBY)
-        cmd  = make_control_command(mode=ctrl.RunMode.PV_CHARGE, power=100)
-        self._route(cmd, prev)
-        self.reset_fn.assert_called_once_with(self.ser)
-        self.apply_fn.assert_called_once()
-
-    def test_charge_after_charge_no_reset(self):
-        prev = make_control_command(mode=ctrl.RunMode.CHARGE)
-        cmd  = make_control_command(mode=ctrl.RunMode.CHARGE)
-        self._route(cmd, prev)
-        self.reset_fn.assert_not_called()
-        self.apply_fn.assert_called_once()
-
-    def test_charge_at_startup_no_reset(self):
-        cmd = make_control_command(mode=ctrl.RunMode.CHARGE)
-        self._route(cmd, None)
-        self.reset_fn.assert_not_called()
-        self.apply_fn.assert_called_once_with(self.client, cmd)
-
-    def test_ev_charging_full_sequence(self):
-        cmds = [
-            make_control_command(mode=None, priority=ctrl.Priority.LOAD_FIRST),
-            make_control_command(mode=ctrl.RunMode.STANDBY),
-            make_control_command(mode=ctrl.RunMode.STANDBY),
-            make_control_command(mode=ctrl.RunMode.STANDBY),
-            make_control_command(mode=ctrl.RunMode.CHARGE),
-            make_control_command(mode=None, priority=ctrl.Priority.LOAD_FIRST),
-        ]
-        prev = None
-        for cmd in cmds:
-            self._route(cmd, prev)
-            prev = cmd
-        self.assertEqual(self.standby_fn.call_count, 3)
-        self.assertEqual(self.reset_fn.call_count, 1)
-        self.assertEqual(self.apply_fn.call_count, 3)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# N.  Utility functions
+# L.  Utility functions
 # ══════════════════════════════════════════════════════════════════════════════
 class TestAsInt(unittest.TestCase):
 
@@ -855,7 +773,7 @@ class TestKwToPct(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# O.  read_conf — config file parser
+# M.  read_conf — config file parser
 # ══════════════════════════════════════════════════════════════════════════════
 class TestReadConf(unittest.TestCase):
 
@@ -966,7 +884,7 @@ class TestReadConf(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# P.  select_config — schedule window selection
+# N.  select_config — schedule window selection
 # ══════════════════════════════════════════════════════════════════════════════
 class TestSelectConfig(unittest.TestCase):
 
@@ -1051,26 +969,6 @@ class TestToUint16(unittest.TestCase):
 
     def test_overflow_masked(self):
         self.assertEqual(ctrl.to_uint16(0x1FFFF), 0xFFFF)
-
-
-class TestCrc16(unittest.TestCase):
-
-    def test_empty_bytes_gives_0xffff(self):
-        self.assertEqual(ctrl.crc16(b""), 0xFFFF)
-
-    def test_known_crc(self):
-        # CRC16/MODBUS of b"\x01\x03" = 0x0610 (known value)
-        result = ctrl.crc16(b"\x01\x03")
-        self.assertIsInstance(result, int)
-        self.assertGreaterEqual(result, 0)
-        self.assertLessEqual(result, 0xFFFF)
-
-    def test_different_data_different_crc(self):
-        self.assertNotEqual(ctrl.crc16(b"\x01"), ctrl.crc16(b"\x02"))
-
-    def test_result_is_16bit(self):
-        for data in [b"\x00", b"\xFF", b"\x01\x02\x03"]:
-            self.assertLessEqual(ctrl.crc16(data), 0xFFFF)
 
 
 class TestPrettyConf(unittest.TestCase):

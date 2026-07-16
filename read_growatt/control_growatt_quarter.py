@@ -29,7 +29,6 @@ PV curtailment:
 
 Hardware:
   Growatt SPH5000 inverter via Modbus RTU (/dev/sphgen, 9600 baud)
-  Seplos BMS via serial (/dev/tty_seplos, 19200 baud) for current-limit control
   PV contactors via Zigbee2MQTT relay
 """
 
@@ -47,7 +46,6 @@ import time
 import subprocess
 from time import strftime, sleep
 from pymodbus.client import ModbusSerialClient
-import serial
 import mysql.connector
 import json
 import paho.mqtt.publish as mqtt_publish
@@ -163,13 +161,6 @@ class ActiveRun:
 MODBUS_PORT     = '/dev/sphgen'
 MODBUS_BAUDRATE = 9600
 
-# ---------------- Seplos BMS CONFIG ----------------
-PORT    = "/dev/tty_seplos"
-SLAVE   = 0
-BAUD    = 19200
-PARITY  = 'N'
-TIMEOUT = 1.5
-
 SYSTEMID = os.environ["PVOUTPUT_SYSTEM_ID"]
 APIKEY   = os.environ["PVOUTPUT_API_KEY"]
 
@@ -197,7 +188,6 @@ RELAY_TOPIC        = "zigbee2mqtt/PV MHCOZY 4 channel relais/set"  # configurabl
 PV_CURTAIL_MIN_KWH = 0.05   # threshold below which curtailment is ignored
 
 PVO_COUNTER       = 0
-SLAVE             = 0
 soc_glob          = 50
 last_soc          = None
 SOC_HYST          = 2.0
@@ -543,15 +533,6 @@ def to_uint16(value):
     return value & 0xFFFF
 
 
-def crc16(data: bytes) -> int:
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
-    return crc & 0xFFFF
-
-
 def read_register(client, reg: Register):
     if reg.rtype in ("UINT8", "INT8"):
         raw  = read_16bit_register(client, reg.addr) & 0xFF
@@ -635,51 +616,6 @@ def modbus_write_priority(client, priority: int):
         traceback.print_exc()
         dbg(1, "SPH", "Failed to write priority register")
         return False
-
-
-def write_to_seplos_reg(ser, addr, value, label):
-    """Modbus RTU Write Multiple Registers (0x10)."""
-
-    if not isinstance(value, list):
-        value = [value]
-
-    # Convert signed to unsigned 16-bit
-    value = [int(v) & 0xFFFF for v in value]
-
-    count      = len(value)
-    byte_count = count * 2
-
-    frame = bytearray([
-        SLAVE,
-        0x10,
-        (addr >> 8) & 0xFF, addr & 0xFF,
-        (count >> 8) & 0xFF, count & 0xFF,
-        byte_count
-    ])
-
-    for v in value:
-        frame += bytes([(v >> 8) & 0xFF, v & 0xFF])
-
-    crc    = crc16(frame)
-    frame += bytes([crc & 0xFF, crc >> 8])
-
-    ser.reset_input_buffer()
-    ser.write(frame)
-
-    time.sleep(0.1)
-
-    response = ser.read(8)
-
-    if len(response) < 8:
-        dbg(1, "SEPLOS", f"No response writing {label}")
-        return
-
-    if crc16(response[:-2]) != (response[-2] | (response[-1] << 8)):
-        dbg(1, "SEPLOS", f"CRC error writing {label}")
-        return
-
-    dbg(2, "SEPLOS", f"Wrote {value} to {label} ({addr})")
-
 
 
 def set_in_standby(sph_client):
@@ -1789,8 +1725,6 @@ def main_loop():
     if not modbus_write_init_registers(client):
         dbg(1, "SPH", "Failed to initialize inverter registers")
         return
-
-    ser = serial.Serial(PORT, BAUD, parity=PARITY, timeout=TIMEOUT)
 
     dbg(2, "SPH", "Growatt control loop started")
 
