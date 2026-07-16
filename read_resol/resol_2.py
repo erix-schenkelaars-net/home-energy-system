@@ -154,81 +154,84 @@ mqtt_translation_table = {
 }
 
 def saveinErixDB(data):
-    if data.get("errmsk", 1) == 0:  # Default to 1 (error) if key is missing
-        i = datetime.now()
+    """Store this cycle's reading. Always writes a row; the error mask decides what goes in it.
+
+    This used to be `if errmsk == 0:` around the whole insert, with no else and no log -- so a
+    transient fault in the solar-thermal controller silently dropped the row for the *entire*
+    energy table (~3.8x/day). It also meant resol_error_code could never hold anything but 0:
+    the only rows ever written were the ones with no error. Every fault this system has ever
+    reported is therefore absent from the data.
+
+    Now: the error code is always recorded, and the sensor readings are only stored when the
+    controller says they are trustworthy. A fault leaves them NULL -- visible, not invisible.
+    """
+    errmsk  = data.get("errmsk")     # None when the payload did not parse into an error mask
+    healthy = (errmsk == 0)
+    i = datetime.now()
+
+    if healthy:
         dbg(2, "DATABASE", f"data  {data}")
+    else:
+        dbg(1, "DATABASE",
+            f"Resol errormask {errmsk!r} -- storing error code, sensor values left NULL")
 
-        try:
-            # Connect to MySQL database
-            db = mysql.connector.connect(
-                host=DB_HOST,
-                user=DB_USER,
-                passwd=DB_PASSWORD,
-                database=DB_NAME
-            )
-            cursor = db.cursor()
+    # The sensor fields, in the column order below. The error mask is not one of them: it is
+    # recorded whatever happens, which is the whole point.
+    SENSOR_FIELDS = ("temp1", "temp2", "temp3", "temp4", "temp5", "temp6", "temp7", "temp8",
+                     "temp9", "temp10", "temp11", "temp12", "temp17", "temp18", "temp19",
+                     "vol13", "vol17", "vol18", "vol19", "rel1", "rel2", "rel3", "rel6")
 
-            # Upsert on our own 5-minute bucket. This service used to be the only one that
-            # created rows, which made it the heartbeat of the whole table: when it missed a
-            # cycle the five other writers silently wrote to the previous row. Now any of them
-            # creates the row and we only own our own columns. See common/energy_row.py.
-            sql = er.upsert_sql([
-                "resol_temp_1_c", "resol_temp_2_c", "resol_temp_3_c", "resol_temp_4_c",
-                "resol_temp_5_c", "resol_temp_6_c", "resol_temp_7_c", "resol_temp_8_c",
-                "resol_temp_9_c", "resol_temp_10_c", "resol_temp_11_c", "resol_temp_12_c",
-                "resol_temp_17_c", "resol_temp_18_c", "resol_temp_19_c",
-                "resol_volume_13_lpm", "resol_volume_17_lpm", "resol_volume_18_lpm",
-                "resol_volume_19_lpm", "resol_relay_1", "resol_relay_2", "resol_relay_3",
-                "resol_relay_6", "resol_error_code",
-            ])
+    db = cursor = None
+    try:
+        # Connect to MySQL database
+        db = mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            passwd=DB_PASSWORD,
+            database=DB_NAME
+        )
+        cursor = db.cursor()
 
-            values = (
-                er.bucket(i),   # ts first: upsert_sql puts the key in front
-                data.get("temp1"), data.get("temp2"), data.get("temp3"), data.get("temp4"),
-                data.get("temp5"), data.get("temp6"), data.get("temp7"), data.get("temp8"),
-                data.get("temp9"), data.get("temp10"), data.get("temp11"), data.get("temp12"),
-                data.get("temp17"), data.get("temp18"), data.get("temp19"),
-                data.get("vol13"), data.get("vol17"), data.get("vol18"), data.get("vol19"),
-                data.get("rel1"), data.get("rel2"), data.get("rel3"), data.get("rel6"),
-                data.get("errmsk")
-            )
+        # Upsert on our own 5-minute bucket. This service used to be the only one that
+        # created rows, which made it the heartbeat of the whole table: when it missed a
+        # cycle the five other writers silently wrote to the previous row. Now any of them
+        # creates the row and we only own our own columns. See common/energy_row.py.
+        sql = er.upsert_sql([
+            "resol_temp_1_c", "resol_temp_2_c", "resol_temp_3_c", "resol_temp_4_c",
+            "resol_temp_5_c", "resol_temp_6_c", "resol_temp_7_c", "resol_temp_8_c",
+            "resol_temp_9_c", "resol_temp_10_c", "resol_temp_11_c", "resol_temp_12_c",
+            "resol_temp_17_c", "resol_temp_18_c", "resol_temp_19_c",
+            "resol_volume_13_lpm", "resol_volume_17_lpm", "resol_volume_18_lpm",
+            "resol_volume_19_lpm", "resol_relay_1", "resol_relay_2", "resol_relay_3",
+            "resol_relay_6", "resol_error_code",
+        ])
 
-            # Execute the query
-            cursor.execute(sql, values)
-            db.commit()  # Commit the transaction
+        values = (
+            er.bucket(i),   # ts first: upsert_sql puts the key in front
+            *(data.get(f) if healthy else None for f in SENSOR_FIELDS),
+            errmsk,
+        )
 
-        except mysql.connector.Error as err:
-            dbg(1, "DATABASE", f"Error: {err}")
+        # Execute the query
+        cursor.execute(sql, values)
+        db.commit()  # Commit the transaction
 
-        finally:
-            # Ensure resources are closed properly
+    except mysql.connector.Error as err:
+        dbg(1, "DATABASE", f"Error: {err}")
+
+    finally:
+        # Ensure resources are closed properly
+        if cursor is not None:
             cursor.close()
+        if db is not None:
             db.close()
 
-
+    # Only dump the readings when they were actually stored: on a fault the payload holds no
+    # sensor fields at all, and these lines index `data` directly.
+    if healthy:
         dbg(3, "DATABASE", f"inserted in mysql-database  : {data}")
-        dbg(2, "DATABASE", f"temp1 : {data['temp1']}")
-        dbg(2, "DATABASE", f"temp2 : {data['temp2']}")
-        dbg(2, "DATABASE", f"temp3 : {data['temp3']}")
-        dbg(2, "DATABASE", f"temp4 : {data['temp4']}")
-        dbg(2, "DATABASE", f"temp5 : {data['temp5']}")
-        dbg(2, "DATABASE", f"temp6 : {data['temp6']}")
-        dbg(2, "DATABASE", f"temp7 : {data['temp7']}")
-        dbg(2, "DATABASE", f"temp8 : {data['temp8']}")
-        dbg(2, "DATABASE", f"temp9 : {data['temp9']}")
-        dbg(2, "DATABASE", f"temp10 : {data['temp10']}")
-        dbg(2, "DATABASE", f"temp11 : {data['temp11']}")
-        dbg(2, "DATABASE", f"temp12 : {data['temp12']}")
-        dbg(2, "DATABASE", f"temp17 : {data['temp17']}")
-        dbg(2, "DATABASE", f"temp18 : {data['temp18']}")
-        dbg(2, "DATABASE", f"temp19 : {data['temp19']}")
-        dbg(2, "DATABASE", f"vol13 : {data['vol13']}")
-        dbg(2, "DATABASE", f"vol17 : {data['vol17']}")
-        dbg(2, "DATABASE", f"vol18 : {data['vol18']}")
-        dbg(2, "DATABASE", f"rel1 : {data['rel1']}")
-        dbg(2, "DATABASE", f"rel2 : {data['rel2']}")
-        dbg(2, "DATABASE", f"rel3 : {data['rel3']}")
-        dbg(2, "DATABASE", f"rel6 : {data['rel6']}")
+        for f in SENSOR_FIELDS:
+            dbg(2, "DATABASE", f"{f} : {data[f]}")
         dbg(2, "DATABASE", f"time : {i.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
@@ -531,6 +534,10 @@ def parsestream(data):
                     usefulldata = ret
 
     if not usefulldata:
+        # Second silent skip path: no packet this cycle parsed into anything usable, so there is
+        # nothing to store. Log it -- this used to return without a trace, which made a missing
+        # row indistinguishable from a row that was never attempted.
+        dbg(1, "PARSER", "No usable payload this cycle -- nothing stored")
         return True
 
     saveinErixDB(usefulldata)

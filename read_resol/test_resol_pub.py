@@ -186,7 +186,7 @@ class TestParsepayload(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# D.  saveinErixDB() — only writes when errmsk == 0
+# D.  saveinErixDB() — always writes the row; the error mask decides what goes in it
 # ══════════════════════════════════════════════════════════════════════════════
 class TestSaveinErixDB(unittest.TestCase):
 
@@ -196,19 +196,39 @@ class TestSaveinErixDB(unittest.TestCase):
         mock_db.cursor.return_value = mock_cur
         return mock_db, mock_cur
 
-    def test_skips_write_when_errmsk_nonzero(self):
+    def _params(self, data):
         import mysql.connector as _mc
         mock_db, mock_cur = self._mock_db()
         with patch.object(_mc, "connect", return_value=mock_db):
-            mod.saveinErixDB({"errmsk": 1})
-        mock_cur.execute.assert_not_called()
+            mod.saveinErixDB(data)
+        return mock_cur, mock_cur.execute.call_args.args[1] if mock_cur.execute.called else None
 
-    def test_skips_write_when_errmsk_missing(self):
-        import mysql.connector as _mc
-        mock_db, mock_cur = self._mock_db()
-        with patch.object(_mc, "connect", return_value=mock_db):
-            mod.saveinErixDB({})
-        mock_cur.execute.assert_not_called()
+    def test_a_fault_still_writes_the_row(self):
+        """Regression: this used to drop the row entirely, which took the other five services'
+        columns with it -- a solar-thermal sensor glitch destroying P1 cost data."""
+        cur, _ = self._params({"errmsk": 1})
+        cur.execute.assert_called_once()
+
+    def test_a_fault_records_the_error_code(self):
+        """resol_error_code exists for exactly this, yet could only ever contain 0 before:
+        the only rows written were the ones with no error."""
+        _, params = self._params({"errmsk": 4})
+        self.assertEqual(params[-1], 4)
+
+    def test_a_fault_leaves_the_sensor_values_null(self):
+        """The original intent stands: readings the controller calls untrustworthy are not stored."""
+        _, params = self._params({"errmsk": 1})
+        self.assertTrue(all(p is None for p in params[1:-1]))
+
+    def test_a_missing_errmsk_is_treated_as_a_fault(self):
+        _, params = self._params({})
+        self.assertIsNone(params[-1])
+        self.assertTrue(all(p is None for p in params[1:-1]))
+
+    def test_a_fault_does_not_use_stale_sensor_values(self):
+        """A payload can carry an error mask *and* readings; the readings are still suspect."""
+        _, params = self._params({"errmsk": 2, "temp1": 999.0})
+        self.assertIsNone(params[1])
 
     def _full_data(self):
         return {
