@@ -115,7 +115,7 @@ PV_HORIZON_WEST_ELEV_FULL =  9.0  # west / evening: full forecast above this (na
 SLOT_H = 0.25  # slot duration: 15 minutes = 0.25 hours
 
 BAT_CAPACITY_KWH     = bc.BAT_CAPACITY_KWH
-BAT_MIN_SOC_PCT      = bc.BAT_MIN_SOC_PCT           # 20.0% — LP floor (raised from 15% to prevent SOC_LOW_LOCK at 14%)
+BAT_MIN_SOC_PCT      = float(os.getenv("BAT_MIN_SOC_PCT", str(bc.BAT_MIN_SOC_PCT)))  # LP floor; env-overridable (replay/tuning), default bc=20.0%
 BAT_MIN_SOC_DISCHARGE_PCT = bc.BAT_MIN_SOC_DISCHARGE_PCT  # 18.0% — DISCHARGE floor (doc)
 BAT_DAWN_SOC_PCT     = bc.BAT_DAWN_SOC_PCT              # 20.0% — minimum SoC at 06:00
 BAT_MAX_SOC_PCT      = bc.BAT_MAX_SOC_PCT
@@ -1482,6 +1482,88 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
              len(schedule), WIP, solver_status, total_optimizer, total_om_raw)
 
 
+def store_predicted_snapshot(conn, schedule: list[HourSlot], today: date, overwrite: bool = False):
+    """Once-per-day 'expected grid euros' baseline for the honest predicted chart line.
+
+    Stored on the first run of the day (schedule then spans the full day from 00:00) and never
+    overwritten, so the dashboard's predicted line is a stable day-ahead grid-flow expectation
+    instead of the per-slot frozen plans — which over-predict export because each rolling run
+    planned a near-floor DISCHARGE the deadband later converted to STANDBY. Pure grid cash flow;
+    the battery is deliberately left out (we only show hard euros to/from the grid).
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS predicted_grid_snapshot (
+            snapshot_date DATE     NOT NULL,
+            slot_dt       DATETIME NOT NULL,
+            action        VARCHAR(32),
+            pv_kwh        FLOAT,
+            load_kwh      FLOAT,
+            grid_kwh      FLOAT,
+            cost_eur      FLOAT,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (snapshot_date, slot_dt)
+        )
+    """)
+    if overwrite:
+        cur.execute("DELETE FROM predicted_grid_snapshot WHERE snapshot_date=%s", (today,))
+    else:
+        cur.execute("SELECT 1 FROM predicted_grid_snapshot WHERE snapshot_date=%s LIMIT 1", (today,))
+        if cur.fetchone():
+            cur.close()
+            return   # already snapshotted today — keep the stable day-ahead expectation
+    rows = [(today, s.dt, s.action, s.pv_kwh, s.load_kwh, s.grid_kwh, s.cost_eur)
+            for s in schedule if s.dt.date() == today]
+    if rows:
+        cur.executemany("""INSERT INTO predicted_grid_snapshot
+              (snapshot_date, slot_dt, action, pv_kwh, load_kwh, grid_kwh, cost_eur)
+              VALUES (%s,%s,%s,%s,%s,%s,%s)""", rows)
+        conn.commit()
+        log.info("Predicted grid snapshot stored: %d slots for %s", len(rows), today)
+    cur.close()
+
+
+def store_rolling_predicted_snapshot(conn, today: date, initial_soc_pct: float,
+                                     deadband_pct: float, optimise_kwargs: dict,
+                                     overwrite: bool = False):
+    """Optie (b): predicted-snapshot uit de ROLLING projectie (bootst de 15-min lus incl. de
+    deadband na), zodat de predicted-lijn de near-floor arbitrage vangt die het single-solve
+    dagplan mist. ~96 LP-solves — 1x/dag (of via --snapshot backfill). Alleen harde grid-euro s,
+    batterij buiten beschouwing. Valt stil terug (geen snapshot) bij een fout."""
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS predicted_grid_snapshot (
+            snapshot_date DATE NOT NULL, slot_dt DATETIME NOT NULL, action VARCHAR(32),
+            pv_kwh FLOAT, load_kwh FLOAT, grid_kwh FLOAT, cost_eur FLOAT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (snapshot_date, slot_dt))
+    """)
+    if not overwrite:
+        cur.execute("SELECT 1 FROM predicted_grid_snapshot WHERE snapshot_date=%s LIMIT 1", (today,))
+        if cur.fetchone():
+            cur.close(); return   # al gesnapshot vandaag
+    cur.close()
+    try:
+        results = rolling_replay(start_qtr=0, end_qtr=96, initial_soc_pct=initial_soc_pct,
+                                 deadband_pct=deadband_pct, optimise_kwargs=optimise_kwargs)
+    except Exception as exc:
+        log.error("Rolling snapshot failed (%s) — no predicted snapshot stored", exc)
+        return
+    rows = [(today, dt, act, pv, load, grid, cost)
+            for (dt, act, pv, load, grid, cost) in results if dt.date() == today]
+    if not rows:
+        return
+    cur = conn.cursor()
+    if overwrite:
+        cur.execute("DELETE FROM predicted_grid_snapshot WHERE snapshot_date=%s", (today,))
+    cur.executemany("""INSERT INTO predicted_grid_snapshot
+          (snapshot_date, slot_dt, action, pv_kwh, load_kwh, grid_kwh, cost_eur)
+          VALUES (%s,%s,%s,%s,%s,%s,%s)""", rows)
+    conn.commit(); cur.close()
+    log.info("Rolling predicted snapshot stored: %d slots for %s (deadband=%.0f%%)",
+             len(rows), today, deadband_pct)
+
+
 def mark_slot_applied(conn, slot_dt: datetime):
     cur = conn.cursor()
     # Mark current slot (most recent schedule entry) and all missed past slots.
@@ -1823,6 +1905,7 @@ def optimise(  # noqa: C901
     ev_soc: Optional[float] = None,
     ref_temp_by_hour: Optional[dict[int, float]] = None,
     inday_load_factor: float = 1.0,
+    replay_date: Optional[date] = None,
 ) -> tuple[list[HourSlot], str]:
     if ref_temp_by_hour is None:
         ref_temp_by_hour = {}
@@ -1883,6 +1966,23 @@ def optimise(  # noqa: C901
             f"price={raw_price:.4f}  allin={slot.import_price():.4f}  pv={pv:.3f}  load={load:.3f}  "
             f"hp_corr={hp_correction:+.4f}  T_fc={forecast_temp:.1f}C")
 
+    if replay_date is not None:
+        # Historical dry-run: replace the forecast-built pv/load/spot with the values
+        # actually stored for those days (battery_schedule = forecast used; electricity_prices
+        # = spot). Lets us re-solve a past day's exact inputs to test optimizer changes.
+        _rdb = get_db(); _rc = _rdb.cursor()
+        _rc.execute("SELECT ts, markttarief_kwh FROM electricity_prices WHERE ts>=%s AND ts<%s",
+                    (str(today), str(today + timedelta(days=2))))
+        _spot = {(t.date(), t.strftime('%H:%M')): float(v) for t, v in _rc.fetchall() if v is not None}
+        _rc.execute("SELECT slot_dt, pv_kwh, load_kwh FROM battery_schedule WHERE slot_dt>=%s AND slot_dt<%s",
+                    (str(today), str(today + timedelta(days=2))))
+        _pl = {(d.date(), d.strftime('%H:%M')): (float(pv or 0), float(ld or 0)) for d, pv, ld in _rc.fetchall()}
+        _rdb.close(); _nov = 0
+        for _s in slots:
+            _key = (_s.dt.date(), _s.dt.strftime('%H:%M'))
+            if _key in _spot: _s.price_eur_kwh = _spot[_key]
+            if _key in _pl:  _s.pv_kwh, _s.load_kwh = _pl[_key]; _nov += 1
+        log.info("REPLAY %s: %d slots from stored pv/load/spot", replay_date, _nov)
     if not slots:
         log.error("No slots built – empty schedule")
         return [], "MILP_FAILED"
@@ -1939,7 +2039,7 @@ def optimise(  # noqa: C901
     for t, slot in enumerate(slots):
         c_obj[gi_base + t] =  slot.import_price() + CHARGE_GRID_MIN_MARGIN_EUR_KWH
         c_obj[ge_base + t] = -slot.export_price()
-        c_obj[bd_base + t] += 1e-4  # tiny: discourage unnecessary battery cycling
+        c_obj[bd_base + t] += 1e-4  # tiny tie-breaker to avoid degenerate pointless discharge
         net_demand_t = slot.load_kwh + ev_load[t] - slot.pv_kwh
         if net_demand_t >= 0:
             c_obj[co_base + t] += LP_CHARGE_INCENTIVE  # deficit/night: discourage spurious BATTERY_FIRST
@@ -2718,13 +2818,70 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
 # 8.  MAIN
 # ---------------------------------------------------------------------------
 
-def main(dry_run: bool = False):
+def rolling_replay(
+    start_qtr: int,
+    end_qtr: int,
+    initial_soc_pct: float,
+    deadband_pct: float,
+    optimise_kwargs: dict,
+) -> list:
+    """Rolling-horizon dry-run: mimic the real 15-min control loop on a past day.
+
+    Each quarter: re-solve the LP from the live SoC (like a production run), take the
+    CURRENT slot's planned action, apply the discharge deadband (mirror control_growatt),
+    advance the SoC by that one executed slot, then step forward. Reproduces the near-floor
+    charge->hold sawtooth that a single solve cannot (it is a rolling-horizon artefact).
+    Analysis only - never writes to the DB.
+    """
+    soc, cum, fired = initial_soc_pct, 0.0, 0
+    results: list = []
+    log.info("ROLL === rolling replay  qtr %d->%d  soc0=%.1f%%  deadband=%.1f%% ===",
+             start_qtr, end_qtr, soc, deadband_pct)
+    for qtr in range(start_qtr, end_qtr):
+        schedule, _ = optimise(start_qtr_idx=qtr, initial_soc_pct=soc, **optimise_kwargs)
+        if not schedule:
+            break
+        s0 = schedule[0]
+        planned = s0.action
+        if "DISCHARGE" in planned and soc < deadband_pct:
+            executed = "STANDBY"                       # deadband -> hold, export PV directly
+            net      = s0.pv_kwh - s0.load_kwh
+            gi, ge   = max(-net, 0.0), max(net, 0.0)
+            cost     = gi * s0.import_price() - ge * s0.export_price()
+            grid     = gi - ge                         # +import / -export
+            new_soc  = soc                             # battery passive
+            fired   += 1
+        else:
+            executed = planned
+            cost     = s0.cost_eur
+            grid     = s0.grid_kwh
+            new_soc  = s0.soc_end_pct
+        cum += cost
+        results.append((s0.dt, executed, s0.pv_kwh, s0.load_kwh, grid, cost))
+        log.info("ROLL  %s  %-24s -> %-10s soc %.1f->%.1f  cost %+.4f  cum %+.4f%s",
+                 s0.dt.strftime("%m-%d %H:%M"), planned, executed, soc, new_soc,
+                 cost, cum, "  <deadband>" if executed != planned else "")
+        soc = new_soc
+    log.info("ROLL === done: %d slots, %d deadband firings, cum_cost=EUR %+.4f, end_soc=%.1f%% ===",
+             end_qtr - start_qtr, fired, cum, soc)
+    return results
+
+
+def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_range: Optional[tuple] = None, snapshot_date: Optional[date] = None):
     log.info("=== Battery Optimizer LP %s start%s ===", WIP, "  [DRY-RUN]" if dry_run else "")
 
     now           = datetime.now()
+    if rolling_range is not None:
+        replay_at = rolling_range[0]   # reuse replay machinery for today/soc/dry_run
+    if snapshot_date is not None:
+        replay_at = datetime.combine(snapshot_date, datetime.min.time())  # full-day solve for backfill
     today         = now.date()
     current_hour  = now.hour
     start_qtr_idx = now.hour * 4 + now.minute // 15  # 0..95 within the day
+    if replay_at is not None:
+        dry_run       = True          # replay writes nothing to the DB
+        today         = replay_at.date()
+        start_qtr_idx = replay_at.hour * 4 + replay_at.minute // 15  # start at the given moment
 
     try:
         conn = get_db()
@@ -2739,6 +2896,13 @@ def main(dry_run: bool = False):
     if not soc_pct or soc_pct < 5.0:
         log.warning("Invalid SOC reading (%.1f) — using fallback 50%%", soc_pct or 0)
         soc_pct = 50.0
+    if replay_at is not None:
+        _sc = conn.cursor()
+        _sc.execute("SELECT AVG(seplos_soc_pct) FROM energy WHERE ts>=%s AND ts<%s",
+                    (replay_at, replay_at + timedelta(minutes=15)))
+        _r = _sc.fetchone()[0]; _sc.close()
+        if _r: soc_pct = float(_r)
+        log.info("REPLAY: initial SoC %.1f%% at %s (actual)", soc_pct, replay_at)
     log.info("Current SoC: %.1f%%", soc_pct)
 
     prices    = fetch_all_prices(today)
@@ -2768,6 +2932,23 @@ def main(dry_run: bool = False):
 
     log.info("PV curtailment: %s", "enabled" if PV_CURTAIL_ENABLED else "disabled")
 
+    okw_base = dict(prices=prices, radiation=radiation, load_profile=load_prof, today=today,
+                    mode=mode, ev_soc=ev_soc, ref_temp_by_hour=ref_temp_by_hour,
+                    inday_load_factor=inday_factor)
+    deadband_pct = float(os.getenv("DEADBAND_PCT", str(bc.SOC_DISCHARGE_DEADBAND)))
+
+    if rolling_range is not None:
+        end_q = round((rolling_range[1] - datetime.combine(today, datetime.min.time())).total_seconds() / 900)
+        rolling_replay(
+            start_qtr       = start_qtr_idx,
+            end_qtr         = end_q,
+            initial_soc_pct = soc_pct,
+            deadband_pct    = deadband_pct,
+            optimise_kwargs = {**okw_base, "replay_date": today},
+        )
+        conn.close()
+        return
+
     schedule, solver_status = optimise(
         start_qtr_idx    = start_qtr_idx,
         prices           = prices,
@@ -2779,6 +2960,7 @@ def main(dry_run: bool = False):
         ev_soc           = ev_soc,
         ref_temp_by_hour = ref_temp_by_hour,
         inday_load_factor = inday_factor,
+        replay_date       = replay_at.date() if replay_at else None,
     )
 
     if not schedule:
@@ -2787,6 +2969,12 @@ def main(dry_run: bool = False):
         return
 
     _verify_schedule_balance(schedule)
+
+    if snapshot_date is not None:
+        store_rolling_predicted_snapshot(conn, snapshot_date, soc_pct, deadband_pct,
+                                         {**okw_base, "replay_date": snapshot_date}, overwrite=True)
+        conn.close()
+        return
 
     total_cost    = sum(s.cost_eur for s in schedule)
     total_curtail = sum(s.pv_curtail_kwh for s in schedule)
@@ -2817,6 +3005,8 @@ def main(dry_run: bool = False):
         write_schedule_to_db(conn, schedule, solver_status)
         mark_slot_applied(conn, next_slot.dt)
         write_simulation_to_db(conn, sim_results)
+        store_rolling_predicted_snapshot(conn, today, soc_pct, deadband_pct,
+                                         {**okw_base, "replay_date": None}, overwrite=False)
 
     conn.close()
     log.info("=== Battery Optimizer LP %s done%s  cost=€%.4f  saving_vs_baseline=€%.4f  "
@@ -2879,6 +3069,21 @@ def _sleep_until_next_quarter():
 
 if __name__ == "__main__":
     _dry_run = "--dry-run" in sys.argv
+    _replay  = None
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--replay" and _i + 1 < len(sys.argv):
+            _rv = sys.argv[_i + 1]
+            _replay = datetime.fromisoformat(_rv if "T" in _rv else _rv + "T00:00")
+    _rolling = None
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--rolling-replay" and _i + 2 < len(sys.argv):
+            _rs, _re = sys.argv[_i + 1], sys.argv[_i + 2]
+            _rolling = (datetime.fromisoformat(_rs if "T" in _rs else _rs + "T00:00"),
+                        datetime.fromisoformat(_re if "T" in _re else _re + "T00:00"))
+    _snapshot = None
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--snapshot" and _i + 1 < len(sys.argv):
+            _snapshot = date.fromisoformat(sys.argv[_i + 1])
 
     log.info("=== Battery Optimizer LP %s self-scheduling loop started%s ===",
              WIP, "  [DRY-RUN]" if _dry_run else "")
@@ -2888,7 +3093,16 @@ if __name__ == "__main__":
     log.info("%s: PV estimate via KNMI GTI (PANEL_PR_GTI=%.2f)  fallback=OM GHI (PANEL_EFF_CAL=%.2f)",
              WIP, PANEL_PR_GTI, PANEL_EFF_CAL)
 
-    if _dry_run:
+    if _snapshot is not None:
+        log.info("=== SNAPSHOT backfill for %s ===", _snapshot)
+        main(snapshot_date=_snapshot)
+    elif _rolling is not None:
+        log.info("=== ROLLING REPLAY: %s -> %s (no DB writes) ===", _rolling[0], _rolling[1])
+        main(rolling_range=_rolling)
+    elif _replay is not None:
+        log.info("=== REPLAY: historical dry-run for %s (no DB writes) ===", _replay)
+        main(replay_at=_replay)
+    elif _dry_run:
         # Single run and exit — not production mode
         main(dry_run=True)
     else:
