@@ -10,6 +10,7 @@ services:
     environment:
       - TZ=Europe/Amsterdam
     volumes:
+      - ../common:/app/common:ro
       # Map de lokale folder met je script/config naar /app in de container
       - .:/app
       - ./logs:/logs

@@ -14,6 +14,7 @@ Configuration via environment variables (see ../.env):
 """
 
 import os
+import sys
 import time
 import json
 import traceback
@@ -23,6 +24,12 @@ from pathlib import Path
 import paho.mqtt.client as mqtt
 import mysql.connector
 from dotenv import load_dotenv
+
+# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 
 
 # ---------------------------
@@ -172,11 +179,10 @@ def execute_cycle():
             "sparrow_compressor_speed_rpm": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_compressor_speed"))
         }
 
-        query = "UPDATE energy SET " + ", ".join(
-            f"{key} = %s" for key in data.keys()
-        ) + " WHERE id = (SELECT id FROM energy ORDER BY id DESC LIMIT 1)"
-
-        cursor.execute(query, tuple(data.values()))
+        # Write our own 5-minute bucket, not "the newest row": that row may belong to an
+        # earlier interval if the service that creates rows missed a cycle. See common/energy_row.py.
+        query = er.upsert_sql(list(data.keys()))
+        cursor.execute(query, (er.bucket(),) + tuple(data.values()))
 
         dbg(3, "DB", f"received from mqtt is: {data}")
 

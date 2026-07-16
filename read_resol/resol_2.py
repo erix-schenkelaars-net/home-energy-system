@@ -20,6 +20,7 @@ Configuration via environment variables (see ../.env):
 """
 
 import os
+import sys
 from dotenv import load_dotenv
 from pathlib import Path
 import json
@@ -27,6 +28,12 @@ import socket
 import time
 from datetime import datetime
 import pytz
+
+# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 import mysql.connector
 import paho.mqtt.publish as publish
 
@@ -161,22 +168,29 @@ def saveinErixDB(data):
             )
             cursor = db.cursor()
 
-            # Prepare the SQL query
-            sql = """INSERT INTO energy
-                (resol_temp_1_c, resol_temp_2_c,  	resol_temp_3_c, resol_temp_4_c, resol_temp_5_c, resol_temp_6_c, resol_temp_7_c, resol_temp_8_c,
-                resol_temp_9_c, resol_temp_10_c, resol_temp_11_c, resol_temp_12_c, resol_temp_17_c, resol_temp_18_c, resol_temp_19_c,
-                resol_volume_13_lpm, resol_volume_17_lpm, resol_volume_18_lpm, resol_volume_19_lpm, resol_relay_1, resol_relay_2, resol_relay_3 , resol_relay_6, resol_error_code, ts)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+            # Upsert on our own 5-minute bucket. This service used to be the only one that
+            # created rows, which made it the heartbeat of the whole table: when it missed a
+            # cycle the five other writers silently wrote to the previous row. Now any of them
+            # creates the row and we only own our own columns. See common/energy_row.py.
+            sql = er.upsert_sql([
+                "resol_temp_1_c", "resol_temp_2_c", "resol_temp_3_c", "resol_temp_4_c",
+                "resol_temp_5_c", "resol_temp_6_c", "resol_temp_7_c", "resol_temp_8_c",
+                "resol_temp_9_c", "resol_temp_10_c", "resol_temp_11_c", "resol_temp_12_c",
+                "resol_temp_17_c", "resol_temp_18_c", "resol_temp_19_c",
+                "resol_volume_13_lpm", "resol_volume_17_lpm", "resol_volume_18_lpm",
+                "resol_volume_19_lpm", "resol_relay_1", "resol_relay_2", "resol_relay_3",
+                "resol_relay_6", "resol_error_code",
+            ])
 
             values = (
+                er.bucket(i),   # ts first: upsert_sql puts the key in front
                 data.get("temp1"), data.get("temp2"), data.get("temp3"), data.get("temp4"),
                 data.get("temp5"), data.get("temp6"), data.get("temp7"), data.get("temp8"),
                 data.get("temp9"), data.get("temp10"), data.get("temp11"), data.get("temp12"),
                 data.get("temp17"), data.get("temp18"), data.get("temp19"),
                 data.get("vol13"), data.get("vol17"), data.get("vol18"), data.get("vol19"),
                 data.get("rel1"), data.get("rel2"), data.get("rel3"), data.get("rel6"),
-                data.get("errmsk"), i.strftime('%Y-%m-%d %H:%M:%S')
+                data.get("errmsk")
             )
 
             # Execute the query

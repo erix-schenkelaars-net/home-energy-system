@@ -41,6 +41,7 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.d
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from common import energy_cost as ec   # gedeelde, canonieke kostenberekening
+from common import energy_row as er    # gedeelde 5-minuten-bucket + upsert
 
 
 # --------------------------------------------------
@@ -311,30 +312,26 @@ def read_battery_today_kwh() -> tuple[float, float]:
 # ---------------------------
 def update_erix_db_data(data):
     dbg(2, DEBUG_DB_UPDATE, "DB", f"Updating DB with data: {data}")
-    sql = f"""
-    UPDATE {MYSQL_TABLE_NAME}
-    SET p1_energy_import_low_kwh   = %s,
-        p1_energy_import_high_kwh  = %s,
-        p1_energy_export_low_kwh   = %s,
-        p1_energy_export_high_kwh  = %s,
-        p1_power_import_w          = %s,
-        p1_power_export_w          = %s,
-        p1_gas_total_m3            = %s,
-        p1_energy_today_import_kwh = %s,
-        p1_energy_today_export_kwh = %s,
-        p1_energy_today_kwh        = %s,
-        p1_gas_today_m3            = %s,
-        p1_electricity_today_kwh   = %s,
-        cost_elec_var_eur          = %s,
-        cost_gas_var_eur           = %s
-    WHERE id=(SELECT id FROM {MYSQL_TABLE_NAME} ORDER BY id DESC LIMIT 1)
-    """
+    # Write our own 5-minute bucket, not "the newest row". That row belongs to an earlier
+    # interval whenever the row for this one does not exist yet, and this UPDATE would then
+    # overwrite its cost_* -- silently destroying an interval that the Energiekosten page
+    # sums. That cost ~1.4% of realised cost per day. See common/energy_row.py.
+    sql = er.upsert_sql([
+        "p1_energy_import_low_kwh",   "p1_energy_import_high_kwh",
+        "p1_energy_export_low_kwh",   "p1_energy_export_high_kwh",
+        "p1_power_import_w",          "p1_power_export_w",
+        "p1_gas_total_m3",
+        "p1_energy_today_import_kwh", "p1_energy_today_export_kwh",
+        "p1_energy_today_kwh",        "p1_gas_today_m3",
+        "p1_electricity_today_kwh",
+        "cost_elec_var_eur",          "cost_gas_var_eur",
+    ], table=MYSQL_TABLE_NAME)
     try:
         db = mysql.connector.connect(
             host=MYSQL_HOST, user=MYSQL_USER,
             passwd=MYSQL_PASSWD, db=MYSQL_DB_NAME)
         cur = db.cursor()
-        cur.execute(sql, data)
+        cur.execute(sql, (er.bucket(),) + tuple(data))
         db.commit()
         dbg(2, DEBUG_DB_UPDATE, "DB", "DB update OK")
     except Exception as e:

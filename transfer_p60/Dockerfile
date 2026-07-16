@@ -1,6 +1,8 @@
 FROM python:3.13-slim
 
-WORKDIR .
+# /app like every other service: `WORKDIR .` resolved to / and put the script outside the
+# ../common:/app/common mount, so `from common import ...` could not resolve.
+WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --upgrade pip --quiet

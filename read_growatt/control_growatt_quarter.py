@@ -52,6 +52,7 @@ import paho.mqtt.publish as mqtt_publish
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from common import battery_constants as bc
 from common.battery_alert import alert_trigger, alert_clear
+from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 
 
 print("=====================================================================================")
@@ -1082,30 +1083,21 @@ def run_data_collection(client):
 
         cursor = db.cursor()
 
-        sql = f"""
-            UPDATE {DB_TABLE}
-            SET sph_pv_energy_total_kwh=%s,
-                sph_pv_energy_today_kwh=%s,
-                sph_pv_power_tot_w=%s,
-                sph_temp_c=%s,
-                sph_pv_voltage_1_v =%s,
-                sph_pv_voltage_2_v =%s,
-                sph_pv_power_1_w=%s,
-                sph_pv_power_2_w=%s,
-                used_energy_today_kwh=%s,
-                sph_bat_act_charge_discharge_power_w=%s,
-                sph_bat_voltage_v=%s,
-                sph_bat_charge_today_kwh=%s,
-                sph_bat_charge_total_kwh=%s,
-                sph_bat_discharge_today_kwh=%s,
-                sph_bat_discharge_total_kwh=%s,
-                sph_grid_power_w=%s,
-                sph_fault_code=%s,
-                sph_fault_sub_code=%s,
-                sph_alarm_code=%s,
-                sph_alarm_sub_code=%s
-            ORDER BY id DESC LIMIT 1
-        """
+        # Write our own 5-minute bucket, not "the newest row". This loop runs every 60s, so it
+        # hits each bucket ~5 times and the last write before the bucket rolls is what sticks --
+        # a constant ~4-minute label lag that cancels out in counter differences. Targeting
+        # "newest" instead made that lag stretch to 10+ minutes whenever the row for this
+        # interval did not exist yet, misattributing the energy. See common/energy_row.py.
+        sql = er.upsert_sql([
+            "sph_pv_energy_total_kwh", "sph_pv_energy_today_kwh", "sph_pv_power_tot_w",
+            "sph_temp_c", "sph_pv_voltage_1_v", "sph_pv_voltage_2_v",
+            "sph_pv_power_1_w", "sph_pv_power_2_w", "used_energy_today_kwh",
+            "sph_bat_act_charge_discharge_power_w", "sph_bat_voltage_v",
+            "sph_bat_charge_today_kwh", "sph_bat_charge_total_kwh",
+            "sph_bat_discharge_today_kwh", "sph_bat_discharge_total_kwh",
+            "sph_grid_power_w", "sph_fault_code", "sph_fault_sub_code",
+            "sph_alarm_code", "sph_alarm_sub_code",
+        ], table=DB_TABLE)
         e_used_today = etodaynet + PV_Etoday
         e_used_today = (e_used_today
                         - regs.get('REG_Daily_charge_of_battery', 0)
@@ -1145,7 +1137,7 @@ def run_data_collection(client):
         dbg(3, "DB", f"Inverter T:  {pvtemp:.1f} C")
         dbg(3, "DB", f"Battery V:   {regs.get('REG_Battery_voltage', 0):.1f} V (SPH side)")
 
-        cursor.execute(sql, data)
+        cursor.execute(sql, (er.bucket(),) + data)
         db.commit()
 
         dbg(2, "DB", "Data successfully stored in MySQL database")
@@ -1513,7 +1505,9 @@ def store_control_action(action: str) -> None:
         db = mysql.connector.connect(host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
                                      db=DB_NAME, ssl_disabled=True, connection_timeout=5)
         cur = db.cursor()
-        cur.execute("UPDATE energy SET control_action=%s ORDER BY id DESC LIMIT 1", (action,))
+        # Own 5-minute bucket: the action that was actually executed belongs to the interval it
+        # ran in, not to whichever row happens to be newest.
+        cur.execute(er.upsert_sql(["control_action"]), (er.bucket(), action))
         db.commit()
         cur.close()
         db.close()

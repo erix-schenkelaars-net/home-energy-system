@@ -328,6 +328,45 @@ class TestUpdateDbData(unittest.TestCase):
         mock_cur.execute.assert_called_once()
         mock_db.commit.assert_called_once()
 
+    def test_writes_its_own_bucket_not_the_newest_row(self):
+        """Regression: targeting "the newest row" overwrote the previous interval's cost_*
+        whenever the row for this interval did not exist yet -- ~1.4% of realised cost per day."""
+        mock_db  = MagicMock()
+        mock_cur = MagicMock()
+        mock_db.cursor.return_value = mock_cur
+        import mysql.connector as _mc
+        with patch.object(_mc, "connect", return_value=mock_db), \
+             patch.object(mod, "fill_null_p1_rows"):
+            mod.update_erix_db_data(self._sample_data())
+        sql = mock_cur.execute.call_args.args[0]
+        self.assertIn("ON DUPLICATE KEY UPDATE", sql)
+        self.assertNotIn("ORDER BY id DESC", sql)
+
+    def test_ts_is_the_first_parameter_and_is_a_5_minute_bucket(self):
+        mock_db  = MagicMock()
+        mock_cur = MagicMock()
+        mock_db.cursor.return_value = mock_cur
+        import mysql.connector as _mc
+        with patch.object(_mc, "connect", return_value=mock_db), \
+             patch.object(mod, "fill_null_p1_rows"):
+            mod.update_erix_db_data(self._sample_data())
+        ts = mock_cur.execute.call_args.args[1][0]
+        self.assertEqual((ts.second, ts.microsecond), (0, 0))
+        self.assertEqual(ts.minute % 5, 0)
+
+    def test_it_writes_only_p1_and_cost_columns(self):
+        """It must not be able to blank out another service's columns."""
+        mock_db  = MagicMock()
+        mock_cur = MagicMock()
+        mock_db.cursor.return_value = mock_cur
+        import mysql.connector as _mc
+        with patch.object(_mc, "connect", return_value=mock_db), \
+             patch.object(mod, "fill_null_p1_rows"):
+            mod.update_erix_db_data(self._sample_data())
+        sql = mock_cur.execute.call_args.args[0]
+        for foreign in ("resol_", "sph_", "seplos_", "sparrow_", "honeywell_"):
+            self.assertNotIn(foreign, sql)
+
     def test_triggers_the_null_interpolator(self):
         """Every write sweeps the last 24 h for NULL P1 rows left by a reader outage."""
         mock_db = MagicMock()

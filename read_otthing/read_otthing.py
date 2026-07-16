@@ -15,6 +15,7 @@ Configuration via environment variables (see ../.env):
 """
 
 import os
+import sys
 import time
 import json
 import traceback
@@ -23,6 +24,12 @@ import paho.mqtt.client as mqtt
 import mysql.connector
 from pathlib import Path
 from dotenv import load_dotenv
+
+# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 
 
 # ---------------------------
@@ -200,22 +207,14 @@ def execute_cycle():
         db = connect_db()
         cursor = db.cursor()
 
-        # Get last row id first — avoids MariaDB subquery-on-same-table restriction
-        cursor.execute(f"SELECT id FROM {DB_TABLE} ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-        if row is None:
-            dbg(1, "DB", "No rows in table — skipping")
-            return
-
-        last_id = row[0]
-        query = (
-            f"UPDATE {DB_TABLE} SET "
-            + ", ".join(f"{k} = %s" for k in data)
-            + " WHERE id = %s"
-        )
-        cursor.execute(query, (*data.values(), last_id))
+        # Write our own 5-minute bucket rather than "the newest row", which may belong to an
+        # earlier interval. This also drops the lookup and the "no rows yet" skip: the upsert
+        # creates the row if we are the first one here. See common/energy_row.py.
+        ts = er.bucket()
+        cursor.execute(er.upsert_sql(list(data.keys()), table=DB_TABLE),
+                       (ts, *data.values()))
         db.commit()
-        dbg(1, "DB", f"DB updated OK (id={last_id})")
+        dbg(1, "DB", f"DB updated OK (ts={ts:%Y-%m-%d %H:%M})")
 
     except Exception as e:
         dbg(1, "DB", f"DB error: {e}")

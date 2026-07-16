@@ -30,6 +30,7 @@ from datetime import date
 import mysql.connector
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from common.battery_alert import alert_trigger, alert_clear
+from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 from common.battery_constants import SOC_LOW_STOP
 
 # Load .env from parent directory (x:/home/pi/docker/.env)
@@ -605,44 +606,57 @@ def update_db(**v):
         # De per-cel min/max celspanning staat NIET meer hier maar in battery_debugging
         # (debug-only, losgekoppeld). De aggregaat vmin/vmax hier blijft consistent:
         # MIN(cel*_min) in battery_debugging == seplos_cell_voltage_min_v op dezelfde ts.
-        # Reset per rij gebeurt vanzelf: read_resol INSERT een nieuwe rij met NULL
-        # seplos-kolommen, en COALESCE(...,sentinel) start dan opnieuw. Temp-sentinels
-        # zijn -999 zodat ook negatieve omgevingstemp correct accumuleert.
-        # LET OP: seplos_soc_pct heeft column-default 0 (niet NULL), dus de reset moet
+        # Own 5-min ts-bucket (UNIQUE), same as battery_debugging below: the INSERT starts the
+        # interval and the ON DUPLICATE branch accumulates into it until the bucket rolls. The
+        # reset is now intrinsic to the new bucket -- it no longer depends on read_resol
+        # inserting a row with NULL seplos columns, which silently failed whenever read_resol
+        # missed a cycle. Temp-sentinels are -999 so negative ambient temps accumulate correctly.
+        # LET OP: seplos_soc_pct heeft column-default 0 (niet NULL), dus de accumulatie moet
         # die 0 als "leeg" behandelen -> NULLIF(...,0), anders latcht LEAST de rij op 0.
         # Een echte SOC van exact 0.0% is onbereikbaar (LP-floor 20% + LFP).
         sql = f"""
-        UPDATE {DB_TABLE}
-        SET seplos_alarm_active=%s,
-            seplos_warning_active=%s,
-            seplos_voltage_v=%s,
-            seplos_current_a=%s,
-            seplos_direction=%s,
-            seplos_power_w=%s,
-            seplos_soc_pct=LEAST(COALESCE(NULLIF(seplos_soc_pct, 0), 999), %s),
-            seplos_mode=%s,
-            seplos_cell_voltage_min_v=LEAST(COALESCE(seplos_cell_voltage_min_v, 9.999), %s),
-            seplos_cell_voltage_max_v=GREATEST(COALESCE(seplos_cell_voltage_max_v, 0), %s),
-            seplos_cell_voltage_delta_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_mv, 0), %s),
-            seplos_cell_voltage_delta_sustained_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_sustained_mv, 0), %s),
-            seplos_cell_voltage_delta_rest_mv=IF(%s IS NULL, seplos_cell_voltage_delta_rest_mv,
-                LEAST(COALESCE(seplos_cell_voltage_delta_rest_mv, 65535), %s)),
-            seplos_temp_cell_min_c=LEAST(COALESCE(seplos_temp_cell_min_c, 999), %s),
-            seplos_temp_cell_max_c=GREATEST(COALESCE(seplos_temp_cell_max_c, -999), %s),
-            seplos_temp_env_c=GREATEST(COALESCE(seplos_temp_env_c, -999), %s),
-            seplos_temp_pow_c=GREATEST(COALESCE(seplos_temp_pow_c, -999), %s),
-            seplos_error_tb02_voltage=%s,
-            seplos_error_tb03_temp=%s,
-            seplos_error_tb05_current=%s,
-            seplos_error_tb07_FET_state=%s,
-            seplos_error_tb15_hardfault=%s,
-            seplos_energy_charged_kwh=%s,
-            seplos_energy_discharged_kwh=%s
-        ORDER BY id DESC LIMIT 1
+        INSERT INTO {DB_TABLE} (ts,
+            seplos_alarm_active, seplos_warning_active, seplos_voltage_v, seplos_current_a,
+            seplos_direction, seplos_power_w, seplos_soc_pct, seplos_mode,
+            seplos_cell_voltage_min_v, seplos_cell_voltage_max_v, seplos_cell_voltage_delta_mv,
+            seplos_cell_voltage_delta_sustained_mv, seplos_cell_voltage_delta_rest_mv,
+            seplos_temp_cell_min_c, seplos_temp_cell_max_c, seplos_temp_env_c, seplos_temp_pow_c,
+            seplos_error_tb02_voltage, seplos_error_tb03_temp, seplos_error_tb05_current,
+            seplos_error_tb07_FET_state, seplos_error_tb15_hardfault,
+            seplos_energy_charged_kwh, seplos_energy_discharged_kwh)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            seplos_alarm_active=VALUES(seplos_alarm_active),
+            seplos_warning_active=VALUES(seplos_warning_active),
+            seplos_voltage_v=VALUES(seplos_voltage_v),
+            seplos_current_a=VALUES(seplos_current_a),
+            seplos_direction=VALUES(seplos_direction),
+            seplos_power_w=VALUES(seplos_power_w),
+            seplos_soc_pct=LEAST(COALESCE(NULLIF(seplos_soc_pct, 0), 999), VALUES(seplos_soc_pct)),
+            seplos_mode=VALUES(seplos_mode),
+            seplos_cell_voltage_min_v=LEAST(COALESCE(seplos_cell_voltage_min_v, 9.999), VALUES(seplos_cell_voltage_min_v)),
+            seplos_cell_voltage_max_v=GREATEST(COALESCE(seplos_cell_voltage_max_v, 0), VALUES(seplos_cell_voltage_max_v)),
+            seplos_cell_voltage_delta_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_mv, 0), VALUES(seplos_cell_voltage_delta_mv)),
+            seplos_cell_voltage_delta_sustained_mv=GREATEST(COALESCE(seplos_cell_voltage_delta_sustained_mv, 0), VALUES(seplos_cell_voltage_delta_sustained_mv)),
+            seplos_cell_voltage_delta_rest_mv=IF(VALUES(seplos_cell_voltage_delta_rest_mv) IS NULL,
+                seplos_cell_voltage_delta_rest_mv,
+                LEAST(COALESCE(seplos_cell_voltage_delta_rest_mv, 65535), VALUES(seplos_cell_voltage_delta_rest_mv))),
+            seplos_temp_cell_min_c=LEAST(COALESCE(seplos_temp_cell_min_c, 999), VALUES(seplos_temp_cell_min_c)),
+            seplos_temp_cell_max_c=GREATEST(COALESCE(seplos_temp_cell_max_c, -999), VALUES(seplos_temp_cell_max_c)),
+            seplos_temp_env_c=GREATEST(COALESCE(seplos_temp_env_c, -999), VALUES(seplos_temp_env_c)),
+            seplos_temp_pow_c=GREATEST(COALESCE(seplos_temp_pow_c, -999), VALUES(seplos_temp_pow_c)),
+            seplos_error_tb02_voltage=VALUES(seplos_error_tb02_voltage),
+            seplos_error_tb03_temp=VALUES(seplos_error_tb03_temp),
+            seplos_error_tb05_current=VALUES(seplos_error_tb05_current),
+            seplos_error_tb07_FET_state=VALUES(seplos_error_tb07_FET_state),
+            seplos_error_tb15_hardfault=VALUES(seplos_error_tb15_hardfault),
+            seplos_energy_charged_kwh=VALUES(seplos_energy_charged_kwh),
+            seplos_energy_discharged_kwh=VALUES(seplos_energy_discharged_kwh)
         """
 
-
         c.execute(sql, (
+            er.bucket(),                       # ts                       5-min bucket
             int(v["alarm"]),                   # seplos_alarm_active      int
             int(v["warning"]),                 # seplos_warning_active    int
             float(v["voltage"]),               # seplos_voltage_v         float
@@ -656,7 +670,6 @@ def update_db(**v):
             float(v["vdiff"]),                 # seplos_cell_voltage_delta_mv float
             float(v["vdiff_sustained"]),       # seplos_cell_voltage_delta_sustained_mv float
             v["vdiff_rest"],                   # seplos_cell_voltage_delta_rest_mv  float or None
-            v["vdiff_rest"],                   #   (same value: NULL-check + LEAST accumulation)
             float(v["tmin"]),                  # seplos_temp_cell_min_c   float
             float(v["tmax"]),                  # seplos_temp_cell_max_c   float
             float(v["tenv"]),                  # seplos_temp_env_c        float
