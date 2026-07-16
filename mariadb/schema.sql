@@ -166,7 +166,11 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `honeywell_ot_thermo_room_t_c`        float        DEFAULT NULL COMMENT 'Room temperature °C',
   `honeywell_ot_thermo_smart_power`     varchar(20)  DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `idx_ts` (`ts`)
+
+  -- UNIQUE, not just an index: it is what makes one row per 5-minute bucket possible, so every
+  -- service can INSERT ... ON DUPLICATE KEY UPDATE its own columns on its own interval instead
+  -- of writing to "the newest row" and hoping it is the right one. See tools/migrate_energy_ts_bucket.py.
+  UNIQUE KEY `idx_ts` (`ts`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 
