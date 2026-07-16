@@ -761,6 +761,8 @@ def main():
             pack_voltage = pia[0] / 100.0
             pack_current = s16(pia[1]) / 100.0
             soc = pia[5] / 10.0
+            soh = pia[6] / 10.0    # 0x1006 State of Health (PCT10) — register map: seplos_tool.py
+            cycles = pia[7]        # 0x1007 charge cycle counter (U16)
             mode_raw = pic[11]
             mode_str = MODE_MAP.get(mode_raw, f"Unknown (0x{mode_raw:02X})")
 
@@ -932,6 +934,8 @@ def main():
             # -------- DISPLAY --------
             dbg(2, DEBUG_MAIN, "MAIN", "=" * 60)
             dbg(2, DEBUG_MAIN, "MAIN", f"SOC              :    {soc:6.1f} %")
+            dbg(2, DEBUG_MAIN, "MAIN", f"SOH              :    {soh:6.1f} %")
+            dbg(2, DEBUG_MAIN, "MAIN", f"Cycles           :    {cycles:6d} x")
             dbg(2, DEBUG_MAIN, "MAIN", f"Voltage          :    {pack_voltage:6.2f} V")
             dbg(2, DEBUG_MAIN, "MAIN", f"Current          :    {pack_current:6.2f} A")
             dbg(2, DEBUG_MAIN, "MAIN", f"Mode             :    {mode_str} (0x{mode_raw:02X})")
