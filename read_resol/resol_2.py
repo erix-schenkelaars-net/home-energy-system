@@ -172,8 +172,11 @@ def saveinErixDB(data):
     if healthy:
         dbg(2, "DATABASE", f"data  {data}")
     else:
+        # Log the raw bytes it was decoded from, not just the number: RESOL does not publish the
+        # bit layout, so the only way to work out what a value means is to see what produced it.
         dbg(1, "DATABASE",
-            f"Resol errormask {errmsk!r} -- storing error code, sensor values left NULL")
+            f"Resol errormask {errmsk!r} -- storing error code, sensor values left NULL "
+            f"(raw bytes logged by parsepayload)")
 
     # The sensor fields, in the column order below. The error mask is not one of them: it is
     # recorded whatever happens, which is the whole point.
@@ -372,7 +375,9 @@ def parsepayload(payload):
     Reads and validates frames (each with checksum and septet injection).
     Returns None on checksum error, otherwise a dict of sensor values.
     """
-    dbg(3, "parsepayload", f"parse Payload: {''.join([hex(ord(i))[2:] for i in payload])}")
+    # Zero-pad: hex(5) is "0x5" -> "5", so an unpadded dump has variable width per byte and
+    # you cannot count offsets in it. That matters here -- the error mask sits at 96..99.
+    dbg(3, "parsepayload", f"parse Payload: {''.join(f'{ord(i):02x}' for i in payload)}")
 
     data = []
 
@@ -452,6 +457,14 @@ def parsepayload(payload):
     vals = {}
     for i, rng in list(payloadmap.items()):
         vals[i] = gb(data, rng[0], rng[1]+1)
+        if i == 'errmsk' and vals[i] != 0:
+            # RESOL does not publish the bit layout, so a non-zero mask is only diagnosable if
+            # we can see the bytes it came from. Log here rather than stashing it in vals --
+            # every key in there becomes an MQTT entity in Home Assistant.
+            dbg(1, "parsepayload",
+                f"errmsk={vals[i]} (0x{vals[i]:08X}) bits "
+                f"{[b for b in range(31) if vals[i] >> b & 1]} from bytes "
+                f"{rng[0]}..{rng[1]} = {' '.join(f'{ord(b):02x}' for b in data[rng[0]:rng[1]+1])}")
 
         # Temperatures can be negative (two's complement)
         if i.startswith('temp'):
