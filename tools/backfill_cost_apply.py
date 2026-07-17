@@ -71,9 +71,13 @@ def main():
         total_old_e += old_elec;  total_new_e += new_elec
         total_old_g += old_gas;   total_new_g += new_gas
 
-        if abs(new_elec - old_elec) > 0.001:
+        # De drempel voorkomt zinloze writes op bestaande rijen. Een rij zonder waarde moet
+        # hem altijd krijgen: NULL betekent "onbekend", en na herberekening is hij bekend --
+        # ook als hij (bijna) nul is. Anders houden restored rows uit backfill_missing_rows.py
+        # een NULL die suggereert dat we het niet weten.
+        if curr["cost_e"] is None or abs(new_elec - old_elec) > 0.001:
             elec_updates.append((new_elec, curr["id"]))
-        if abs(new_gas - old_gas) > 0.001:
+        if curr["cost_g"] is None or abs(new_gas - old_gas) > 0.001:
             gas_updates.append((new_gas, curr["id"]))
 
     conn2.close()
