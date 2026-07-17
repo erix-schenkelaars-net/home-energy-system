@@ -28,7 +28,11 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `p1_gas_total_m3`                     double       DEFAULT NULL COMMENT 'Cumulative gas counter m3',
   `p1_power_export_w`                   double       DEFAULT NULL COMMENT 'Smoothed export power W',
   `p1_power_import_w`                   double       DEFAULT NULL COMMENT 'Smoothed import power W',
-  `resol_error_code`                    smallint(6)  DEFAULT NULL,
+  -- Resol Fehlermaske: a 31-bit bitmask (packet 0x7E11, payload offset 96..99), so it needs
+  -- an int, not a smallint. It was smallint until 2026-07-17 and held 0 in all 45796 rows --
+  -- partly because read_resol dropped any row with a non-zero mask, and partly because a real
+  -- mask could not physically fit. RESOL does not publish the bit layout.
+  `resol_error_code`                    int(10) unsigned DEFAULT NULL COMMENT 'Resol Fehlermaske (31-bit bitmask, packet 0x7E11 offset 96)',
   `resol_relay_1`                       tinyint(4)   DEFAULT NULL COMMENT '% solar collector pump',
   `resol_relay_2`                       tinyint(4)   DEFAULT NULL COMMENT '% 3-way valve glycol',
   `resol_relay_3`                       tinyint(4)   DEFAULT NULL COMMENT '% wood gasifier pump',

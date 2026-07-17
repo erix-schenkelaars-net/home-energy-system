@@ -534,10 +534,8 @@ def parsestream(data):
                     usefulldata = ret
 
     if not usefulldata:
-        # Second silent skip path: no packet this cycle parsed into anything usable, so there is
-        # nothing to store. Log it -- this used to return without a trace, which made a missing
-        # row indistinguishable from a row that was never attempted.
-        dbg(1, "PARSER", "No usable payload this cycle -- nothing stored")
+        # Normal path, not an error: parsestream() runs per socket chunk and most chunks carry
+        # other packets than the 0x7E11 we want. Do not log here -- it fires ~10x per cycle.
         return True
 
     saveinErixDB(usefulldata)
