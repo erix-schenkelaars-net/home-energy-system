@@ -42,6 +42,17 @@ os.environ.update({
 for _m in ("requests", "dotenv", "eccodes", "mysql", "mysql.connector"):
     sys.modules.setdefault(_m, MagicMock())
 
+
+# requests is stubbed, so give it a real exception class — `except requests.HTTPError` cannot
+# catch a MagicMock.
+class _HTTPError(Exception):
+    def __init__(self, msg="", response=None):
+        super().__init__(msg)
+        self.response = response
+
+
+sys.modules["requests"].HTTPError = _HTTPError
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  Import
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,6 +308,39 @@ class TestStore(unittest.TestCase):
     def test_it_commits(self):
         _, _, conn = self._store([(dt.datetime(2026, 7, 16, 12, 15), 1000.0)])
         conn.commit.assert_called_once()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# H.  cycle() — every failure must stay inside the loop
+# ══════════════════════════════════════════════════════════════════════════════
+class TestCycleContainsFailures(unittest.TestCase):
+    """Regression: latest_filename() sat outside the try, so a 429 escaped cycle(), killed the
+    process, and docker restarted it — main() fetches before its first sleep, so that retry drew
+    another 429. A self-reinforcing crash loop (60 restarts on 2026-07-18)."""
+
+    def test_a_rate_limit_does_not_escape(self):
+        resp = MagicMock(); resp.status_code = 429
+        err = _HTTPError("429 Too Many Requests", response=resp)
+        with patch.object(mod, "latest_filename", side_effect=err):
+            mod.cycle()          # must return normally
+
+    def test_a_listing_failure_does_not_escape(self):
+        with patch.object(mod, "latest_filename", side_effect=RuntimeError("boom")):
+            mod.cycle()
+
+    def test_a_download_failure_does_not_escape(self):
+        with patch.object(mod, "latest_filename", return_value="f.grb2"), \
+             patch.object(mod, "download", side_effect=RuntimeError("boom")):
+            mod.cycle()
+
+    def test_an_empty_listing_does_not_escape(self):
+        with patch.object(mod, "latest_filename", return_value=None):
+            mod.cycle()
+
+    def test_a_non_429_http_error_does_not_escape(self):
+        resp = MagicMock(); resp.status_code = 500
+        with patch.object(mod, "latest_filename", side_effect=_HTTPError("500", response=resp)):
+            mod.cycle()
 
 
 if __name__ == "__main__":

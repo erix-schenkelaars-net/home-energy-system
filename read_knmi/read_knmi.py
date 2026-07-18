@@ -225,12 +225,17 @@ def cycle():
     if not KNMI_API_KEY:
         log.error("KNMI_API_KEY not set in .env — cannot fetch")
         return
-    fn = latest_filename()
-    if not fn:
-        log.warning("No nowcast files listed")
-        return
-    tmp = f"/tmp/{fn}"
+    # Everything network-facing lives inside the try: latest_filename() used to sit outside it, so
+    # a failure there escaped cycle() and killed the process. Docker restarted it, main() fetches
+    # immediately before its first sleep, and that retry drew another 429 -- a self-reinforcing
+    # crash loop that made the rate limiting worse (60 restarts on 2026-07-18).
+    tmp = None
     try:
+        fn = latest_filename()
+        if not fn:
+            log.warning("No nowcast files listed")
+            return
+        tmp = f"/tmp/{fn}"
         download(fn, tmp)
         run_dt, slots = parse(tmp)
         conn = _db()
@@ -244,11 +249,22 @@ def cycle():
                  _to_local(slots[0][0]).strftime("%H:%M"),
                  _to_local(slots[-1][0]).strftime("%H:%M"),
                  slots[0][1], slots[-1][1], fn)
+    except requests.HTTPError as exc:
+        code = exc.response.status_code if exc.response is not None else None
+        if code == 429:
+            # Expected and self-correcting: KNMI rate-limits the key (the anonymous one is shared
+            # with everyone using it). Nothing downstream needs this particular run -- every run is
+            # kept separately and consumers take the newest per slot -- so skip and wait it out.
+            log.warning("KNMI rate limit (429) — skipping this run, next attempt in %d min",
+                        FETCH_MINUTES)
+        else:
+            log.error("cycle failed: %s", exc, exc_info=True)
     except Exception as exc:
         log.error("cycle failed: %s", exc, exc_info=True)
     finally:
-        try: os.remove(tmp)
-        except OSError: pass
+        if tmp:
+            try: os.remove(tmp)
+            except OSError: pass
 
 
 def main():
