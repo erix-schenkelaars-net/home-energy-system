@@ -259,5 +259,41 @@ class TestSaveinErixDB(unittest.TestCase):
             mod.saveinErixDB(self._full_data())   # must not raise
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# E.  _accept_reading() — reject a misaligned reading and re-read, bounded
+# ══════════════════════════════════════════════════════════════════════════════
+class TestAcceptReading(unittest.TestCase):
+
+    def setUp(self):
+        mod._reread_count = 0          # fresh budget, as login() sets each cycle
+
+    def test_a_clean_reading_is_accepted(self):
+        self.assertTrue(mod._accept_reading({"errmsk": 0, "temp1": 20.0}))
+        self.assertEqual(mod._reread_count, 0)   # a good reading spends no budget
+
+    def test_a_misaligned_reading_is_rejected(self):
+        self.assertFalse(mod._accept_reading({"errmsk": 25559808}))
+        self.assertEqual(mod._reread_count, 1)
+
+    def test_it_gives_up_after_max_rereads_and_stores_the_bad_one(self):
+        """The bound: reject MAX_REREADS times, then accept so a persistent fault is not a loop."""
+        bad = {"errmsk": 25559808}
+        rejected = sum(0 if mod._accept_reading(bad) else 1 for _ in range(mod.MAX_REREADS + 3))
+        self.assertEqual(rejected, mod.MAX_REREADS)          # exactly the budget is spent
+        self.assertTrue(mod._accept_reading(bad))            # and beyond it, the bad one is kept
+
+    def test_a_missing_errmsk_is_treated_as_clean(self):
+        """A parse with no mask field must not be mistaken for misaligned and re-read forever."""
+        self.assertTrue(mod._accept_reading({"temp1": 20.0}))
+        self.assertEqual(mod._reread_count, 0)
+
+    def test_the_budget_resets_when_reset(self):
+        for _ in range(mod.MAX_REREADS):
+            mod._accept_reading({"errmsk": 1})
+        self.assertEqual(mod._reread_count, mod.MAX_REREADS)
+        mod._reread_count = 0                                # what login() does per cycle
+        self.assertFalse(mod._accept_reading({"errmsk": 1})) # budget is available again -> rejects
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

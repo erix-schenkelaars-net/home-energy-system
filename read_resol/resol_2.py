@@ -84,6 +84,15 @@ VBUS_PASSWORD = os.environ["VBUS_PASSWORD"]
 
 sock = None
 
+# Occasionally a reading comes back misaligned: the payload is shifted a few bytes, so the
+# error-mask position (offset 96) holds temperature data and errmsk != 0. It is always transient
+# -- every bad reading is flanked by good ones 5 min away -- and the controller re-broadcasts the
+# packet ~every second. So a bad reading is rejected and the stream is read on for the next
+# broadcast, up to MAX_REREADS times. Only if it stays bad that many times in a row do we store it
+# anyway (errmsk recorded, sensor values NULL), so a genuinely persistent fault is not hidden.
+MAX_REREADS   = 5
+_reread_count = 0
+
 # --------------------------------------------------
 # TIMER (exact 5-minute alignment)
 # --------------------------------------------------
@@ -343,6 +352,8 @@ def send_to_mqtt_server(data):
 # LOGIN
 # --------------------------------------------------
 def login():
+    global _reread_count
+    _reread_count = 0          # fresh re-read budget for this 5-minute cycle
     dat = recv()
     if dat != "+HELLO\n":
         dbg(1, "LOGIN", "No HELLO received")
@@ -493,6 +504,23 @@ def parsepayload(payload):
 # STREAM PARSER
 # ==================================================
 
+def _accept_reading(ret):
+    """Whether to store a parsed reading, or reject it as misaligned and re-read.
+
+    A non-zero error mask means the payload is shifted (temperatures sit in the mask position),
+    which is always transient. Reject it -- returning False makes parsestream read on to the next
+    broadcast -- for up to MAX_REREADS rejections per cycle. After that, accept it anyway so a
+    genuinely persistent fault is stored (errmsk recorded, sensor values NULL) instead of looping.
+    """
+    global _reread_count
+    if ret.get("errmsk", 0) != 0 and _reread_count < MAX_REREADS:
+        _reread_count += 1
+        dbg(1, "PARSER", f"Misaligned reading rejected (errmsk={ret['errmsk']}), "
+                         f"re-reading {_reread_count}/{MAX_REREADS}")
+        return False
+    return True
+
+
 def parsestream(data):
     dbg(3, "PARSER", "Parsing stream chunk")
 
@@ -543,7 +571,7 @@ def parsestream(data):
 
                 ret = parsepayload(payload)
 
-                if ret is not None:
+                if ret is not None and _accept_reading(ret):
                     usefulldata = ret
 
     if not usefulldata:
@@ -573,6 +601,10 @@ while True:
 
     # Create socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Bound connect and every recv(). The adapter streams continuously so this never fires in
+    # normal operation, but it stops a stalled stream from hanging the re-read loop forever; a
+    # timeout just raises, is caught below, and the cycle is retried on the next 5-minute tick.
+    sock.settimeout(30)
 
     dbg(1, "SOCKET", "Connecting...")
 
