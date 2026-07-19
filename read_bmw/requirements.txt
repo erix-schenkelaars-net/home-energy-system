@@ -1,3 +1,4 @@
 requests
 paho-mqtt>=2.0
 python-dotenv
+mysql-connector-python

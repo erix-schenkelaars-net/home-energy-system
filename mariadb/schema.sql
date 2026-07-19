@@ -16,6 +16,15 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `ts`                                  datetime     NOT NULL,
   `cost_elec_var_eur`                   double       DEFAULT NULL COMMENT 'Variabele stroomkost interval (EUR)',
   `cost_gas_var_eur`                    double       DEFAULT NULL COMMENT 'Variabele gaskost interval (EUR)',
+  -- BMW (read_bmw, since 2026-07-19). The SoC is the REST poll value, not the streaming one:
+  -- vehicle.powertrain.electric.battery.stateOfCharge.displayed carries a decimal but only
+  -- arrives in the burst the car sends on parking or waking (4 samples in 6 days), where the
+  -- REST poll delivers every 30 min. bmw_ev_start_dt is the *resolved* cheapest charge start,
+  -- computed in read_bmw so the dashboard reads an answer instead of re-deriving the search.
+  `bmw_soc_pct`                         decimal(5,2) DEFAULT NULL COMMENT 'BMW battery SoC % (REST poll)',
+  `bmw_range_km`                        smallint(6)  DEFAULT NULL COMMENT 'BMW remaining electric range km',
+  `bmw_connector_status`                varchar(24)  DEFAULT NULL COMMENT 'BMW charge connector CONNECTED/DISCONNECTED',
+  `bmw_ev_start_dt`                     datetime     DEFAULT NULL COMMENT 'Planned cheapest EV charge start',
   `p1_electricity_today_kwh`            double       DEFAULT NULL,
   `p1_energy_export_high_kwh`           double       DEFAULT NULL COMMENT 'Cumulative export tariff 2 (high) kWh',
   `p1_energy_export_low_kwh`            double       DEFAULT NULL COMMENT 'Cumulative export tariff 1 (low) kWh',

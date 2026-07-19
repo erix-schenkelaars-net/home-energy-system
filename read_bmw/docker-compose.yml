@@ -9,5 +9,6 @@ services:
     env_file:
       - ../.env
     volumes:
+      - ../common:/app/common:ro
       - ./bmw_tokens.json:/app/bmw_tokens.json
       - ./logs:/logs

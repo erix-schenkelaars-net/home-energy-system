@@ -30,6 +30,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import signal
@@ -42,7 +43,14 @@ from pathlib import Path
 
 import requests
 import paho.mqtt.client as mqtt
+import mysql.connector
 from dotenv import load_dotenv
+
+# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -58,6 +66,22 @@ MQTT_BROKER   = os.environ["MQTT_BROKER"]
 MQTT_PORT     = int(os.environ.get("MQTT_PORT", 1883))
 MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
+
+DB_HOST     = os.environ.get("DB_HOST", "localhost")
+DB_USER     = os.environ.get("DB_USER", "")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+DB_NAME     = os.environ.get("DB_NAME", "")
+
+# EV charge planning. The battery figure is the gross pack; note that the car itself reports
+# vehicle.drivetrain.batteryManagement.maxEnergy = 3.86 kWh at 70.1% SoC, implying ~5.5 kWh
+# usable. Sizing the window off 7.7 therefore books more slots than the charge needs, which is
+# safe (it starts earlier, never later) but not optimal. Left at the value the container
+# dashboard has always used so this port does not silently change behaviour.
+EV_READY_BY_HOUR   = int(os.environ.get("EV_READY_BY_HOUR", 9))
+EV_TARGET_SOC_PCT  = float(os.environ.get("EV_TARGET_SOC_PCT", 100.0))
+EV_BATTERY_KWH     = float(os.environ.get("EV_BATTERY_KWH", 7.7))
+EV_CHARGE_POWER_KW = float(os.environ.get("EV_CHARGE_POWER_KW", 2.3))
+EV_SLOT_H          = 0.25        # the price table is quarter-hourly
 
 BMW_MQTT_HOST      = "customer.streaming-cardata.bmwgroup.com"
 BMW_MQTT_PORT      = 9000
@@ -739,9 +763,130 @@ def fetch_rest_state(local: mqtt.Client):
                 log.info(f"  BMW field: {dk.split('.')[-1]:30s} = NOT IN RESPONSE")
 
         _on_bmw_message(local, f"rest/{BMW_VIN}", {"vin": BMW_VIN, "data": data})
+        save_to_energy(data)
 
     except Exception as e:
         log.error(f"REST state fetch failed: {e}")
+
+
+# ── SoC + EV start to the database ────────────────────────────────────────────
+#
+# The WordPress dashboard reads the resolved answer out of `energy` rather than re-deriving it,
+# so the charge-window search lives here. The Flask container dashboard still computes its own
+# copy over MQTT; the two agree because this is a faithful port, but that duplication is the
+# thing to remove once the container version is retired.
+
+_REST_SOC_KEY       = "vehicle.drivetrain.electricEngine.charging.level"
+_REST_CONNECTOR_KEY = "vehicle.drivetrain.electricEngine.charging.connectorStatus"
+_REST_RANGE_KEY     = "vehicle.drivetrain.electricEngine.remainingElectricRange"
+
+
+def compute_ev_start(soc, prices, now=None):
+    """The cheapest contiguous charge window that still finishes by EV_READY_BY_HOUR.
+
+    `prices` maps a quarter-hour index (0..191, counted from midnight *today*) to €/kWh, so a
+    deadline already passed today rolls into tomorrow by adding 96. Returns the slot index to
+    start at, or the current slot when charging must start now to make the deadline at all.
+    Returns None when the SoC is unknown -- a missing reading must not look like "charge now".
+    """
+    if soc is None:
+        return None
+    now = now or datetime.now()
+    cur_slot = now.hour * 4 + now.minute // 15
+
+    need      = max(0.0, (EV_TARGET_SOC_PCT - soc) / 100 * EV_BATTERY_KWH)
+    num_slots = math.ceil(need / (EV_CHARGE_POWER_KW * EV_SLOT_H))
+
+    dl_slot = EV_READY_BY_HOUR * 4
+    if cur_slot >= dl_slot:
+        dl_slot += 96                      # deadline is tomorrow morning
+    must = dl_slot - num_slots
+
+    if num_slots == 0 or cur_slot >= must:
+        return cur_slot                    # already full, or no slack left to shop around
+
+    best, bestc = must, float("inf")
+    for s in range(cur_slot, must + 1):
+        window = range(s, s + num_slots)
+        if not all(slot in prices for slot in window):
+            continue                       # never plan across a hole in the price table
+        c = sum(prices[slot] for slot in window)
+        if c < bestc:
+            bestc, best = c, s
+    return best
+
+
+def _slot_to_datetime(slot, now=None):
+    """Turn a quarter-hour index counted from midnight today into a wall-clock datetime."""
+    if slot is None:
+        return None
+    now = now or datetime.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight + timedelta(minutes=15 * slot)
+
+
+def _fetch_prices(cur):
+    """Quarter-hour prices from the optimizer's schedule, newest plan per slot."""
+    cur.execute(
+        "SELECT slot_dt, price_eur_kwh FROM battery_schedule "
+        "WHERE slot_dt >= CURDATE() AND slot_dt < NOW() + INTERVAL 48 HOUR "
+        "ORDER BY slot_dt ASC, created_at DESC"
+    )
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    prices = {}
+    for slot_dt, price in cur.fetchall():
+        idx = int((slot_dt - midnight).total_seconds() // 900)
+        if idx not in prices:              # ORDER BY created_at DESC -> first row wins
+            prices[idx] = float(price or 0)
+    return prices
+
+
+def _to_float(entry):
+    """REST values arrive as strings ('70'); a missing or unparsable one must stay None."""
+    if not isinstance(entry, dict):
+        return None
+    try:
+        return float(entry.get("value"))
+    except (TypeError, ValueError):
+        return None
+
+
+def save_to_energy(data):
+    """Store SoC, range, connector and the planned EV start on this 5-minute bucket.
+
+    Uses the REST values, not the streaming ones: vehicle.powertrain...stateOfCharge.displayed
+    carries a decimal but only arrives in the burst the car sends when it parks or wakes -- 4
+    samples in 6 days against ~90 REST polls a day. A tile fed from that would sit stale for
+    days. See common/energy_row.py for why this is an upsert on the bucket and not an UPDATE.
+    """
+    soc       = _to_float(data.get(_REST_SOC_KEY))
+    range_km  = _to_float(data.get(_REST_RANGE_KEY))
+    connector = (data.get(_REST_CONNECTOR_KEY) or {}).get("value")
+
+    if soc is None:
+        log.warning("REST poll carried no SoC -- not writing a row")
+        return
+
+    db = cur = None
+    try:
+        db  = mysql.connector.connect(host=DB_HOST, user=DB_USER,
+                                      passwd=DB_PASSWORD, database=DB_NAME)
+        cur = db.cursor()
+
+        ev_start = _slot_to_datetime(compute_ev_start(soc, _fetch_prices(cur)))
+
+        cols = ["bmw_soc_pct", "bmw_range_km", "bmw_connector_status", "bmw_ev_start_dt"]
+        cur.execute(er.upsert_sql(cols),
+                    (er.bucket(), soc, range_km, connector, ev_start))
+        db.commit()
+        log.info("Stored SoC %.1f%% range %s km connector %s, EV start %s",
+                 soc, range_km, connector,
+                 ev_start.strftime("%H:%M") if ev_start else "n/a")
+    except mysql.connector.Error as err:
+        log.error("DB write failed: %s", err)
+    finally:
+        if cur: cur.close()
+        if db:  db.close()
 
 
 def _check_vehicle_mapping():
