@@ -98,6 +98,16 @@ sock = None
 MAX_REREADS   = 5
 _reread_count = 0
 
+# If a cycle still ends up with a misaligned reading, reconnect and read the controller again a
+# few seconds later instead of waiting out the full 5 minutes. This is cheap because the row is
+# upserted on its own 5-minute bucket (see saveinErixDB): a retry at :05 lands in the same bucket
+# as the bad reading at :00 and simply overwrites it, so a rescued cycle leaves no trace and a
+# failed one leaves exactly the honest NULL row it would have left anyway. A fresh socket also
+# clears any desync in the session itself, which re-reading the same stream cannot.
+RETRY_SECONDS     = 5
+MAX_CYCLE_RETRIES = 3
+_cycle_healthy    = False
+
 # --------------------------------------------------
 # TIMER (exact 5-minute alignment)
 # --------------------------------------------------
@@ -179,8 +189,10 @@ def saveinErixDB(data):
     Now: the error code is always recorded, and the sensor readings are only stored when the
     controller says they are trustworthy. A fault leaves them NULL -- visible, not invisible.
     """
+    global _cycle_healthy
     errmsk  = data.get("errmsk")     # None when the payload did not parse into an error mask
     healthy = (errmsk == 0)
+    _cycle_healthy = healthy         # tells the main loop whether this cycle is worth retrying
     i = datetime.now()
 
     if healthy:
@@ -605,6 +617,17 @@ def parsestream(data):
     return False
 
 
+def _should_retry_cycle(healthy, attempt):
+    """Whether to reconnect and read again after a cycle, rather than wait for the next tick.
+
+    Bounded twice over: only a misaligned reading is worth retrying, and only MAX_CYCLE_RETRIES
+    times. At RETRY_SECONDS apart the whole ladder finishes well inside the 5-minute bucket the
+    row is keyed on, so a rescued reading still overwrites the bad one instead of landing in the
+    next interval.
+    """
+    return not healthy and attempt < MAX_CYCLE_RETRIES
+
+
 # ==================================================
 # MAIN LOOP (runs every 5 minutes)
 # ==================================================
@@ -616,40 +639,51 @@ while True:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     dbg(1, "MAIN", f" -- Starting execution at {now_str} -- ")
 
-    # Create socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Bound connect and every recv(). The adapter streams continuously so this never fires in
-    # normal operation, but it stops a stalled stream from hanging the re-read loop forever; a
-    # timeout just raises, is caught below, and the cycle is retried on the next 5-minute tick.
-    sock.settimeout(30)
+    for attempt in range(MAX_CYCLE_RETRIES + 1):
+        _cycle_healthy = False
 
-    dbg(1, "SOCKET", "Connecting...")
+        # Create socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Bound connect and every recv(). The adapter streams continuously so this never fires in
+        # normal operation, but it stops a stalled stream from hanging the re-read loop forever; a
+        # timeout just raises, is caught below, and the cycle is retried on the next 5-minute tick.
+        sock.settimeout(30)
 
-    host = VBUS_HOST
-    port = VBUS_PORT
-    VBUS_ADDR = (host, port)
+        dbg(1, "SOCKET", "Connecting...")
 
-    try:
-        sock.connect(VBUS_ADDR)
-        dbg(1, "SOCKET", f"Connected to {VBUS_ADDR}")
-        dbg(3, "SOCKET", f"Socket info: {sock}")
+        host = VBUS_HOST
+        port = VBUS_PORT
+        VBUS_ADDR = (host, port)
 
-        # Login & get data
-        login()
-
-    except Exception as e:
-        dbg(1, "SOCKET", f"Connection failed: {e}")
-
-    finally:
-        # Close socket safely
-        dbg(1, "SOCKET", "Killing socket...")
         try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        sock.close()
-        sock = None
-        dbg(1, "SOCKET", "Dead :-(")
+            sock.connect(VBUS_ADDR)
+            dbg(1, "SOCKET", f"Connected to {VBUS_ADDR}")
+            dbg(3, "SOCKET", f"Socket info: {sock}")
+
+            # Login & get data
+            login()
+
+        except Exception as e:
+            dbg(1, "SOCKET", f"Connection failed: {e}")
+
+        finally:
+            # Close socket safely
+            dbg(1, "SOCKET", "Killing socket...")
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            sock.close()
+            sock = None
+            dbg(1, "SOCKET", "Dead :-(")
+
+        if not _should_retry_cycle(_cycle_healthy, attempt):
+            break
+
+        dbg(1, "MAIN", f"Misaligned reading -- reconnecting in {RETRY_SECONDS}s "
+                       f"({attempt + 1}/{MAX_CYCLE_RETRIES}); the retry upserts the same "
+                       f"5-minute bucket, so a good read still replaces the bad row")
+        time.sleep(RETRY_SECONDS)
 
     dbg(1, "MAIN", f" -- Finished execution at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} -- ")
 

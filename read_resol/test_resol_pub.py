@@ -336,5 +336,34 @@ class TestCarryTail(unittest.TestCase):
         self.assertEqual(mod._carry_tail(f"{self.A}whole{self.A}"), self.A)
 
 
+class TestShouldRetryCycle(unittest.TestCase):
+    """A misaligned cycle reconnects seconds later instead of waiting out the 5-minute tick.
+
+    Safe only because the row is upserted on its own bucket: a retry at :05 overwrites the bad
+    reading from :00 rather than writing a second row or landing in the next interval.
+    """
+
+    def test_a_healthy_cycle_is_not_retried(self):
+        self.assertFalse(mod._should_retry_cycle(True, 0))
+
+    def test_a_misaligned_cycle_is_retried(self):
+        self.assertTrue(mod._should_retry_cycle(False, 0))
+
+    def test_the_retries_are_bounded(self):
+        self.assertTrue(mod._should_retry_cycle(False, mod.MAX_CYCLE_RETRIES - 1))
+        self.assertFalse(mod._should_retry_cycle(False, mod.MAX_CYCLE_RETRIES))
+
+    def test_the_whole_ladder_fits_inside_one_bucket(self):
+        """If the retries could outlast the 5-minute bucket, a rescued reading would overwrite
+        the *next* interval instead of the bad one -- the exact class of bug this repo has paid
+        for before. Leave generous room for the reconnect and re-read of each attempt."""
+        self.assertLess(mod.MAX_CYCLE_RETRIES * mod.RETRY_SECONDS, 60)
+
+    def test_a_failed_connection_is_retried_too(self):
+        """A cycle that never reached saveinErixDB leaves the flag False, so a dropped connection
+        gets another go in seconds rather than costing the whole interval."""
+        self.assertTrue(mod._should_retry_cycle(False, 0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
