@@ -295,5 +295,46 @@ class TestAcceptReading(unittest.TestCase):
         self.assertFalse(mod._accept_reading({"errmsk": 1})) # budget is available again -> rejects
 
 
+class TestCarryTail(unittest.TestCase):
+    """The read loop must hand parsestream() new bytes, not the ones it already judged.
+
+    Regression: login() used to do `buf += recv()`, so parsestream() -- which always starts at the
+    front of the buffer -- kept re-finding the packet it had just rejected. All five re-reads were
+    spent on one stale packet inside a single second, and no fresh broadcast was ever examined.
+    """
+
+    A = chr(0xAA)
+
+    def test_it_keeps_only_the_trailing_partial_message(self):
+        buf = f"{self.A}first{self.A}second{self.A}partial"
+        self.assertEqual(mod._carry_tail(buf), f"{self.A}partial")
+
+    def test_the_rejected_packet_is_not_offered_again(self):
+        """The actual bug: after a bad packet, the next parse must not contain it."""
+        buf = f"{self.A}BADPACKET{self.A}tail"
+        self.assertNotIn("BADPACKET", mod._carry_tail(buf) + "NEWDATA")
+
+    def test_it_restores_the_separator_split_ate(self):
+        """parsestream() does split(0xAA)[1:-1]; without a leading 0xAA the carried message is
+        the discarded first fragment and the re-read silently loses a broadcast."""
+        carried = mod._carry_tail(f"{self.A}done{self.A}partial")
+        nxt     = carried + f"complete{self.A}next{self.A}"
+        self.assertEqual(nxt.split(self.A)[1:-1], ["partialcomplete", "next"])
+
+    def test_the_buffer_stops_growing(self):
+        """Over a cycle of re-reads the buffer must stay bounded, not accumulate every broadcast."""
+        buf = f"{self.A}start"
+        for _ in range(50):
+            buf = mod._carry_tail(buf) + f"msg{self.A}rest"
+        self.assertLess(len(buf), 40)
+
+    def test_a_buffer_without_a_separator_is_carried_whole(self):
+        """A chunk that splits mid-message must not be thrown away."""
+        self.assertEqual(mod._carry_tail("halfmessage"), f"{self.A}halfmessage")
+
+    def test_a_buffer_ending_on_a_separator_carries_nothing_but_the_separator(self):
+        self.assertEqual(mod._carry_tail(f"{self.A}whole{self.A}"), self.A)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

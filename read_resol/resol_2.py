@@ -90,6 +90,11 @@ sock = None
 # packet ~every second. So a bad reading is rejected and the stream is read on for the next
 # broadcast, up to MAX_REREADS times. Only if it stays bad that many times in a row do we store it
 # anyway (errmsk recorded, sensor values NULL), so a genuinely persistent fault is not hidden.
+#
+# For that to mean anything, each re-read has to see a *new* broadcast. The read loop used to grow
+# one buffer (buf += recv()) and hand the whole thing back to parsestream(), which starts at the
+# front every time -- so all MAX_REREADS rejections landed on the same stale packet, inside the
+# same second, and the budget was spent without ever looking at fresh data. See _carry_tail().
 MAX_REREADS   = 5
 _reread_count = 0
 
@@ -377,7 +382,7 @@ def login():
 
     buf = recv()
     while parsestream(buf):
-        buf += recv()
+        buf = _carry_tail(buf) + recv()
 
 
 def parsepayload(payload):
@@ -503,6 +508,18 @@ def parsepayload(payload):
 # ==================================================
 # STREAM PARSER
 # ==================================================
+
+def _carry_tail(buf):
+    """Drop everything already handed to parsestream(), keeping only the trailing partial message.
+
+    parsestream() splits on 0xAA and discards the first and last fragment, so the bytes after the
+    last 0xAA are the one message it has not seen in full yet. Carrying just those forward (with
+    the 0xAA restored, since split() ate it) means the next parse works on genuinely new data:
+    a rejected packet is gone, and a re-read really is the next broadcast rather than a re-parse
+    of the one we already turned down.
+    """
+    return chr(0xAA) + buf.split(chr(0xAA))[-1]
+
 
 def _accept_reading(ret):
     """Whether to store a parsed reading, or reject it as misaligned and re-read.
