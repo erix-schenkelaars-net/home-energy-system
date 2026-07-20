@@ -337,5 +337,65 @@ class TestReadTodayEnergy(unittest.TestCase):
         self.assertEqual(dis, 0.0)
 
 
+class TestCheckCellFrame(unittest.TestCase):
+    """One corrupt poll must not reach the database.
+
+    update_db() folds every poll into the five-minute bucket with LEAST(), so a single frame
+    reading 115 mV low pins that bucket's minimum permanently -- in the very columns the cell
+    ageing baseline is measured from. Seen three times between 17 and 20 July 2026, each time as
+    a contiguous tail of the 16-cell block, each time with the max registers of every cell normal.
+    """
+
+    FLAT = [3278] * 16                       # a quiet pack, all cells together
+
+    def test_the_first_frame_is_accepted(self):
+        """Nothing to compare against yet -- refusing here would stall the reader at startup."""
+        ok, why = mod.check_cell_frame(self.FLAT, None, -4.0, 0.0, 0)
+        self.assertTrue(ok)
+        self.assertIsNone(why)
+
+    def test_normal_drift_is_accepted(self):
+        now = [v - 3 for v in self.FLAT]
+        self.assertTrue(mod.check_cell_frame(now, self.FLAT, -4.0, -4.0, 0)[0])
+
+    def test_the_real_20_july_frame_is_rejected(self):
+        """Measured at 04:30: cells 10-16 read 3163 mV while 1-9 held at 3278, current steady."""
+        now = [3278] * 9 + [3163] * 6 + [3161]
+        ok, why = mod.check_cell_frame(now, self.FLAT, -3.9, -4.1, 0)
+        self.assertFalse(ok)
+        self.assertIn("mV in one poll", why)
+
+    def test_the_real_19_july_frame_is_rejected(self):
+        """06:00: the tail was only three cells long, and 124 mV instead of 115."""
+        now = [3181] * 13 + [3060, 3060, 3057]
+        self.assertFalse(mod.check_cell_frame(now, [3181] * 16, -5.8, -5.5, 0)[0])
+
+    def test_a_load_step_is_let_through(self):
+        """Current moved, so the cells had every reason to move with it. Rejecting a real IR
+        response would blind the taper exactly when the pack is working hardest."""
+        now = [v - 100 for v in self.FLAT]
+        self.assertTrue(mod.check_cell_frame(now, self.FLAT, -60.0, -4.0, 0)[0])
+
+    def test_a_persistent_fault_is_only_delayed(self):
+        """After the budget the frame is accepted, so a real sudden fault still reaches the
+        alarms and the taper -- a few seconds late, never suppressed."""
+        now = [3278] * 15 + [3100]
+        self.assertFalse(mod.check_cell_frame(now, self.FLAT, -4.0, -4.0, 0)[0])
+        ok, why = mod.check_cell_frame(now, self.FLAT, -4.0, -4.0, mod.MAX_CELL_REJECTS)
+        self.assertTrue(ok)
+        self.assertEqual(why, "budget exhausted")
+
+    def test_a_genuine_gradual_spread_is_accepted(self):
+        """Real divergence builds over many polls, so no single step is large. This is the case
+        the guard must never touch: 60 mV of spread at low SoC is normal for this pack."""
+        now = [3050 + 4 * i for i in range(16)]
+        self.assertTrue(mod.check_cell_frame(now, now, -10.0, -10.0, 0)[0])
+
+    def test_a_changed_cell_count_is_accepted(self):
+        """A short or padded frame is somebody else's problem -- this guard compares like for
+        like and must not throw on a length it did not expect."""
+        self.assertTrue(mod.check_cell_frame([3278] * 16, [3278] * 8, -4.0, -4.0, 0)[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

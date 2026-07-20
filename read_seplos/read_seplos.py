@@ -69,6 +69,22 @@ VMIN_TAPER_START_MV = 3120     # mV - begin voltage discharge taper. Must stay b
                                #      measured), else it fires every cycle at ~0% throttle.
 VMIN_TAPER_END_MV = 2950       # mV - hard discharge floor (0 A)
 
+# Cell-frame plausibility. Three times between 17 and 20 July a single poll came back with a
+# contiguous *tail* of the 16-cell block (cells 7-16, 14-16, 10-16 -- a different length each time)
+# reading ~115 mV low, while the max registers of every cell stayed normal. Sixteen cells in series
+# carry the same current, so an identical step across an adjacent block while the others hold still
+# is not physically possible; and the frames pass CRC, so nothing was logged. The damage is to the
+# record rather than the pack: update_db() folds each poll in with LEAST(), so one bad poll pins the
+# five-minute bucket's minimum for good -- in exactly the columns the cell-ageing baseline rests on.
+#
+# The guard is a rate limit, not a shape test: without a change in current a cell cannot move this
+# far in one poll interval, because there is no IR term to move it. A real load step is allowed
+# through by the current tolerance, and a genuinely sudden cell fault is only delayed, never hidden,
+# by MAX_CELL_REJECTS.
+CELL_STEP_MAX_MV       = 80    # mV - largest believable move for one cell between polls (~2 s)
+CELL_STEP_CURRENT_TOL_A = 5.0  # A  - above this change in pack current, the move may well be real
+MAX_CELL_REJECTS       = 5     # polls - after this many in a row, accept anyway and let it be seen
+
 VDELTA_TAPER_START_MV = 25     # mV - begin reducing discharge when cells diverge
 VDELTA_TAPER_END_MV   = 35     # mV - discharge = 0A (well below EVE MB31 BMS intervention ~100 mV)
 
@@ -263,6 +279,41 @@ def linear_taper(value, start, end, limit_high, limit_low):
         return limit_low
     ratio = (value - start) / (end - start)
     return limit_high - ratio * (limit_high - limit_low)
+
+
+def check_cell_frame(cell_v, prev_cell_v, current_a, prev_current_a, reject_count):
+    """Whether a 16-cell voltage frame is believable, given the one before it.
+
+    Returns (accept, reason). `reason` is None when the frame is accepted; otherwise it is a
+    short string naming the worst offender, for the log.
+
+    Rejects a frame in which any cell moved more than CELL_STEP_MAX_MV since the previous
+    accepted frame while the pack current barely changed. Cells only move that fast because
+    current moved -- so if it did (more than CELL_STEP_CURRENT_TOL_A), the frame is let through
+    even if it looks dramatic.
+
+    After MAX_CELL_REJECTS consecutive rejections the frame is accepted regardless: a fault that
+    persists is real and must reach the database, alarms and taper. This only ever costs a few
+    seconds of delay on something genuine, and it stops one corrupt poll from pinning the
+    five-minute minimum.
+    """
+    if prev_cell_v is None or len(cell_v) != len(prev_cell_v):
+        return True, None                      # nothing to compare against yet
+    if reject_count >= MAX_CELL_REJECTS:
+        return True, "budget exhausted"        # persistent -> treat as real
+
+    if abs(current_a - prev_current_a) > CELL_STEP_CURRENT_TOL_A:
+        return True, None                      # a load step explains a big move
+
+    worst_i, worst_d = None, 0.0
+    for i, (now, was) in enumerate(zip(cell_v, prev_cell_v)):
+        d = abs(now - was)
+        if d > worst_d:
+            worst_i, worst_d = i + 1, d
+    if worst_d > CELL_STEP_MAX_MV:
+        return False, (f"cell {worst_i} moved {worst_d:.0f} mV in one poll at "
+                       f"{current_a:.1f} A (was {prev_current_a:.1f} A)")
+    return True, None
 
 
 def calculate_dynamic_limits(soc, vmin_mv, vmax_mv, vdiff_mv, tmax, tmin):
@@ -761,6 +812,9 @@ def main():
         vdelta_window = deque(maxlen=TAPER_DEBOUNCE)  # last N vdelta readings
         vmin_window   = deque(maxlen=TAPER_DEBOUNCE)  # last N vmin readings
         rest_count    = 0   # consecutive readings with |I| < REST_CURRENT_A
+        prev_cell_v    = None   # last accepted cell frame, for the plausibility guard
+        prev_current_a = 0.0
+        cell_rejects   = 0      # consecutive rejected frames
         while True:
             pia = safe_modbus_read(ser, 0x1000, 18)
             pib = safe_modbus_read(ser, 0x1100, 26)
@@ -783,6 +837,26 @@ def main():
             cell_t = [temp(v) for v in pib[16:20]]
             env_t = temp(pib[24])
             pow_t = temp(pib[25])
+
+            # Drop an implausible frame before anything consumes it -- the limits, the taper
+            # debounce and above all update_db(), whose LEAST() would otherwise pin this bucket's
+            # minimum to a value the pack never had. See check_cell_frame().
+            accept, why = check_cell_frame(cell_v, prev_cell_v, pack_current,
+                                           prev_current_a, cell_rejects)
+            if not accept:
+                cell_rejects += 1
+                # Log the whole frame, not just the verdict: RESOL-style, the only way to work out
+                # what these frames actually carry is to see one.
+                dbg(1, DEBUG_SEPLOS, "SEPL",
+                    f"⚠ implausible cell frame rejected ({cell_rejects}/{MAX_CELL_REJECTS}): {why}"
+                    f" | cells mV: {cell_v}")
+                time.sleep(2)   # same cadence as the short-PIC-frame path above
+                continue
+            if cell_rejects:
+                dbg(1, DEBUG_SEPLOS, "SEPL",
+                    f"cell frame plausible again after {cell_rejects} rejected")
+                cell_rejects = 0
+            prev_cell_v, prev_current_a = cell_v, pack_current
 
             vmin, vmax = min(cell_v), max(cell_v)
             vmin_idx  = cell_v.index(vmin) + 1   # 1-based cell number
