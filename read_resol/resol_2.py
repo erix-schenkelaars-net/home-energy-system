@@ -104,6 +104,11 @@ _reread_count = 0
 # as the bad reading at :00 and simply overwrites it, so a rescued cycle leaves no trace and a
 # failed one leaves exactly the honest NULL row it would have left anyway. A fresh socket also
 # clears any desync in the session itself, which re-reading the same stream cannot.
+#
+# This reconnect is a DELIBERATE, PERMANENT second net -- keep it. Layer 1 (_carry_tail, re-read
+# the next broadcast) has caught every misalignment so far with zero reconnects, but this layer
+# is what covers the case layer 1 cannot: a whole session gone desynced rather than one bad
+# packet. It is cheap and bounded, so it stays even though it rarely fires (decided 2026-07-21).
 RETRY_SECONDS     = 5
 MAX_CYCLE_RETRIES = 3
 _cycle_healthy    = False
