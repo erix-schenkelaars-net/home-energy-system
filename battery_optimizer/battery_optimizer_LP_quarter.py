@@ -225,12 +225,27 @@ INDAY_FACTOR_MIN        = 0.7   # #1: clamp ondergrens
 INDAY_FACTOR_MAX        = 1.4   # #1: clamp bovengrens
 INDAY_DAMPING           = 0.7   # #1: demping richting 1.0 (0=geen correctie, 1=volledig)
 
-# Cooling (airco) load forecast — DRY-RUN (analyse 2026-07-08). Dagverbruik is ~71%
-# temp-gedreven; een EWMA cooling-degree-hours model halveert de forecast-MAPE (42->13%).
-# Zolang COOLING_DRYRUN=True wordt ALLEEN gelogd (temp-blind vs temp-aware), niks toegepast.
-COOLING_DRYRUN          = True
+# Cooling (airco) load forecast — APPLIED with bounds (was dry-run 2026-07-08..21). Dagverbruik
+# is ~71% temp-gedreven; een cooling-degree-hours regressie op de laatste 14 dagen scheelt in een
+# backtest 37% MAE (5.8->3.7 kWh) t.o.v. temp-blind — de winst zit bij hittegolven en hun nasleep,
+# waar het na-ijlende gemiddelde de temp-swing niet volgt.
+#
+# BEGRENZING (waarom): de rauwe regressie kan bij een degeneratieve fit onzin geven — op 16-06 gaf
+# hij -1,1 kWh (negatieve dagload), wat de LP-planning zou verzieken. Daarom een FACTOR op het
+# temp-blinde profiel, geklemd op [MIN,MAX], en bij elke twijfel (te weinig data, geen spreiding,
+# negatieve helling) terugval naar factor 1.0 = exact het huidige temp-blinde gedrag.
+COOLING_APPLY           = True  # False => factor altijd 1.0 (temp-blind, oude gedrag)
 COOLING_CDH_THRESHOLD_C = 21.0  # graden waarboven koellast telt (cooling-degree-hours)
 COOLING_EWMA_ALPHA      = 0.5   # thermische-massa decay per dag (0.5 = half-life ~1 dag)
+COOLING_FACTOR_MIN      = 0.7   # onder-clamp op de temp-aware/temp-blind schaal (vangt -1,1 af)
+COOLING_FACTOR_MAX      = 1.4   # boven-clamp; symmetrisch met de in-day factor
+
+# Seizoensgate — één drempel splitst verwarmen en koelen zodat ze elkaars complement zijn i.p.v.
+# elkaar te overlappen. Komt de dag-MAX voorspeltemperatuur niet boven deze waarde, dan is het een
+# stookdag: warmtepomp-correctie aan, airco uit. Erboven: warmtepomp uit (geen spookverwarming in
+# de zomer — het UA-model rekent anders koellast <20C als 'stoken'), airco-factor aan. 16C zit onder
+# het 20C-setpunt met ruimte voor zon en interne warmte.
+HEATING_MAX_TEMP_C      = 16.0
 
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER", "YOUR_MQTT_BROKER_IP")
 MQTT_BROKER_PORT = int(os.environ.get("MQTT_PORT", 1883))
@@ -324,7 +339,8 @@ class HourSlot:
     gti_east_wm2: float = 0.0     # raw KNMI GTI east string (W/m²)
     gti_west_wm2: float = 0.0     # raw KNMI GTI west string (W/m²)
     pv_source: str = ""           # 'KNMI_GTI' | 'OM_GHI' | 'FORECAST_SOLAR' | 'CACHE'
-    hp_correction_kwh: float = 0.0
+    hp_correction_kwh: float = 0.0       # verwarmings-delta (warmtepomp) t.o.v. referentietemp
+    cooling_correction_kwh: float = 0.0  # koel-delta (airco) t.o.v. het temp-blinde profiel
 
     def hour(self) -> int:
         return self.dt.hour
@@ -1387,6 +1403,7 @@ def ensure_schedule_table(conn):
         ("gti_west_wm2",     "FLOAT"),
         ("pv_source",        "VARCHAR(20)"),
         ("hp_correction_kwh","FLOAT"),
+        ("cooling_correction_kwh","FLOAT"),
         ("total_om_raw_kwh",  "FLOAT"),
         ("total_optimizer_kwh","FLOAT"),
     ]:
@@ -1417,8 +1434,9 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
                grid_kwh, cost_eur, applied, rollback_conf,
                forecast_temp_c, ref_temp_c, ev_kwh, pv_curtail_kwh,
                solver_status, bat_kwh, cloud_cover_pct, ghi_ratio,
-               gti_east_wm2, gti_west_wm2, pv_source, hp_correction_kwh)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               gti_east_wm2, gti_west_wm2, pv_source, hp_correction_kwh,
+               cooling_correction_kwh)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             now, slot.dt, slot.action, slot.charge_kw,
             slot.import_price(), slot.pv_kwh, slot.load_kwh,
@@ -1429,6 +1447,7 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
             slot.cloud_cover_pct, slot.ghi_ratio,
             slot.gti_east_wm2, slot.gti_west_wm2,
             slot.pv_source or None, slot.hp_correction_kwh,
+            slot.cooling_correction_kwh,
         ))
     conn.commit()
 
@@ -1700,20 +1719,61 @@ def compute_inday_load_factor(conn, profile: dict[tuple[bool, int], float], now:
 
 
 # ---------------------------------------------------------------------------
-# 5a2.  COOLING (AIRCO) LOAD FORECAST — DRY-RUN (alleen loggen, niet toegepast)
+# 5a2.  COOLING (AIRCO) LOAD FORECAST — APPLIED, bounded
 # ---------------------------------------------------------------------------
-def log_cooling_dryrun(conn, load_prof, now):
-    """Logt de temp-blinde (huidige) vs temp-aware dagvoorspelling zodat we het
-    live-effect kunnen zien. Past de LP-load NIET aan. Puur read-only + log;
-    faalt stil (nooit de optimizer breken)."""
-    if not COOLING_DRYRUN:
-        return
+def _cooling_fit(act: dict, acc: dict, today):
+    """Fit dagload ~ EWMA-graaduren op de laatste 14 historische dagen.
+
+    Returns (intercept, slope) of None bij een onbruikbare fit: te weinig punten, geen
+    spreiding in de graaduren, of een negatieve helling (fysisch onzin — meer koelen zou
+    dan minder load geven). None => de aanroeper valt terug op factor 1.0 (temp-blind).
+    Zuiver rekenwerk, geen DB — zo staat het in een test zonder database.
+    """
+    import statistics as _st
+    fit_days = [d for d in sorted(act) if d < today and d in acc][-14:]
+    if len(fit_days) < 4:
+        return None
+    X = [acc[d] for d in fit_days]
+    Y = [act[d] for d in fit_days]
+    n = len(X)
+    mx, my, vx = _st.mean(X), _st.mean(Y), _st.pvariance(X)
+    if vx <= 0:
+        return None
+    b = sum((x - mx) * (y - my) for x, y in zip(X, Y)) / n / vx
+    if b < 0:
+        return None
+    return (my - b * mx, b)
+
+
+def _cooling_factor(intercept, slope, acc_day, base_kwh):
+    """Temp-aware/temp-blind schaal, geklemd op [MIN, MAX].
+
+    base_kwh is de temp-blinde dagvoorspelling (som van het profiel). De clamp is de vangrail:
+    zonder haar gaf de rauwe fit op 16-06 een factor van -0,08 (temp-aware -1,1 kWh); geklemd
+    wordt dat 0,7. Niet-positieve base => 1.0 (niets om tegen te schalen).
+    """
+    if base_kwh <= 0:
+        return 1.0
+    raw = (intercept + slope * acc_day) / base_kwh
+    return max(COOLING_FACTOR_MIN, min(COOLING_FACTOR_MAX, raw))
+
+
+def compute_cooling_factors(conn, load_prof, now, radiation):
+    """Begrensde temp-aware koelcorrectie. Geeft {date: factor} voor vandaag en morgen.
+
+    De factor schaalt het temp-blinde dagprofiel naar de CDH-regressie, geklemd op [MIN,MAX].
+    Elke degeneratie -> lege dict => factor 1.0 in de lus = exact het huidige temp-blinde
+    gedrag. Read-only + fail-safe: gooit nooit door naar de optimizer.
+    """
+    factors: dict = {}
+    if not COOLING_APPLY:
+        return factors
     try:
-        import statistics as _st
         th, alpha = COOLING_CDH_THRESHOLD_C, COOLING_EWMA_ALPHA
-        is_weekend = now.weekday() >= 5
-        base_kwh = sum(load_prof.get((is_weekend, h), 0.0) for h in range(24))  # huidige temp-blinde dag-forecast
+        today = now.date()
+        tomorrow = today + timedelta(days=1)
         since = now - timedelta(days=35)
+
         cur = conn.cursor(dictionary=True)
         cur.execute(
             "SELECT DATE(slot_dt) d, AVG(GREATEST(forecast_temp_c-%s,0))*24 cdh, COUNT(*) n "
@@ -1727,24 +1787,52 @@ def log_cooling_dryrun(conn, load_prof, now):
         act = {r["d"]: float(r["kwh"]) for r in cur.fetchall()
                if r["n"] and r["n"] > 250 and r["kwh"] is not None}
         cur.close()
-        acc, prev = {}, None                       # EWMA thermische-massa accumulator
+
+        acc, prev = {}, None                       # EWMA thermische-massa accumulator (historie)
         for d in sorted(cdh):
             acc[d] = cdh[d] if prev is None else cdh[d] + (alpha ** (d - prev).days) * acc[prev]
             prev = d
-        today = now.date()
-        fit_days = [d for d in sorted(act) if d < today and d in acc][-14:]
-        if len(fit_days) >= 4 and today in acc:
-            X = [acc[d] for d in fit_days]; Y = [act[d] for d in fit_days]; n = len(X)
-            mx, my, vx = _st.mean(X), _st.mean(Y), _st.pvariance(X)
-            if vx > 0:
-                b = sum((x - mx) * (y - my) for x, y in zip(X, Y)) / n / vx
-                ta_kwh = (my - b * mx) + b * acc[today]
-                log.info("COOLING dry-run: temp-blind=%.1f kWh  temp-aware(EWMA a=%.1f)=%.1f kWh  "
-                         "acc=%.1f b=%.2f  (NIET toegepast)", base_kwh, alpha, ta_kwh, acc[today], b)
-                return
-        log.info("COOLING dry-run: temp-blind=%.1f kWh  (te weinig data voor temp-aware fit)", base_kwh)
+
+        fit = _cooling_fit(act, acc, today)
+        if fit is None:
+            log.info("COOLING: onbruikbare fit -> factor 1.0 (temp-blind)")
+            return factors
+        intercept, slope = fit
+
+        # verwachte graaduren voor vandaag en morgen uit de temp-forecast (radiation)
+        fc_sum: dict = {today: 0.0, tomorrow: 0.0}
+        fc_cnt: dict = {today: 0, tomorrow: 0}
+        for iso, entry in radiation.items():
+            try:
+                dd = datetime.strptime(iso[:13], "%Y-%m-%dT%H").date()
+            except (ValueError, TypeError):
+                continue
+            if dd in fc_sum:
+                fc_sum[dd] += max(0.0, float(entry.get("temp_c", 0.0)) - th)
+                fc_cnt[dd] += 1
+
+        last_hist = max(acc) if acc else None
+        acc_prev = acc[last_hist] if last_hist else 0.0
+        prev_day = last_hist or (today - timedelta(days=1))
+        for dd in (today, tomorrow):
+            if not fc_cnt[dd]:
+                continue
+            cdh_dd = fc_sum[dd] / fc_cnt[dd] * 24
+            gap = max(1, (dd - prev_day).days)
+            acc_dd = cdh_dd + (alpha ** gap) * acc_prev
+            is_we = dd.weekday() >= 5
+            base_kwh = sum(load_prof.get((is_we, h), load_prof.get((False, h), 0.0))
+                           for h in range(24))
+            factors[dd] = _cooling_factor(intercept, slope, acc_dd, base_kwh)
+            acc_prev, prev_day = acc_dd, dd
+
+        log.info("COOLING toegepast: factor vandaag=%.2f morgen=%.2f  (b=%.2f, clamp %.1f-%.1f)",
+                 factors.get(today, 1.0), factors.get(tomorrow, 1.0),
+                 slope, COOLING_FACTOR_MIN, COOLING_FACTOR_MAX)
+        return factors
     except Exception as e:
-        log.warning("COOLING dry-run faalde (genegeerd): %s", e)
+        log.warning("COOLING factor-berekening faalde (genegeerd, factor 1.0): %s", e)
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -1905,10 +1993,13 @@ def optimise(  # noqa: C901
     ev_soc: Optional[float] = None,
     ref_temp_by_hour: Optional[dict[int, float]] = None,
     inday_load_factor: float = 1.0,
+    cooling_factors: Optional[dict] = None,
     replay_date: Optional[date] = None,
 ) -> tuple[list[HourSlot], str]:
     if ref_temp_by_hour is None:
         ref_temp_by_hour = {}
+    if cooling_factors is None:
+        cooling_factors = {}
 
     dbg(2, DEBUG_OPT, "OPT",
         f"LP Optimiser  start_qtr_idx={start_qtr_idx}  "
@@ -1917,6 +2008,19 @@ def optimise(  # noqa: C901
 
     tomorrow     = today + timedelta(days=1)
     current_hour = (start_qtr_idx % 96) // 4
+
+    # Dag-MAX voorspeltemperatuur per horizon-dag: bepaalt de seizoensmodus (stoken vs koelen).
+    # Ontbreekt een dag in de forecast, dan 99C -> koelmodus (warmtepomp uit): de veilige default
+    # is 'geen spookverwarming', precies de bug die deze gate wegneemt.
+    day_max_temp: dict = {}
+    for _iso, _entry in radiation.items():
+        try:
+            _dd = datetime.strptime(_iso[:13], "%Y-%m-%dT%H").date()
+        except (ValueError, TypeError):
+            continue
+        _t = float(_entry.get("temp_c", -99.0))
+        if _dd not in day_max_temp or _t > day_max_temp[_dd]:
+            day_max_temp[_dd] = _t
 
     slots: list[HourSlot] = []
     for idx in range(start_qtr_idx, 192):
@@ -1948,8 +2052,16 @@ def optimise(  # noqa: C901
                                          load_profile.get((False, hour), BASE_LOAD_FALLBACK_W / 1000))
         if d == today:
             db_load_h *= inday_load_factor
+        # Seizoensgate: stookdag (dag-max <= 16C) => warmtepomp aan, airco uit; anders omgekeerd.
+        # Zo vullen de twee modellen elkaar aan i.p.v. dubbel te tellen in het tussenseizoen.
+        heating_mode  = day_max_temp.get(d, 99.0) <= HEATING_MAX_TEMP_C
+        # Temp-blinde basis vóór de koelfactor, zodat de airco-bijdrage het verschil is.
+        cool_base_h   = db_load_h * LOAD_PESSIMISM
+        cool_factor   = 1.0 if heating_mode else cooling_factors.get(d, 1.0)
+        db_load_h    *= cool_factor                   # begrensde temp-aware schaal (airco)
         db_load_h    *= LOAD_PESSIMISM
-        hp_corr_h     = predict_hp_correction_kwh(forecast_temp, ref_temp, hour)
+        cooling_corr  = (db_load_h - cool_base_h) * SLOT_H
+        hp_corr_h     = predict_hp_correction_kwh(forecast_temp, ref_temp, hour) if heating_mode else 0.0
         load          = max(0.05 * SLOT_H, (db_load_h + hp_corr_h) * SLOT_H)
         hp_correction = hp_corr_h * SLOT_H
 
@@ -1959,7 +2071,8 @@ def optimise(  # noqa: C901
                         forecast_temp_c=forecast_temp, ref_temp_c=ref_temp,
                         cloud_cover_pct=cc, ghi_ratio=ghi_r,
                         gti_east_wm2=gti_e, gti_west_wm2=gti_w,
-                        pv_source=pv_src, hp_correction_kwh=hp_correction)
+                        pv_source=pv_src, hp_correction_kwh=hp_correction,
+                        cooling_correction_kwh=cooling_corr)
         slots.append(slot)
         dbg(3, DEBUG_OPT, "OPT",
             f"  Slot idx={idx:03d}  {dt.strftime('%d %H:%M')}  "
@@ -2925,7 +3038,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     base_load    = read_avg_consumption(conn)
     load_prof    = build_load_profile(conn, base_load)
     inday_factor = compute_inday_load_factor(conn, load_prof, now)
-    log_cooling_dryrun(conn, load_prof, now)   # DRY-RUN: alleen loggen, geen invloed op sturing
+    cooling_facs = compute_cooling_factors(conn, load_prof, now, radiation)  # begrensd; {} = temp-blind
 
     mode = "DYNAMIC_PRICE"
     log.info("Optimizer mode: %s", mode)
@@ -2934,7 +3047,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
 
     okw_base = dict(prices=prices, radiation=radiation, load_profile=load_prof, today=today,
                     mode=mode, ev_soc=ev_soc, ref_temp_by_hour=ref_temp_by_hour,
-                    inday_load_factor=inday_factor)
+                    inday_load_factor=inday_factor, cooling_factors=cooling_facs)
     deadband_pct = float(os.getenv("DEADBAND_PCT", str(bc.SOC_DISCHARGE_DEADBAND)))
 
     if rolling_range is not None:
@@ -2960,6 +3073,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         ev_soc           = ev_soc,
         ref_temp_by_hour = ref_temp_by_hour,
         inday_load_factor = inday_factor,
+        cooling_factors   = cooling_facs,
         replay_date       = replay_at.date() if replay_at else None,
     )
 

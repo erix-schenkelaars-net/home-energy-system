@@ -831,5 +831,153 @@ class TestHourSlotDefaults(unittest.TestCase):
         self.assertEqual(slot.pv_curtail_kwh, 0.0)
 
 
+class TestCoolingFit(unittest.TestCase):
+    """The airco temp-aware fit: a slope on cooling-degree-hours, with guardrails.
+
+    The whole point of the guardrails is that a bad fit degrades to temp-blind (factor 1.0),
+    never to garbage. The 16 June 2026 case, where the raw regression extrapolated to -1.1 kWh
+    of daily load, is carried here as a regression.
+    """
+
+    def _acc(self, pairs):
+        # pairs: list of (day_offset, cdh_accumulator) -> {date: acc}
+        base = date(2026, 6, 1)
+        return {base + timedelta(days=o): v for o, v in pairs}
+
+    def test_a_clean_upward_fit_returns_a_positive_slope(self):
+        today = date(2026, 6, 20)
+        acc = self._acc([(d, float(d)) for d in range(6)])          # acc 0..5
+        act = {date(2026, 6, 1) + timedelta(days=d): 15 + 2 * d for d in range(6)}  # load rises with acc
+        fit = mod._cooling_fit(act, acc, today)
+        self.assertIsNotNone(fit)
+        intercept, slope = fit
+        self.assertGreater(slope, 0)
+
+    def test_too_few_days_falls_back(self):
+        """Under four fit days there is nothing to trust -> None -> caller uses factor 1.0."""
+        today = date(2026, 6, 20)
+        acc = self._acc([(0, 1.0), (1, 2.0)])
+        act = {date(2026, 6, 1): 15.0, date(2026, 6, 2): 16.0}
+        self.assertIsNone(mod._cooling_fit(act, acc, today))
+
+    def test_no_spread_in_degree_hours_falls_back(self):
+        """All-equal cooling-degree-hours -> zero variance -> no slope to fit -> None."""
+        today = date(2026, 6, 20)
+        acc = self._acc([(d, 3.0) for d in range(6)])               # identical acc
+        act = {date(2026, 6, 1) + timedelta(days=d): 15 + d for d in range(6)}
+        self.assertIsNone(mod._cooling_fit(act, acc, today))
+
+    def test_a_negative_slope_falls_back(self):
+        """More cooling degrees -> less load is physically nonsensical, so reject the fit."""
+        today = date(2026, 6, 20)
+        acc = self._acc([(d, float(d)) for d in range(6)])
+        act = {date(2026, 6, 1) + timedelta(days=d): 25 - 2 * d for d in range(6)}  # load falls as acc rises
+        self.assertIsNone(mod._cooling_fit(act, acc, today))
+
+
+class TestCoolingFactorApplied(unittest.TestCase):
+    """The factor must actually reach the load through optimise(), not merely exist as a number.
+
+    This is the test that was missing. The nine helper tests around this one exercise the fit and
+    the clamp in isolation and stay green even if optimise() never applies the factor -- which is
+    exactly the wiring bug that shipped (the production call omitted the cooling_factors kwarg).
+    A unit test on the ingredients proves nothing about whether they reach the dish; this drives
+    optimise() end to end.
+    """
+
+    def _cooled(self, factors):
+        # temp=25 -> day-max > 16 -> cooling mode, so the airco factor is actually in effect
+        # (below the seasonal gate it would be forced to 1.0 and this would test nothing).
+        return mod.optimise(
+            start_qtr_idx=0, prices=prices_make(), radiation=_build_radiation(cloud_flat(50), temp=25.0),
+            load_profile=LOAD_NORM, initial_soc_pct=50.0, today=TODAY,
+            ref_temp_by_hour=REF_TEMP, cooling_factors=factors)[0]
+
+    def test_a_factor_below_one_reduces_todays_load(self):
+        base   = self._cooled({})                       # no cooling
+        cooled = self._cooled({TODAY: 0.8})             # 20% temp-aware reduction
+        bl = sum(s.load_kwh for s in base   if s.dt.date() == TODAY)
+        cl = sum(s.load_kwh for s in cooled if s.dt.date() == TODAY)
+        self.assertLess(cl, bl)                         # measurably lower — the whole point
+
+    def test_the_correction_column_is_populated_and_signed(self):
+        cooled = self._cooled({TODAY: 0.8})
+        corr = sum(s.cooling_correction_kwh for s in cooled if s.dt.date() == TODAY)
+        self.assertLess(corr, 0)                        # factor < 1 -> negative (less load)
+
+    def test_no_factor_leaves_the_correction_exactly_zero(self):
+        """Default {} must be a true no-op, so a day without a cooling signal is untouched."""
+        base = self._cooled({})
+        self.assertEqual(sum(s.cooling_correction_kwh for s in base), 0.0)
+
+    def test_only_the_named_day_is_scaled(self):
+        """A factor for today must not bleed into tomorrow's slots."""
+        cooled = self._cooled({TODAY: 0.8})            # tomorrow deliberately absent
+        tom = sum(s.cooling_correction_kwh for s in cooled if s.dt.date() != TODAY)
+        self.assertEqual(tom, 0.0)
+
+
+class TestSeasonalGate(unittest.TestCase):
+    """One threshold on the day's max forecast temp splits heating from cooling, so the two
+    corrections complement rather than double-count. The bug this closes: the heat-pump UA model
+    read every sub-20C hour as heating, so it reserved phantom heating on cool summer mornings."""
+
+    def _run(self, temp, factors):
+        return mod.optimise(
+            start_qtr_idx=0, prices=prices_make(), radiation=_build_radiation(cloud_flat(50), temp=temp),
+            load_profile=LOAD_NORM, initial_soc_pct=50.0, today=TODAY,
+            ref_temp_by_hour=REF_TEMP, cooling_factors=factors)[0]
+
+    def test_a_warm_day_reserves_no_heat_pump_load(self):
+        """Day-max 25C > 16 -> cooling mode -> WP correction must be zero (no summer heating)."""
+        slots = self._run(temp=25.0, factors={})
+        self.assertEqual(sum(s.hp_correction_kwh for s in slots), 0.0)
+
+    def test_a_warm_day_applies_the_airco_factor(self):
+        warm_cooled = self._run(temp=25.0, factors={TODAY: 0.8})
+        corr = sum(s.cooling_correction_kwh for s in warm_cooled if s.dt.date() == TODAY)
+        self.assertLess(corr, 0)                       # airco active in cooling mode
+
+    def test_a_cold_day_keeps_the_heat_pump_correction(self):
+        """Day-max 5C <= 16 -> heating mode. Forecast 5C differs from the 10C reference, so the UA
+        model produces a real, non-zero correction (a delta needs the two temps to differ)."""
+        slots = self._run(temp=5.0, factors={})
+        self.assertNotEqual(sum(s.hp_correction_kwh for s in slots), 0.0)
+
+    def test_a_cold_day_suppresses_the_airco_factor(self):
+        """In heating mode the statistical cooling factor is forced to 1.0 so it cannot fight the
+        physical heating model — no cooling correction on a winter day even if a factor is given."""
+        cold_cooled = self._run(temp=10.0, factors={TODAY: 0.8})
+        self.assertEqual(sum(s.cooling_correction_kwh for s in cold_cooled), 0.0)
+
+
+class TestCoolingFactor(unittest.TestCase):
+    """The clamp is the safety rail around the raw temp-aware/temp-blind ratio."""
+
+    def test_the_16_june_degeneracy_is_clamped(self):
+        """Raw fit gave temp-aware -1.1 kWh against a temp-blind 14.1 -> ratio -0.08.
+        Un-clamped that hands the LP a negative daily load; clamped it becomes the floor."""
+        # intercept/slope reconstructed so that intercept + slope*acc = -1.1
+        factor = mod._cooling_factor(intercept=-1.1, slope=0.0, acc_day=0.0, base_kwh=14.1)
+        self.assertAlmostEqual(factor, mod.COOLING_FACTOR_MIN)
+        self.assertGreater(factor, 0)                               # never negative
+
+    def test_a_hot_day_is_capped_at_the_ceiling(self):
+        factor = mod._cooling_factor(intercept=10.0, slope=5.0, acc_day=20.0, base_kwh=15.0)
+        self.assertAlmostEqual(factor, mod.COOLING_FACTOR_MAX)      # (10+100)/15 -> clamp
+
+    def test_a_normal_ratio_passes_through(self):
+        factor = mod._cooling_factor(intercept=6.0, slope=0.5, acc_day=10.0, base_kwh=10.0)
+        self.assertAlmostEqual(factor, 1.1)                        # (6+5)/10, inside the band
+
+    def test_zero_baseline_is_neutral(self):
+        """No profile to scale against -> factor 1.0, never a divide-by-zero."""
+        self.assertEqual(mod._cooling_factor(10.0, 1.0, 5.0, 0.0), 1.0)
+
+    def test_the_clamp_band_is_sane(self):
+        self.assertLess(mod.COOLING_FACTOR_MIN, 1.0)
+        self.assertGreater(mod.COOLING_FACTOR_MAX, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
