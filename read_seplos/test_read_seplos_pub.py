@@ -342,8 +342,10 @@ class TestCheckCellFrame(unittest.TestCase):
 
     update_db() folds every poll into the five-minute bucket with LEAST(), so a single frame
     reading 115 mV low pins that bucket's minimum permanently -- in the very columns the cell
-    ageing baseline is measured from. Seen three times between 17 and 20 July 2026, each time as
-    a contiguous tail of the 16-cell block, each time with the max registers of every cell normal.
+    ageing baseline is measured from. Seen five times between 17 and 24 July 2026, each time as
+    a contiguous tail of the 16-cell block, each time with the max registers of every cell normal,
+    each time gone by the next poll. Depths ran from 35 to 125 mV, which is why the limit is
+    derived from what the cells can physically do rather than from the frames observed so far.
     """
 
     FLAT = [3278] * 16                       # a quiet pack, all cells together
@@ -369,6 +371,22 @@ class TestCheckCellFrame(unittest.TestCase):
         """06:00: the tail was only three cells long, and 124 mV instead of 115."""
         now = [3181] * 13 + [3060, 3060, 3057]
         self.assertFalse(mod.check_cell_frame(now, [3181] * 16, -5.8, -5.5, 0)[0])
+
+    def test_the_real_24_july_frame_is_rejected(self):
+        """07:31:48, the first one the guard caught in production. Logged verbatim."""
+        now = [3195] * 13 + [3075, 3075, 3073]
+        self.assertFalse(mod.check_cell_frame(now, [3195] * 16, -2.2, -2.2, 0)[0])
+
+    def test_the_small_24_july_frame_is_rejected(self):
+        """The same artefact in the same bucket, four minutes earlier and only 35 mV deep. It
+        cleared the original 80 mV limit and pinned the 07:30 row at 3157 mV; the neighbouring
+        buckets read 3 and 4 mV of spread. Size is not what identifies these frames, so the limit
+        may not be sized off the largest one seen.
+        """
+        now = [3195] * 13 + [3160, 3160, 3158]
+        ok, why = mod.check_cell_frame(now, [3195] * 16, -4.4, -4.4, 0)
+        self.assertFalse(ok, "a 35 mV tail drop at steady current must not reach the database")
+        self.assertIn("cell 16 moved 37 mV", why)   # the deepest of the three, not the first
 
     def test_a_load_step_is_let_through(self):
         """Current moved, so the cells had every reason to move with it. Rejecting a real IR

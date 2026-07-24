@@ -81,7 +81,14 @@ VMIN_TAPER_END_MV = 2950       # mV - hard discharge floor (0 A)
 # far in one poll interval, because there is no IR term to move it. A real load step is allowed
 # through by the current tolerance, and a genuinely sudden cell fault is only delayed, never hidden,
 # by MAX_CELL_REJECTS.
-CELL_STEP_MAX_MV       = 80    # mV - largest believable move for one cell between polls (~2 s)
+#
+# The limit started at 80 mV and was too loose. On 2026-07-24 the artefact struck twice inside one
+# bucket: a 120 mV version at 07:31:48 that the guard caught, and a 35 mV version that it let past
+# into the 07:30 row -- same three tail cells, same recovery within one poll, only smaller. Sizing
+# the limit off the artefacts seen so far was the mistake; they come in a range. 25 mV is derived
+# from the physics instead: explaining that much movement at under CELL_STEP_CURRENT_TOL_A of change
+# would take ~5 mOhm per cell, and these measure 0.15-1 mOhm. Nothing real can reach it.
+CELL_STEP_MAX_MV       = 25    # mV - largest believable move for one cell between polls (~2 s)
 CELL_STEP_CURRENT_TOL_A = 5.0  # A  - above this change in pack current, the move may well be real
 MAX_CELL_REJECTS       = 5     # polls - after this many in a row, accept anyway and let it be seen
 
