@@ -1084,6 +1084,73 @@ class TestRollingReplayDeadbandCarriesEv(unittest.TestCase):
         self.assertGreater(with_ev, without)
 
 
+class TestReplayForecastSource(unittest.TestCase):
+    """Which stored forecast a replay re-solves against decides what the predicted line means.
+
+    battery_schedule is rewritten every quarter, so each slot holds the forecast as it stood at
+    that slot's own time -- what the controller knew, and the right input for judging a control
+    change. predicted_grid_snapshot is written once at midnight, so it carries the day-ahead
+    forecast the day was actually planned with. Rebuilding the dashboard line from the first
+    would quietly erase the forecast error the line exists to show: on 2026-07-23 the two
+    disagree by 23% on load, 15.8 against 19.4 kWh.
+    """
+
+    PV_MARK   = 1.234
+    LOAD_MARK = 0.567
+
+    OMIT = object()          # call optimise() without the kwarg, to test its default
+
+    def _replay(self, forecast, with_rows):
+        seen: list = []
+        cur  = MagicMock()
+        cur.execute.side_effect = lambda sql, params=None: seen.append(sql)
+        if with_rows:
+            pl = [(datetime(TODAY.year, TODAY.month, TODAY.day, q // 4, (q % 4) * 15),
+                   self.PV_MARK, self.LOAD_MARK) for q in range(96)]
+            cur.fetchall.side_effect = [[], pl]
+        else:
+            cur.fetchall.side_effect = [[], []]
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        kw = dict(start_qtr_idx=0, prices=prices_make(),
+                  radiation=_build_radiation(cloud_flat(8)), load_profile=LOAD_NORM,
+                  initial_soc_pct=50.0, today=TODAY, ref_temp_by_hour=REF_TEMP,
+                  replay_date=TODAY)
+        if forecast is not self.OMIT:
+            kw["replay_forecast"] = forecast
+        with patch.object(mod, "get_db", return_value=conn):
+            slots, status = mod.optimise(**kw)
+        return seen, slots, status
+
+    def test_snapshot_reads_the_midnight_forecast(self):
+        seen, _, _ = self._replay("snapshot", with_rows=True)
+        self.assertTrue(any("predicted_grid_snapshot" in s for s in seen))
+        self.assertFalse(any("battery_schedule" in s for s in seen))
+
+    def test_schedule_reads_what_the_controller_knew(self):
+        seen, _, _ = self._replay("schedule", with_rows=True)
+        self.assertTrue(any("battery_schedule" in s for s in seen))
+        self.assertFalse(any("predicted_grid_snapshot" in s for s in seen))
+
+    def test_the_default_is_the_controller_view(self):
+        """--rolling-replay judges control changes, so left alone it must see what control saw."""
+        seen, _, _ = self._replay(self.OMIT, with_rows=True)
+        self.assertTrue(any("battery_schedule" in s for s in seen))
+        self.assertFalse(any("predicted_grid_snapshot" in s for s in seen))
+
+    def test_the_stored_values_actually_land_on_the_slots(self):
+        _, slots, _ = self._replay("snapshot", with_rows=True)
+        marked = [s for s in slots if abs(s.pv_kwh - self.PV_MARK) < 1e-9]
+        self.assertEqual(len(marked), 96)
+        self.assertTrue(all(abs(s.load_kwh - self.LOAD_MARK) < 1e-9 for s in marked))
+
+    def test_an_empty_source_refuses_instead_of_using_live_weather(self):
+        """Silence would reconstruct a different day entirely and still look healthy."""
+        _, slots, status = self._replay("snapshot", with_rows=False)
+        self.assertEqual(status, "REPLAY_NO_DATA")
+        self.assertEqual(slots, [])
+
+
 class TestEvChargeShape(unittest.TestCase):
     """The plug charges in one unbroken run, so the LP may be told to model it that way.
 

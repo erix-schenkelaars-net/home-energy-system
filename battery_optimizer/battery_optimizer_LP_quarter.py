@@ -2042,6 +2042,7 @@ def optimise(  # noqa: C901
     inday_load_factor: float = 1.0,
     cooling_factors: Optional[dict] = None,
     replay_date: Optional[date] = None,
+    replay_forecast: str = "schedule",
 ) -> tuple[list[HourSlot], str]:
     if ref_temp_by_hour is None:
         ref_temp_by_hour = {}
@@ -2127,14 +2128,34 @@ def optimise(  # noqa: C901
             f"hp_corr={hp_correction:+.4f}  T_fc={forecast_temp:.1f}C")
 
     if replay_date is not None:
-        # Historical dry-run: replace the forecast-built pv/load/spot with the values
-        # actually stored for those days (battery_schedule = forecast used; electricity_prices
-        # = spot). Lets us re-solve a past day's exact inputs to test optimizer changes.
+        # Historical dry-run: replace the forecast-built pv/load/spot with the values actually
+        # stored for those days (electricity_prices = spot). Lets us re-solve a past day's
+        # exact inputs to test optimizer changes.
+        #
+        # Which forecast counts as "the" one depends on the question being asked, so
+        # replay_forecast picks the table:
+        #
+        #   schedule  battery_schedule, rewritten every quarter, so each slot holds the
+        #             forecast as it stood at that slot's own time. This is what the
+        #             controller genuinely knew, and the right input for judging a control
+        #             change.
+        #   snapshot  predicted_grid_snapshot, written once at midnight, so the whole day
+        #             carries the day-ahead forecast. The right input for rebuilding the
+        #             dashboard's predicted line, which exists to show the forecast error:
+        #             feeding it the in-day corrections would erase the very gap it measures.
+        #             On 2026-07-23 the two disagree by 23% on load (15.8 vs 19.4 kWh).
+        #
+        # The horizon runs two days and a snapshot covers one, so day two comes from the next
+        # day's snapshot -- made twelve hours later than the day being replayed, which is a
+        # small look-ahead. It only tilts the value of the terminal SoC, and the alternative
+        # (today's live weather for a day months past) is far worse.
+        _src   = "predicted_grid_snapshot" if replay_forecast == "snapshot" else "battery_schedule"
+        _dtcol = "slot_dt"
         _rdb = get_db(); _rc = _rdb.cursor()
         _rc.execute("SELECT ts, markttarief_kwh FROM electricity_prices WHERE ts>=%s AND ts<%s",
                     (str(today), str(today + timedelta(days=2))))
         _spot = {(t.date(), t.strftime('%H:%M')): float(v) for t, v in _rc.fetchall() if v is not None}
-        _rc.execute("SELECT slot_dt, pv_kwh, load_kwh FROM battery_schedule WHERE slot_dt>=%s AND slot_dt<%s",
+        _rc.execute(f"SELECT {_dtcol}, pv_kwh, load_kwh FROM {_src} WHERE {_dtcol}>=%s AND {_dtcol}<%s",
                     (str(today), str(today + timedelta(days=2))))
         _pl = {(d.date(), d.strftime('%H:%M')): (float(pv or 0), float(ld or 0)) for d, pv, ld in _rc.fetchall()}
         _rdb.close(); _nov = 0
@@ -2142,7 +2163,13 @@ def optimise(  # noqa: C901
             _key = (_s.dt.date(), _s.dt.strftime('%H:%M'))
             if _key in _spot: _s.price_eur_kwh = _spot[_key]
             if _key in _pl:  _s.pv_kwh, _s.load_kwh = _pl[_key]; _nov += 1
-        log.info("REPLAY %s: %d slots from stored pv/load/spot", replay_date, _nov)
+        log.info("REPLAY %s: %d slots from stored spot + pv/load out of %s", replay_date, _nov, _src)
+        if _nov == 0:
+            # Silence here would leave the slots on live weather for a day long past, and the
+            # run would look perfectly healthy while reconstructing the wrong day entirely.
+            log.error("REPLAY %s: %s holds nothing for this day — refusing to replay it",
+                      replay_date, _src)
+            return [], "REPLAY_NO_DATA"
     if not slots:
         log.error("No slots built – empty schedule")
         return [], "MILP_FAILED"
@@ -3157,8 +3184,12 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     _verify_schedule_balance(schedule)
 
     if snapshot_date is not None:
+        # Rebuild the predicted line from the forecast the day was actually planned with,
+        # not from the corrections that arrived during it — see the replay_forecast note in
+        # optimise(). Without this a backfilled day quietly outperforms a live one.
         store_rolling_predicted_snapshot(conn, snapshot_date, soc_pct, deadband_pct,
-                                         {**okw_base, "replay_date": snapshot_date}, overwrite=True)
+                                         {**okw_base, "replay_date": snapshot_date,
+                                          "replay_forecast": "snapshot"}, overwrite=True)
         conn.close()
         return
 
