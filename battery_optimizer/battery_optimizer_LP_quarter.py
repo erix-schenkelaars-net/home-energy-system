@@ -205,6 +205,13 @@ BMW_CHARGE_POWER_KW         = 2.3
 BMW_TARGET_SOC_PCT          = 100.0
 BMW_READY_BY_HOUR           = 9
 BMW_SOC_START_THRESHOLD_PCT = 95.0   # start a new charge cycle below this level
+# How the LP is allowed to imagine the car charging. The plug itself has no choice: once
+# run_ev_charging() switches it on it holds until the BMW reports CHARGINGENDED, so the real
+# charge is always one unbroken run. Modelling it as scattered cheap quarters prices the
+# charge below anything the controller can achieve and books the load in slots it never uses.
+# Set EV_CHARGE_CONTIGUOUS=false in .env to go back to cherry-picking the cheapest quarters.
+EV_CHARGE_CONTIGUOUS        = (os.environ.get("EV_CHARGE_CONTIGUOUS", "true")
+                               .strip().lower() in ("1", "true", "yes", "on"))
 EV_CHARGE_DETECT_W          = 100    # minimum power (W) to confirm BMW is charging
 EV_POWER_CHECK_WAIT_S       = 60     # wait time (s) after plug-on before power check
 BMW_HOME_LAT                = float(os.environ.get("BMW_HOME_LAT", "52.0"))
@@ -1878,8 +1885,13 @@ def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
                               prices: dict[int, float],
                               ev_soc: Optional[float],
                               current_hour: int) -> list[float]:
-    """Return per-quarter-slot EV charging energy (kWh/slot = kW × SLOT_H).
-    Selects cheapest quarters for BMW i3 before deadline (BMW_READY_BY_HOUR)."""
+    """Return per-quarter-slot EV charging energy (kWh/slot = kW × SLOT_H) before the
+    BMW_READY_BY_HOUR deadline.
+
+    EV_CHARGE_CONTIGUOUS picks the shape: the cheapest unbroken run of the quarters the car
+    needs, which is what the plug actually does, or the cheapest quarters wherever they fall,
+    which is cheaper on paper and unreachable in practice.
+    """
     if ev_soc is None or ev_soc >= BMW_TARGET_SOC_PCT:
         return [0.0] * n_slots
 
@@ -1901,12 +1913,27 @@ def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
         allin = p + _t.energiebelasting_kwh + _t.inkoop_kwh
         candidates.append((allin, i))
 
-    candidates.sort(key=lambda x: x[0])
-    chosen   = {idx for _, idx in candidates[:qtrs_needed]}
+    if EV_CHARGE_CONTIGUOUS:
+        # Slide a window of the length the car needs over the slots left before the deadline
+        # and keep the cheapest position. Short of a full window there is no choice left --
+        # take everything that remains, the same last-chance branch ev_optimal_start() has.
+        window   = min(qtrs_needed, len(candidates))
+        best_at  = 0
+        best_sum = float("inf")
+        for start in range(len(candidates) - window + 1):
+            total = sum(price for price, _ in candidates[start:start + window])
+            if total < best_sum:
+                best_sum, best_at = total, start
+        chosen = {idx for _, idx in candidates[best_at:best_at + window]}
+    else:
+        candidates.sort(key=lambda x: x[0])
+        chosen = {idx for _, idx in candidates[:qtrs_needed]}
+
     ev_kwh   = BMW_CHARGE_POWER_KW * SLOT_H  # kWh per active quarter slot
     schedule = [ev_kwh if i in chosen else 0.0 for i in range(n_slots)]
-    log.info("EV schedule: need=%.2f kWh  qtrs=%d  cheapest_slots=%s",
+    log.info("EV schedule: need=%.2f kWh  qtrs=%d  shape=%s  slots=%s",
              energy_needed, qtrs_needed,
+             "contiguous" if EV_CHARGE_CONTIGUOUS else "cheapest",
              sorted(start_qtr_idx + i for i in chosen))
     return schedule
 

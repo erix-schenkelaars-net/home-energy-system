@@ -1084,6 +1084,77 @@ class TestRollingReplayDeadbandCarriesEv(unittest.TestCase):
         self.assertGreater(with_ev, without)
 
 
+class TestEvChargeShape(unittest.TestCase):
+    """The plug charges in one unbroken run, so the LP may be told to model it that way.
+
+    run_ev_charging() switches the plug on once and holds it until the BMW reports
+    CHARGINGENDED -- there is no path that pauses a charge. Cherry-picking scattered cheap
+    quarters therefore prices the charge below anything reachable and books the car's draw in
+    slots the controller never uses. EV_CHARGE_CONTIGUOUS selects between the two models.
+    """
+
+    SOC       = 8.0     # the 2026-07-23 case: a nearly empty car, 13 quarters needed
+    CHEAP     = 0.05
+    DEAR      = 0.50
+
+    def _two_pocket_prices(self):
+        """Cheap at both ends of the window, dear in between -- the shapes must disagree."""
+        return {q: (self.CHEAP if q < 6 or 30 <= q < 36 else self.DEAR) for q in range(192)}
+
+    def _chosen(self, contiguous, prices=None, start_qtr=0, hour=0):
+        with patch.object(mod, "EV_CHARGE_CONTIGUOUS", contiguous):
+            sched = mod.compute_ev_load_schedule(
+                start_qtr_idx=start_qtr, n_slots=96,
+                prices=prices if prices is not None else self._two_pocket_prices(),
+                ev_soc=self.SOC, current_hour=hour)
+        return [i for i, kwh in enumerate(sched) if kwh > 0.0]
+
+    def test_the_default_matches_the_plug(self):
+        """A stack that charges contiguously must not model itself as pausing by default."""
+        self.assertTrue(mod.EV_CHARGE_CONTIGUOUS)
+
+    def test_contiguous_gives_one_unbroken_run(self):
+        idx = self._chosen(True)
+        self.assertEqual(idx, list(range(idx[0], idx[0] + len(idx))))
+
+    def test_cheapest_splits_across_the_pockets(self):
+        """The regression the switch exists for: this is what the LP used to always do."""
+        idx = self._chosen(False)
+        self.assertNotEqual(idx, list(range(idx[0], idx[0] + len(idx))))
+
+    def test_both_shapes_deliver_the_same_energy(self):
+        self.assertEqual(len(self._chosen(True)), len(self._chosen(False)))
+
+    def test_cheating_is_cheaper_on_paper(self):
+        prices = self._two_pocket_prices()
+        cheap  = sum(prices[i] for i in self._chosen(False, prices))
+        runrun = sum(prices[i] for i in self._chosen(True,  prices))
+        self.assertLess(cheap, runrun,
+                        "scattered picking should undercut the reachable price -- that is the point")
+
+    def test_a_flat_day_makes_the_shapes_agree(self):
+        flat = {q: 0.22 for q in range(192)}
+        self.assertEqual(len(self._chosen(True, flat)), len(self._chosen(False, flat)))
+
+    def test_too_little_time_left_takes_what_remains(self):
+        """Past the last-chance point there is nothing to choose; charge every slot left."""
+        idx = self._chosen(True, start_qtr=32, hour=8)
+        self.assertEqual(idx, [0, 1, 2, 3])          # 32..35, up to the 09:00 deadline
+
+    def test_a_full_car_is_never_scheduled(self):
+        for shape in (True, False):
+            with patch.object(mod, "EV_CHARGE_CONTIGUOUS", shape):
+                sched = mod.compute_ev_load_schedule(0, 96, self._two_pocket_prices(),
+                                                     mod.BMW_TARGET_SOC_PCT, 0)
+            self.assertEqual(sum(sched), 0.0)
+
+    def test_an_unknown_car_is_never_scheduled(self):
+        for shape in (True, False):
+            with patch.object(mod, "EV_CHARGE_CONTIGUOUS", shape):
+                sched = mod.compute_ev_load_schedule(0, 96, self._two_pocket_prices(), None, 0)
+            self.assertEqual(sum(sched), 0.0)
+
+
 class TestReadEvSocAt(unittest.TestCase):
     """A backfilled day has to start from the car that day actually had.
 
