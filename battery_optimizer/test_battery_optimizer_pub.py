@@ -44,7 +44,7 @@ os.environ.update({
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Stub heavy packages
 # ─────────────────────────────────────────────────────────────────────────────
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 for _mod_name in (
     "mysql", "mysql.connector",
     "paho", "paho.mqtt", "paho.mqtt.client", "paho.mqtt.publish",
@@ -977,6 +977,158 @@ class TestCoolingFactor(unittest.TestCase):
     def test_the_clamp_band_is_sane(self):
         self.assertLess(mod.COOLING_FACTOR_MIN, 1.0)
         self.assertGreater(mod.COOLING_FACTOR_MAX, 1.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rolling replay: the car's charge must move with the replay, not just the battery
+# ══════════════════════════════════════════════════════════════════════════════
+class TestRollingReplayAdvancesEvSoc(unittest.TestCase):
+    """The predicted line on the dashboard comes from this replay, so a store of energy that
+    never fills up shows as money the day never spent.
+
+    With the car's SoC frozen at its midnight value, every solve is told the car still needs
+    its whole charge and keeps reserving the cheapest quarters for it; because the replay
+    executes slot 0 of each solve, the car is charged over and over. On 2026-07-23 that put
+    16.1 kWh of EV load into the projection across 28 slots spanning 00:45 to 18:00, against
+    the 7.1 kWh the car really needed, and roughly 3 euro of phantom import on the line.
+    """
+
+    START_SOC_PCT = 8.0
+
+    def _spy_replay(self, ev_soc, n_qtrs=20):
+        """Run the real replay against the real optimiser, recording what each solve was told."""
+        seen: list = []
+        real = mod.optimise
+
+        def spy(**kw):
+            seen.append(kw.get("ev_soc"))
+            return real(**kw)
+
+        okw = dict(prices=prices_make(), radiation=_build_radiation(cloud_flat(8)),
+                   load_profile=LOAD_NORM, today=TODAY, mode="DYNAMIC_PRICE",
+                   ev_soc=ev_soc, ref_temp_by_hour=REF_TEMP)
+        with patch.object(mod, "optimise", side_effect=spy):
+            mod.rolling_replay(start_qtr=0, end_qtr=n_qtrs, initial_soc_pct=50.0,
+                               deadband_pct=mod.bc.SOC_DISCHARGE_DEADBAND,
+                               optimise_kwargs=okw)
+        return seen
+
+    def test_the_first_solve_gets_the_starting_charge(self):
+        seen = self._spy_replay(self.START_SOC_PCT)
+        self.assertEqual(seen[0], self.START_SOC_PCT)
+
+    def test_the_car_fills_up_as_the_replay_runs(self):
+        """The regression: every entry used to be the midnight value."""
+        seen = self._spy_replay(self.START_SOC_PCT)
+        self.assertGreater(max(seen), self.START_SOC_PCT,
+                           "the car was charged but the next solve was not told about it")
+
+    def test_the_car_is_never_charged_past_its_target(self):
+        seen = self._spy_replay(self.START_SOC_PCT)
+        self.assertLessEqual(max(seen), mod.BMW_TARGET_SOC_PCT)
+
+    def test_no_more_energy_than_the_car_can_hold(self):
+        seen     = self._spy_replay(self.START_SOC_PCT)
+        need_kwh = (mod.BMW_TARGET_SOC_PCT - self.START_SOC_PCT) / 100.0 * mod.BMW_BATTERY_KWH
+        drawn    = (max(seen) - self.START_SOC_PCT) / 100.0 * mod.BMW_BATTERY_KWH
+        self.assertLessEqual(drawn, need_kwh + 1e-6)
+
+    def test_a_full_car_is_left_alone(self):
+        seen = self._spy_replay(mod.BMW_TARGET_SOC_PCT)
+        self.assertEqual(set(seen), {mod.BMW_TARGET_SOC_PCT})
+
+    def test_no_car_at_all_stays_none(self):
+        """A missing BMW reading must not become a 0% car that the replay then charges."""
+        seen = self._spy_replay(None)
+        self.assertEqual(set(seen), {None})
+
+
+class TestRollingReplayDeadbandCarriesEv(unittest.TestCase):
+    """A deadband firing holds the battery; it does not unplug the car.
+
+    The forced-STANDBY branch built its own grid figure and left ev_kwh out of it, so every
+    deadband slot understated the import by the car's draw -- the same total_demand the
+    dispatch simulation already uses for its own STANDBY slots.
+    """
+
+    LOAD_KWH = 0.07
+    EV_KWH   = 0.575                      # 2.3 kW for a quarter hour
+
+    def _one_slot_replay(self, ev_kwh):
+        slot = mod.HourSlot(dt=datetime(2026, 7, 23, 3, 0), price_eur_kwh=0.10,
+                            pv_kwh=0.0, load_kwh=self.LOAD_KWH, ev_kwh=ev_kwh,
+                            action="BATTERY_FIRST+DISCHARGE", soc_end_pct=20.0)
+        okw = dict(prices=prices_make(), radiation=_build_radiation(cloud_flat(8)),
+                   load_profile=LOAD_NORM, today=TODAY, mode="DYNAMIC_PRICE",
+                   ev_soc=50.0, ref_temp_by_hour=REF_TEMP)
+        with patch.object(mod, "optimise", return_value=([slot], "OK")):
+            results = mod.rolling_replay(start_qtr=12, end_qtr=13, initial_soc_pct=20.0,
+                                         deadband_pct=23.0, optimise_kwargs=okw)
+        return results[0]
+
+    def test_the_deadband_fired(self):
+        _, executed, _, _, _, _ = self._one_slot_replay(self.EV_KWH)
+        self.assertEqual(executed, "STANDBY")
+
+    def test_the_grid_carries_house_and_car(self):
+        *_, grid, _ = self._one_slot_replay(self.EV_KWH)
+        self.assertAlmostEqual(grid, self.LOAD_KWH + self.EV_KWH, places=6)
+
+    def test_without_a_car_only_the_house_is_carried(self):
+        *_, grid, _ = self._one_slot_replay(0.0)
+        self.assertAlmostEqual(grid, self.LOAD_KWH, places=6)
+
+    def test_the_car_makes_the_slot_more_expensive(self):
+        *_, with_ev   = self._one_slot_replay(self.EV_KWH)
+        *_, without   = self._one_slot_replay(0.0)
+        self.assertGreater(with_ev, without)
+
+
+class TestReadEvSocAt(unittest.TestCase):
+    """A backfilled day has to start from the car that day actually had.
+
+    A replay is a dry run, and a dry run skips the BMW read, so a backfill used to reconstruct
+    the day with no car at all -- simply the opposite of the frozen-car error. 2026-07-23 really
+    drew 7.1 kWh into the car overnight.
+    """
+
+    WHEN = datetime(2026, 7, 23, 0, 0)
+
+    def _conn(self, row):
+        cur  = MagicMock()
+        cur.fetchone.return_value = row
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        return conn, cur
+
+    def test_a_reading_comes_back_as_a_float(self):
+        conn, _ = self._conn((8,))
+        self.assertEqual(mod.read_ev_soc_at(conn, self.WHEN), 8.0)
+
+    def test_no_reading_is_none_and_not_zero(self):
+        """None reads as 'no car'. Zero would read as an empty car and get itself charged."""
+        conn, _ = self._conn(None)
+        self.assertIsNone(mod.read_ev_soc_at(conn, self.WHEN))
+
+    def test_a_null_column_is_none(self):
+        conn, _ = self._conn((None,))
+        self.assertIsNone(mod.read_ev_soc_at(conn, self.WHEN))
+
+    def test_it_looks_backwards_never_forwards(self):
+        """The next reading already holds the charge the replay is meant to plan."""
+        conn, cur = self._conn((8,))
+        mod.read_ev_soc_at(conn, self.WHEN, lookback_h=6)
+        sql, params = cur.execute.call_args[0]
+        self.assertIn("ts <= %s", sql)
+        self.assertIn("ORDER BY ts DESC", sql)
+        self.assertEqual(params[0], self.WHEN)
+        self.assertEqual(params[1], self.WHEN - timedelta(hours=6))
+
+    def test_it_writes_nothing(self):
+        conn, cur = self._conn((8,))
+        mod.read_ev_soc_at(conn, self.WHEN)
+        self.assertNotIn("INSERT", cur.execute.call_args[0][0].upper())
+        conn.commit.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1296,6 +1296,26 @@ def read_current_state(conn) -> dict:
     return row or {}
 
 
+def read_ev_soc_at(conn, when: datetime, lookback_h: int = 6) -> Optional[float]:
+    """The car's charge as it stood at `when` — the newest reading at or before that moment.
+
+    Only used by a replay, which has to start from the day it is reconstructing rather than
+    from tonight. Looking backwards and not forwards is the point: the next reading already
+    contains the charge the replay is supposed to plan, and feeding that in would hand the
+    solver its own answer. Returns None when the car was not seen, which the LP reads as
+    "no car" — honest, and the same thing a live run does with a failed BMW read.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT bmw_soc_pct FROM energy
+        WHERE ts <= %s AND ts > %s AND bmw_soc_pct IS NOT NULL
+        ORDER BY ts DESC LIMIT 1
+    """, (when, when - timedelta(hours=lookback_h)))
+    row = cur.fetchone()
+    cur.close()
+    return float(row[0]) if row and row[0] is not None else None
+
+
 def read_avg_consumption(conn, hours: int = HISTORY_HOURS) -> float:
     skip  = _read_load_skip_days()
     now   = datetime.now()
@@ -2945,20 +2965,33 @@ def rolling_replay(
     advance the SoC by that one executed slot, then step forward. Reproduces the near-floor
     charge->hold sawtooth that a single solve cannot (it is a rolling-horizon artefact).
     Analysis only - never writes to the DB.
+
+    Both stores of energy have to move with the replay, not just the house battery. The car's
+    SoC used to stay frozen at its midnight value for all 96 solves, so every solve was told
+    the car still needed its full charge and kept picking the cheapest quarters for it. Taking
+    slot 0 of each of those solves charged the car over and over: on 2026-07-23 the projection
+    carried 16.1 kWh of EV load across 28 slots from 00:45 to 18:00, against the 7.1 kWh the
+    car actually needed, and the phantom import put roughly 3 euro on the predicted line.
     """
     soc, cum, fired = initial_soc_pct, 0.0, 0
+    okw      = dict(optimise_kwargs)          # local copy -- ev_soc advances per step
+    ev_soc   = okw.pop("ev_soc", None)
+    ev_total = 0.0
     results: list = []
-    log.info("ROLL === rolling replay  qtr %d->%d  soc0=%.1f%%  deadband=%.1f%% ===",
-             start_qtr, end_qtr, soc, deadband_pct)
+    log.info("ROLL === rolling replay  qtr %d->%d  soc0=%.1f%%  deadband=%.1f%%  ev_soc=%s ===",
+             start_qtr, end_qtr, soc, deadband_pct,
+             f"{ev_soc:.0f}%" if ev_soc is not None else "n/a")
     for qtr in range(start_qtr, end_qtr):
-        schedule, _ = optimise(start_qtr_idx=qtr, initial_soc_pct=soc, **optimise_kwargs)
+        schedule, _ = optimise(start_qtr_idx=qtr, initial_soc_pct=soc, ev_soc=ev_soc, **okw)
         if not schedule:
             break
         s0 = schedule[0]
         planned = s0.action
         if "DISCHARGE" in planned and soc < deadband_pct:
             executed = "STANDBY"                       # deadband -> hold, export PV directly
-            net      = s0.pv_kwh - s0.load_kwh
+            # The car keeps drawing while the battery holds, so the grid carries it here too --
+            # the same total_demand the dispatch simulation uses for its own STANDBY slots.
+            net      = s0.pv_kwh - s0.load_kwh - s0.ev_kwh
             gi, ge   = max(-net, 0.0), max(net, 0.0)
             cost     = gi * s0.import_price() - ge * s0.export_price()
             grid     = gi - ge                         # +import / -export
@@ -2975,8 +3008,13 @@ def rolling_replay(
                  s0.dt.strftime("%m-%d %H:%M"), planned, executed, soc, new_soc,
                  cost, cum, "  <deadband>" if executed != planned else "")
         soc = new_soc
-    log.info("ROLL === done: %d slots, %d deadband firings, cum_cost=EUR %+.4f, end_soc=%.1f%% ===",
-             end_qtr - start_qtr, fired, cum, soc)
+        # The car charges on its own schedule, whatever the battery was told to do.
+        if ev_soc is not None and s0.ev_kwh > 0.0:
+            ev_soc    = min(ev_soc + s0.ev_kwh / BMW_BATTERY_KWH * 100.0, BMW_TARGET_SOC_PCT)
+            ev_total += s0.ev_kwh
+    log.info("ROLL === done: %d slots, %d deadband firings, cum_cost=EUR %+.4f, end_soc=%.1f%%, "
+             "ev_charged=%.2f kWh ===",
+             end_qtr - start_qtr, fired, cum, soc, ev_total)
     return results
 
 
@@ -3029,6 +3067,13 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     if dry_run:
         log.info("DRY-RUN: EV plug check skipped")
         ev_is_charging, ev_soc = False, None
+        if replay_at is not None:
+            # A replay must start from the car the day actually had, the same way the house
+            # battery already does above. Leaving it None backfills a day with no car at all,
+            # which is just the opposite error: on 2026-07-23 the car really drew 7.1 kWh.
+            ev_soc = read_ev_soc_at(conn, replay_at)
+            log.info("REPLAY: initial EV SoC %s at %s (actual)",
+                     f"{ev_soc:.0f}%" if ev_soc is not None else "unknown", replay_at)
     else:
         # Use hourly prices for optimal start time calculation
         ev_is_charging, ev_soc = run_ev_charging(current_hour, prices)
