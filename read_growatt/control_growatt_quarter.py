@@ -1095,7 +1095,8 @@ def run_data_collection(client):
             "sph_bat_act_charge_discharge_power_w", "sph_bat_voltage_v",
             "sph_bat_charge_today_kwh", "sph_bat_charge_total_kwh",
             "sph_bat_discharge_today_kwh", "sph_bat_discharge_total_kwh",
-            "sph_grid_power_w", "sph_fault_code", "sph_fault_sub_code",
+            "sph_grid_power_w", "sph_grid_meter_power_w",
+            "sph_fault_code", "sph_fault_sub_code",
             "sph_alarm_code", "sph_alarm_sub_code",
         ], table=DB_TABLE)
         e_used_today = etodaynet + PV_Etoday
@@ -1120,6 +1121,11 @@ def run_data_collection(client):
             f"{regs.get('REG_Daily_discharge_of_battery', 0):.1f}",
             f"{regs.get('REG_Cummulative_discharge_of_battery', 0):.1f}",
             f"{regs.get('REG_AC_POWER_H', 0):.1f}",
+            # Signed net grid from the inverter's own meter (reg 31112), read in the same
+            # 60 s Modbus poll as PV and battery. + = import, - = export. This is the
+            # coherent, unaveraged grid figure the flow dashboard needs: sph_grid_power_w
+            # above is REG_AC_POWER_H, the unsigned inverter AC output, not net grid.
+            f"{regs.get('REG_AC_METER_POWER', 0):.1f}",
             fault_code,
             fault_sub,
             alarm_code,
