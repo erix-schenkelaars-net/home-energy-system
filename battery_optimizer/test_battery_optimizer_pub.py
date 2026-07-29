@@ -1269,5 +1269,54 @@ class TestReadEvSocAt(unittest.TestCase):
         conn.commit.assert_not_called()
 
 
+class TestEvConnectorGate(unittest.TestCase):
+    """A car that is home but not plugged in must not get EV load planned.
+
+    'plug on' only powers the Antela wall socket; connectorStatus is what says the cable is in
+    the car. On 2026-07-29 the car sat home at 92% with the socket on but DISCONNECTED, and
+    run_ev_charging still returned (True, soc) — so the LP planned 0.62 kWh of phantom EV load.
+    The gate keys off the connector, so a powered-but-empty socket plans nothing (and, if the
+    optimizer owns the socket, drops it).
+    """
+
+    def _run(self, connector, plug="on", optimizer_owns=True):
+        with patch.object(mod, "ev_at_home", return_value=True), \
+             patch.object(mod, "read_bmw_state_mqtt",
+                          return_value=(92.0, "NOCHARGING", connector)), \
+             patch.object(mod, "get_ha_switch_state", return_value=plug), \
+             patch.object(mod, "ev_plug_is_optimizer_controlled", return_value=optimizer_owns), \
+             patch.object(mod, "set_ha_switch") as set_sw, \
+             patch.object(mod, "set_ev_plug_control_flag"), \
+             patch.object(mod, "get_ha_sensor_float", return_value=3.0):
+            result = mod.run_ev_charging(15, prices_make())
+        return result, set_sw
+
+    def test_disconnected_plans_no_ev_load(self):
+        # ev_soc None -> compute_ev_load_schedule returns all-zero: no phantom charge.
+        (charging, soc), _ = self._run("DISCONNECTED")
+        self.assertFalse(charging)
+        self.assertIsNone(soc)
+
+    def test_disconnected_drops_an_optimizer_owned_socket(self):
+        _, set_sw = self._run("DISCONNECTED", plug="on", optimizer_owns=True)
+        set_sw.assert_called_with(mod.HA_EV_PLUG_ENTITY, False)
+
+    def test_disconnected_leaves_a_user_owned_socket_alone(self):
+        _, set_sw = self._run("DISCONNECTED", plug="on", optimizer_owns=False)
+        set_sw.assert_not_called()
+
+    def test_connected_below_threshold_still_charges(self):
+        # Cable in the car + socket on + SoC under the start threshold -> keep the run going.
+        (charging, soc), _ = self._run("CONNECTED")
+        self.assertTrue(charging)
+        self.assertEqual(soc, 92.0)
+
+    def test_unknown_connector_does_not_block(self):
+        # No connector field published (None) must not be read as DISCONNECTED.
+        (charging, soc), _ = self._run(None)
+        self.assertTrue(charging)
+        self.assertEqual(soc, 92.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

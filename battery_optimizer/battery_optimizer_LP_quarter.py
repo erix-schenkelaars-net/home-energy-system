@@ -2926,7 +2926,7 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
     if at_home is None:
         log.info("EV: location unknown — skipping location check")
 
-    soc, charging_status, _ = read_bmw_state_mqtt()
+    soc, charging_status, connector = read_bmw_state_mqtt()
 
     if soc is None and charging_status is None:
         log.warning("EV: MQTT read failed — plug unchanged")
@@ -2934,8 +2934,20 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
         return plug_state == "on", None
 
     plug_state = get_ha_switch_state(HA_EV_PLUG_ENTITY)
-    log.info("EV: SoC=%s%%  charging_status=%s  plug=%s",
-             f"{soc:.0f}" if soc is not None else "?", charging_status, plug_state)
+    log.info("EV: SoC=%s%%  charging_status=%s  connector=%s  plug=%s",
+             f"{soc:.0f}" if soc is not None else "?", charging_status, connector, plug_state)
+
+    # The car must be plugged IN, not just the wall socket powered. 'plug on' is only the Antela
+    # socket; connectorStatus is what says the cable is in the car. Planning EV load off a
+    # powered-but-empty socket is the phantom charge this closes (car home, DISCONNECTED, plug on).
+    if connector == "DISCONNECTED":
+        if plug_state == "on" and ev_plug_is_optimizer_controlled():
+            log.info("EV: connector DISCONNECTED (car not plugged in) — turning plug OFF")
+            set_ha_switch(HA_EV_PLUG_ENTITY, False)
+            set_ev_plug_control_flag(False)
+        else:
+            log.info("EV: connector DISCONNECTED (car not plugged in) — no EV load planned")
+        return False, None
 
     # BMW reports done -> stop if optimizer controls the plug
     if charging_status == "CHARGINGENDED":
@@ -3268,7 +3280,16 @@ def _sleep_until_next_quarter():
         if plug_state != "on":
             continue
 
-        soc, charging_status, _ = read_bmw_state_mqtt()
+        soc, charging_status, connector = read_bmw_state_mqtt()
+
+        if connector == "DISCONNECTED":
+            if ev_plug_is_optimizer_controlled():
+                log.info("EV poll: connector DISCONNECTED (car unplugged) — turning plug OFF")
+                set_ha_switch(HA_EV_PLUG_ENTITY, False)
+                set_ev_plug_control_flag(False)
+            else:
+                log.info("EV poll: connector DISCONNECTED, but plug controlled by HA/remote — skipping OFF")
+            continue
 
         if charging_status == "CHARGINGENDED":
             if ev_plug_is_optimizer_controlled():
