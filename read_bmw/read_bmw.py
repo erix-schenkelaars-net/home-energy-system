@@ -505,7 +505,11 @@ def _on_bmw_message(local: mqtt.Client, topic: str, payload: dict):
             retain=True,
         )
 
-    log.debug(f"State updated for {vin} ({len(data)} key(s))")
+    kv = ", ".join(
+        f"{k}={(m.get('value') if isinstance(m, dict) else m)!r}"
+        for k, m in data.items()
+    )
+    log.info(f"State updated for {vin} ({len(data)} key(s)): {kv}")
 
 
 # ── BMW MQTT client (MQTTv5, TLS, port 9000) ──────────────────────────────────
