@@ -214,6 +214,11 @@ EV_CHARGE_CONTIGUOUS        = (os.environ.get("EV_CHARGE_CONTIGUOUS", "true")
                                .strip().lower() in ("1", "true", "yes", "on"))
 EV_CHARGE_DETECT_W          = 100    # minimum power (W) to confirm BMW is charging
 EV_POWER_CHECK_WAIT_S       = 60     # wait time (s) after plug-on before power check
+# Probe-and-commit: switch the socket ON in the cheapest window and watch the plug power.
+# Power is the truth (connectorStatus is useless on this car); >1000 W means it is charging.
+EV_PROBE_POWER_W            = 1000   # measured plug power (W) that proves the BMW is charging
+EV_PROBE_WINDOW_S           = 180    # after plug-on, wait this long for power before abandoning
+EV_PROBE_RETRY_S            = 300    # after a failed probe, wait this long before trying again
 BMW_HOME_LAT                = float(os.environ.get("BMW_HOME_LAT", "52.0"))
 BMW_HOME_LON                = float(os.environ.get("BMW_HOME_LON", "5.0"))
 BMW_HOME_RADIUS_M           = 200    # maximum distance from home (metres)
@@ -1480,6 +1485,15 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
 
     today = now.date()
 
+    # Drop stale EV from past slots. write is forward-only, so a forecast written into a slot that
+    # then passes (a sliding cheapest window the car never plugged into, or yesterday's plan for
+    # this morning) would linger and inflate the EV total. The plan/forecast is only meaningful
+    # going forward; real charging is confirmed live via power, not reconstructed from these rows.
+    cur.execute("UPDATE battery_schedule SET ev_kwh = 0 "
+                "WHERE ev_kwh > 0 AND slot_dt < %s AND DATE(slot_dt) = %s",
+                (now.replace(minute=qtr_min, second=0, microsecond=0), today.isoformat()))
+    conn.commit()
+
     # Optimizer full-day total as known at THIS run: latest forecast per today
     # quarter-slot. Past slots persist from earlier runs, so the morning is
     # recovered from the DB even though this run's schedule is forward-only.
@@ -1881,23 +1895,23 @@ def predict_hp_correction_kwh(forecast_temp_c: float, ref_temp_c: float, hour: i
 # 5c.  EV CHARGE SCHEDULE
 # ---------------------------------------------------------------------------
 
-def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
-                              prices: dict[int, float],
-                              ev_soc: Optional[float],
-                              current_hour: int) -> list[float]:
-    """Return per-quarter-slot EV charging energy (kWh/slot = kW × SLOT_H) before the
-    BMW_READY_BY_HOUR deadline.
+def ev_charge_window(start_qtr_idx: int, prices: dict[int, float],
+                     ev_soc: Optional[float], current_hour: int,
+                     n_slots: Optional[int] = None) -> list[int]:
+    """Absolute quarter-indices of the cheapest run that charges the EV from ev_soc to target
+    before the BMW_READY_BY_HOUR deadline. Empty when no charge is needed.
 
-    EV_CHARGE_CONTIGUOUS picks the shape: the cheapest unbroken run of the quarters the car
-    needs, which is what the plug actually does, or the cheapest quarters wherever they fall,
-    which is cheaper on paper and unreachable in practice.
+    Shared by compute_ev_load_schedule() (to place the LP load) and run_ev_charging() (to gate
+    when a probe may start), so the plan and the plug always agree on when charging happens.
+    EV_CHARGE_CONTIGUOUS picks the shape: the unbroken run the plug actually does, or the
+    cheapest quarters wherever they fall. n_slots (optional) bounds the horizon.
     """
     if ev_soc is None or ev_soc >= BMW_TARGET_SOC_PCT:
-        return [0.0] * n_slots
+        return []
 
     energy_needed = (BMW_TARGET_SOC_PCT - ev_soc) / 100.0 * BMW_BATTERY_KWH
     if energy_needed < 0.1:
-        return [0.0] * n_slots
+        return []
 
     qtrs_needed  = math.ceil(energy_needed / (BMW_CHARGE_POWER_KW * SLOT_H))
     deadline_qtr = ((BMW_READY_BY_HOUR if current_hour < BMW_READY_BY_HOUR
@@ -1905,18 +1919,20 @@ def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
 
     candidates = []
     _t = tariff_for(date.today())
-    for i in range(n_slots):
+    i  = 0
+    while start_qtr_idx + i < deadline_qtr and (n_slots is None or i < n_slots):
         abs_qtr = start_qtr_idx + i
-        if abs_qtr >= deadline_qtr:
-            break
-        p     = prices.get(abs_qtr, 0.25)
-        allin = p + _t.energiebelasting_kwh + _t.inkoop_kwh
+        p       = prices.get(abs_qtr, 0.25)
+        allin   = p + _t.energiebelasting_kwh + _t.inkoop_kwh
         candidates.append((allin, i))
+        i += 1
+    if not candidates:
+        return []
 
     if EV_CHARGE_CONTIGUOUS:
         # Slide a window of the length the car needs over the slots left before the deadline
         # and keep the cheapest position. Short of a full window there is no choice left --
-        # take everything that remains, the same last-chance branch ev_optimal_start() has.
+        # take everything that remains (the last-chance branch when the deadline is close).
         window   = min(qtrs_needed, len(candidates))
         best_at  = 0
         best_sum = float("inf")
@@ -1929,12 +1945,33 @@ def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
         candidates.sort(key=lambda x: x[0])
         chosen = {idx for _, idx in candidates[:qtrs_needed]}
 
+    return sorted(start_qtr_idx + idx for idx in chosen)
+
+
+def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
+                              prices: dict[int, float],
+                              ev_soc: Optional[float],
+                              current_hour: int) -> list[float]:
+    """Return per-quarter-slot EV charging energy (kWh/slot = kW × SLOT_H) before the
+    BMW_READY_BY_HOUR deadline, placed on the same slots as ev_charge_window().
+    """
+    if ev_soc is None or ev_soc >= BMW_TARGET_SOC_PCT:
+        return [0.0] * n_slots
+
+    energy_needed = (BMW_TARGET_SOC_PCT - ev_soc) / 100.0 * BMW_BATTERY_KWH
+    if energy_needed < 0.1:
+        return [0.0] * n_slots
+
+    qtrs_needed = math.ceil(energy_needed / (BMW_CHARGE_POWER_KW * SLOT_H))
+    chosen_abs  = ev_charge_window(start_qtr_idx, prices, ev_soc, current_hour, n_slots)
+    chosen      = {a - start_qtr_idx for a in chosen_abs}
+
     ev_kwh   = BMW_CHARGE_POWER_KW * SLOT_H  # kWh per active quarter slot
     schedule = [ev_kwh if i in chosen else 0.0 for i in range(n_slots)]
     log.info("EV schedule: need=%.2f kWh  qtrs=%d  shape=%s  slots=%s",
              energy_needed, qtrs_needed,
              "contiguous" if EV_CHARGE_CONTIGUOUS else "cheapest",
-             sorted(start_qtr_idx + i for i in chosen))
+             chosen_abs)
     return schedule
 
 
@@ -2873,42 +2910,70 @@ def ev_plug_is_optimizer_controlled() -> bool:
         return False
 
 
-def ev_optimal_start(current_hour: int, prices: dict[int, float], soc: float) -> int:
-    """Find optimal hour to start EV charging using quarter-slot prices.
+# --- EV probe/charge-session state -------------------------------------------------------
+# The optimiser is one long-running process (while True: main(); sleep-poll), so this latch
+# survives across the per-quarter main() calls and the 60s poll loop.
+_ev_session_started   = False   # latch: real charging seen (power/INIT) -> never interrupt it
+_ev_probe_on_since    = None    # ts the plug was switched on to probe (None = not probing)
+_ev_probe_retry_after = None    # ts before which no new probe is attempted (after a failed one)
 
-    Returns: hour (0-23) to start charging. Real start may be within that hour
-    depending on quarter-slot optimization in LP (compute_ev_load_schedule).
+
+def _ev_reset_session() -> None:
+    """Forget the current charge session (car left, or the BMW reported CHARGINGENDED)."""
+    global _ev_session_started, _ev_probe_on_since, _ev_probe_retry_after
+    _ev_session_started   = False
+    _ev_probe_on_since    = None
+    _ev_probe_retry_after = None
+
+
+def _ev_probe_tick(charging_status: Optional[str]) -> Optional[float]:
+    """One evaluation of a running probe (plug is on, session not yet ended). Owns the plug and
+    the latch only -- it never plans load (that is run_ev_charging's return value).
+
+      * power > EV_PROBE_POWER_W (or the BMW reports INITIALIZATION/CHARGINGACTIVE) -> the car
+        is charging: latch the session so it is never interrupted again.
+      * still idle (~0 W, NOCHARGING) after EV_PROBE_WINDOW_S -> nothing was plugged in: switch
+        the socket off and space out the next attempt.
+      * belt-and-suspenders: never abort while charging_status is anything but NOCHARGING, so a
+        slow handshake mid-INITIALIZATION is never cut (that is what caused the CHARGINGERROR).
+
+    Returns the measured plug power (W) for logging, or None if unavailable.
     """
-    energy_needed = max(0.0, (BMW_TARGET_SOC_PCT - soc) / 100.0 * BMW_BATTERY_KWH)
-    qtrs_needed   = math.ceil(energy_needed / (BMW_CHARGE_POWER_KW * SLOT_H))
+    global _ev_session_started, _ev_probe_on_since, _ev_probe_retry_after
+    power_w  = get_ha_sensor_float(HA_EV_PLUG_POWER_ENTITY)
+    charging = (power_w is not None and power_w > EV_PROBE_POWER_W) \
+               or charging_status in ("INITIALIZATION", "CHARGINGACTIVE")
 
-    deadline_hour = BMW_READY_BY_HOUR if current_hour < BMW_READY_BY_HOUR else BMW_READY_BY_HOUR + 24
-    must_start_by_qtr = deadline_hour * 4 - qtrs_needed
-    current_qtr = current_hour * 4
+    if charging:
+        if not _ev_session_started:
+            log.info("EV: charging confirmed (%.0fW, %s) — session committed, holding plug",
+                     power_w or 0, charging_status)
+        _ev_session_started = True
+        _ev_probe_on_since  = None
+        return power_w
 
-    if current_qtr >= must_start_by_qtr:
-        return current_hour  # already in last-chance window
+    if _ev_session_started:
+        return power_w                      # committed session briefly idle -> never interrupt
 
-    best_start_hour = current_hour
-    best_cost = float("inf")
-    _t        = tariff_for(date.today())
+    if _ev_probe_on_since is None:
+        _ev_probe_on_since = time.time()    # plug came on outside our probe -> treat as one now
+        return power_w
 
-    for start_qtr in range(current_qtr, must_start_by_qtr + 1):
-        window_qtrs = list(range(start_qtr, start_qtr + qtrs_needed))
-        if not all(q in prices for q in window_qtrs):
-            continue
-        cost = sum(prices[q] + _t.energiebelasting_kwh + _t.inkoop_kwh
-                   for q in window_qtrs)
-        if cost < best_cost:
-            best_cost = cost
-            best_start_hour = start_qtr // 4
-
-    log.info("EV: SoC=%.0f%%  need=%.1fh (%dqtr)  deadline=%d  best_start=%d  est_cost=€%.3f",
-             soc, energy_needed / BMW_CHARGE_POWER_KW, qtrs_needed, deadline_hour, best_start_hour, best_cost)
-    return best_start_hour
+    waited = time.time() - _ev_probe_on_since
+    if waited >= EV_PROBE_WINDOW_S and charging_status == "NOCHARGING":
+        if ev_plug_is_optimizer_controlled():
+            log.info("EV: probe idle %.0fs (%.0fW, NOCHARGING) — nothing plugged in, "
+                     "plug OFF, retry in %ds", waited, power_w or 0, EV_PROBE_RETRY_S)
+            set_ha_switch(HA_EV_PLUG_ENTITY, False)
+            set_ev_plug_control_flag(False)
+        _ev_probe_on_since    = None
+        _ev_probe_retry_after = time.time() + EV_PROBE_RETRY_S
+    return power_w
 
 
-def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, Optional[float]]:
+def run_ev_charging(current_hour: int, start_qtr_idx: int,
+                    prices: dict[int, float]) -> tuple[bool, Optional[float]]:
+    global _ev_session_started, _ev_probe_on_since, _ev_probe_retry_after
     log.info("EV charge check...")
 
     at_home = ev_at_home()
@@ -2922,6 +2987,7 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
             log.info("EV: car not at home, but plug controlled by HA/remote — skipping OFF")
         else:
             log.info("EV: car not at home — skipping charge")
+        _ev_reset_session()
         return False, None
     if at_home is None:
         log.info("EV: location unknown — skipping location check")
@@ -2937,7 +3003,7 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
     log.info("EV: SoC=%s%%  charging_status=%s  plug=%s",
              f"{soc:.0f}" if soc is not None else "?", charging_status, plug_state)
 
-    # BMW reports done -> stop if optimizer controls the plug
+    # BMW reports done -> stop if optimizer controls the plug (car already stopped; no interrupt)
     if charging_status == "CHARGINGENDED":
         if plug_state == "on" and ev_plug_is_optimizer_controlled():
             log.info("EV: CHARGINGENDED — turning plug OFF")
@@ -2947,6 +3013,7 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
             log.info("EV: CHARGINGENDED, but plug controlled by HA/remote — skipping OFF")
         else:
             log.info("EV: CHARGINGENDED, plug already off")
+        _ev_reset_session()
         return False, soc
 
     # Near full -> no new cycle; if plug already on, let it run until CHARGINGENDED
@@ -2959,46 +3026,44 @@ def run_ev_charging(current_hour: int, prices: dict[int, float]) -> tuple[bool, 
                  soc, BMW_SOC_START_THRESHOLD_PCT)
         return False, soc
 
-    # Plug already on -> log power (informational), keep on until CHARGINGENDED
+    # Plug already on -> commit-or-hold via the probe tick; only report load when charging.
     if plug_state == "on":
-        power_w = get_ha_sensor_float(HA_EV_PLUG_POWER_ENTITY)
-        log.info("EV: plug on, SoC=%.0f%%, power=%.0fW", soc or 0, power_w or 0)
-        if power_w is not None and power_w > EV_CHARGE_DETECT_W:
-            log.info("EV: charging confirmed (%.0fW) — keeping plug on", power_w)
-        else:
-            log.info("EV: low power (%.0fW) — car at home, keeping plug on until CHARGINGENDED",
-                     power_w or 0)
-        return True, soc
+        power_w = _ev_probe_tick(charging_status)
+        if _ev_session_started:
+            log.info("EV: charging (%.0fW, SoC=%.0f%%) — planning load, holding plug",
+                     power_w or 0, soc or 0)
+            return True, soc
+        log.info("EV: plug on, probing (%.0fW, %s, SoC=%.0f%%) — no load planned yet",
+                 power_w or 0, charging_status, soc or 0)
+        return False, soc
 
-    # Plug off, SoC unknown
+    # Plug off from here on -> no active session
+    _ev_session_started = False
+
     if soc is None:
         log.warning("EV: SoC unknown — plug unchanged")
         return False, None
 
-    # Plug off, SoC below threshold -> determine optimal start window
-    optimal_start = ev_optimal_start(current_hour, prices, soc)
-    if current_hour < optimal_start:
-        log.info("EV: waiting for optimal window (start=%d now=%d), SoC=%.0f%%",
-                 optimal_start, current_hour, soc)
+    # Space out repeated failed probes
+    if _ev_probe_retry_after is not None and time.time() < _ev_probe_retry_after:
+        log.info("EV: waiting %.0fs before next probe attempt (SoC=%.0f%%)",
+                 _ev_probe_retry_after - time.time(), soc)
         return False, soc
 
-    # Optimal window reached -> turn on and verify power draw
-    log.info("EV: optimal window (start=%d now=%d), SoC=%.0f%% — turning plug ON",
-             optimal_start, current_hour, soc)
+    # Only start when we are inside the cheapest run that reaches the target (the LP's window)
+    window = ev_charge_window(start_qtr_idx, prices, soc, current_hour)
+    if not window or start_qtr_idx not in window:
+        log.info("EV: not in cheapest charge window yet (window starts %s, now=%d, SoC=%.0f%%) — waiting",
+                 window[0] if window else "—", start_qtr_idx, soc)
+        return False, soc
+
+    # In the cheapest window -> switch the socket on and start probing (power confirms next ticks)
+    log.info("EV: cheapest window reached (SoC=%.0f%%, now=%d) — plug ON, probing for power",
+             soc, start_qtr_idx)
     set_ha_switch(HA_EV_PLUG_ENTITY, True)
     set_ev_plug_control_flag(True)
-
-    log.info("EV: waiting %ds for power response...", EV_POWER_CHECK_WAIT_S)
-    time.sleep(EV_POWER_CHECK_WAIT_S)
-
-    power_w = get_ha_sensor_float(HA_EV_PLUG_POWER_ENTITY)
-    log.info("EV: power after %ds = %.0fW", EV_POWER_CHECK_WAIT_S, power_w or 0)
-    if power_w is not None and power_w > EV_CHARGE_DETECT_W:
-        log.info("EV: charging confirmed (%.0fW)", power_w)
-    else:
-        log.info("EV: low power (%.0fW) — keeping plug on, waiting for CHARGINGENDED or location check",
-                 power_w or 0)
-    return True, soc
+    _ev_probe_on_since = time.time()
+    return False, soc
 
 
 # ---------------------------------------------------------------------------
@@ -3128,9 +3193,13 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
             ev_soc = read_ev_soc_at(conn, replay_at)
             log.info("REPLAY: initial EV SoC %s at %s (actual)",
                      f"{ev_soc:.0f}%" if ev_soc is not None else "unknown", replay_at)
+        ev_soc_real = ev_soc
     else:
-        # Use hourly prices for optimal start time calculation
-        ev_is_charging, ev_soc = run_ev_charging(current_hour, prices)
+        # start_qtr_idx gates the probe to the same cheapest window the LP schedules the load in
+        ev_is_charging, ev_soc = run_ev_charging(current_hour, start_qtr_idx, prices)
+        ev_soc_real = ev_soc    # keep the real SoC for the forecast display (LP goes weightless below)
+        if not ev_is_charging:
+            ev_soc = None   # budget EV load in the LP only once charging is confirmed (power>1000W)
     if ev_is_charging:
         log.info("EV is charging — included in LP load profile")
 
@@ -3219,6 +3288,23 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         log.info("DRY-RUN: DB writes skipped (schedule, applied, simulation)")
         _print_full_schedule(schedule)
     else:
+        # Forecast-only: stamp the intended charge window into ev_kwh so the dashboard shows WHEN
+        # a charge is planned, without weighting the plan. optimise() and simulate_and_report() ran
+        # with ev_soc=None (weightless), so grid/cost/battery are untouched; here we only fill the
+        # display column. Once a session is actually charging, ev_soc is passed through and counted
+        # above, and this branch is skipped.
+        if (not ev_is_charging and ev_soc_real is not None
+                and ev_soc_real < BMW_SOC_START_THRESHOLD_PCT):
+            _win = ev_charge_window(start_qtr_idx, prices, ev_soc_real, current_hour, len(schedule))
+            if _win:
+                _ev_slot = BMW_CHARGE_POWER_KW * SLOT_H
+                _wset    = set(_win)
+                for _t, _s in enumerate(schedule):
+                    if start_qtr_idx + _t in _wset:
+                        _s.ev_kwh = _ev_slot
+                log.info("EV forecast: planned start %s, %d qtr(s), %.2f kWh (display only)",
+                         schedule[_win[0] - start_qtr_idx].dt.strftime("%d %H:%M"),
+                         len(_win), len(_win) * _ev_slot)
         write_schedule_to_db(conn, schedule, solver_status)
         mark_slot_applied(conn, next_slot.dt)
         write_simulation_to_db(conn, sim_results)
@@ -3277,11 +3363,15 @@ def _sleep_until_next_quarter():
                 set_ev_plug_control_flag(False)
             else:
                 log.info("EV poll: CHARGINGENDED, but plug controlled by HA/remote — skipping OFF")
+            _ev_reset_session()
             continue
 
-        power_w = get_ha_sensor_float(HA_EV_PLUG_POWER_ENTITY)
-        log.info("EV poll: SoC=%s%% %.0fW",
-                 f"{soc:.0f}" if soc is not None else "?", power_w or 0)
+        # Commit the session once power flows, or abandon an idle probe -- but never interrupt a
+        # committed/initialising session (that belt-and-suspenders lives in _ev_probe_tick).
+        power_w = _ev_probe_tick(charging_status)
+        log.info("EV poll: SoC=%s%% %.0fW %s",
+                 f"{soc:.0f}" if soc is not None else "?", power_w or 0,
+                 "charging" if _ev_session_started else "probing")
 
 
 if __name__ == "__main__":

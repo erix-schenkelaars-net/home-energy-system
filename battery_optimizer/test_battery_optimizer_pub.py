@@ -11,6 +11,7 @@ The LP optimizer is called with mocked data — no DB, no real API, no solar API
 Quarter-hour slots: start_hour * 4 = start_qtr_idx.
 """
 
+import contextlib
 import os
 import sys
 import unittest
@@ -1267,6 +1268,133 @@ class TestReadEvSocAt(unittest.TestCase):
         mod.read_ev_soc_at(conn, self.WHEN)
         self.assertNotIn("INSERT", cur.execute.call_args[0][0].upper())
         conn.commit.assert_not_called()
+
+
+class TestEvProbeCharging(unittest.TestCase):
+    """Power-first EV control: probe the socket in the cheapest window, commit on real power,
+    and never interrupt a running or initialising session.
+
+    connectorStatus is useless on this car (proven live 2026-07-29: it stayed DISCONNECTED all
+    through INITIALIZATION -> CHARGINGACTIVE, and cutting mid-INITIALIZATION caused CHARGINGERROR
+    + a physical reconnect). So power is the truth and a committed session is latched.
+    """
+
+    def setUp(self):
+        mod._ev_reset_session()
+
+    def _run(self, *, soc=80.0, status="NOCHARGING", plug="on", power=0.0,
+             optimizer_owns=True, at_home=True, hour=0, start_qtr=0, prices=None):
+        if prices is None:
+            prices = {q: 0.22 for q in range(192)}   # flat -> cheapest window starts now
+        with contextlib.ExitStack() as st:
+            st.enter_context(patch.object(mod, "ev_at_home", return_value=at_home))
+            st.enter_context(patch.object(mod, "read_bmw_state_mqtt",
+                                          return_value=(soc, status, None)))
+            st.enter_context(patch.object(mod, "get_ha_switch_state", return_value=plug))
+            st.enter_context(patch.object(mod, "get_ha_sensor_float", return_value=power))
+            st.enter_context(patch.object(mod, "ev_plug_is_optimizer_controlled",
+                                          return_value=optimizer_owns))
+            self.set_sw = st.enter_context(patch.object(mod, "set_ha_switch"))
+            st.enter_context(patch.object(mod, "set_ev_plug_control_flag"))
+            return mod.run_ev_charging(hour, start_qtr, prices)
+
+    def _turned_off(self):
+        return any(c.args == (mod.HA_EV_PLUG_ENTITY, False) for c in self.set_sw.call_args_list)
+
+    def _turned_on(self):
+        return any(c.args == (mod.HA_EV_PLUG_ENTITY, True) for c in self.set_sw.call_args_list)
+
+    # -- plug already on --
+    def test_idle_plug_plans_no_load(self):
+        # the original phantom bug: plug on, ~0 W, NOCHARGING -> no EV load, and plug left alone
+        self.assertEqual(self._run(power=0.0), (False, 80.0))
+        self.assertFalse(self._turned_off())
+
+    def test_power_over_threshold_commits_and_plans(self):
+        self.assertEqual(self._run(power=2000.0), (True, 80.0))
+        self.assertTrue(mod._ev_session_started)
+
+    def test_initialization_commits(self):
+        self.assertEqual(self._run(power=0.0, status="INITIALIZATION"), (True, 80.0))
+        self.assertTrue(mod._ev_session_started)
+
+    def test_committed_session_never_interrupted(self):
+        mod._ev_session_started = True
+        # a live session momentarily reads 0 W / NOCHARGING between cycles -> must NOT be cut
+        self.assertEqual(self._run(power=0.0, status="NOCHARGING"), (True, 80.0))
+        self.assertFalse(self._turned_off())
+
+    def test_idle_probe_aborts_after_window(self):
+        mod._ev_probe_on_since = 0.0             # switched on "long ago" (epoch)
+        res = self._run(power=0.0, status="NOCHARGING")
+        self.assertEqual(res, (False, 80.0))
+        self.assertTrue(self._turned_off())
+        self.assertIsNotNone(mod._ev_probe_retry_after)
+
+    def test_probe_not_aborted_while_not_nocharging(self):
+        mod._ev_probe_on_since = 0.0             # past the window
+        # a non-NOCHARGING status (slow handshake / error retry) must never be cut
+        res = self._run(power=0.0, status="CHARGINGERROR")
+        self.assertEqual(res, (False, 80.0))
+        self.assertFalse(self._turned_off())
+
+    def test_charging_ended_turns_off_and_resets(self):
+        mod._ev_session_started = True
+        res = self._run(status="CHARGINGENDED")
+        self.assertEqual(res, (False, 80.0))
+        self.assertTrue(self._turned_off())
+        self.assertFalse(mod._ev_session_started)
+
+    def test_not_home_turns_off_and_resets(self):
+        mod._ev_session_started = True
+        res = self._run(at_home=False, plug="on")
+        self.assertEqual(res, (False, None))
+        self.assertTrue(self._turned_off())
+        self.assertFalse(mod._ev_session_started)
+
+    # -- plug off --
+    def test_in_cheapest_window_starts_probe(self):
+        res = self._run(plug="off", power=0.0)   # flat prices -> window starts now
+        self.assertEqual(res, (False, 80.0))
+        self.assertTrue(self._turned_on())
+        self.assertIsNotNone(mod._ev_probe_on_since)
+
+    def test_outside_cheapest_window_waits(self):
+        # dear now, cheap later -> cheapest 3-slot run is [12,13,14], not slot 0
+        prices = {q: (0.05 if 12 <= q <= 14 else 0.50) for q in range(192)}
+        res = self._run(plug="off", prices=prices, start_qtr=0, hour=0)
+        self.assertEqual(res, (False, 80.0))
+        self.assertFalse(self._turned_on())
+
+    def test_retry_spacing_blocks_immediate_reprobe(self):
+        mod._ev_probe_retry_after = 9e18         # far in the future
+        res = self._run(plug="off")
+        self.assertEqual(res, (False, 80.0))
+        self.assertFalse(self._turned_on())
+
+    def test_soc_at_or_above_threshold_no_new_cycle(self):
+        res = self._run(plug="off", soc=96.0)
+        self.assertEqual(res, (False, 96.0))
+        self.assertFalse(self._turned_on())
+
+
+class TestEvChargeWindow(unittest.TestCase):
+    """Single source of truth for WHEN the car charges: the cheapest contiguous run to target,
+    as absolute quarter indices. Feeds both the LP schedule and the probe-start gate, and (as a
+    forecast) the dashboard's EV column."""
+
+    def test_returns_contiguous_absolute_indices(self):
+        win = mod.ev_charge_window(0, {q: 0.22 for q in range(192)}, 80.0, 0)
+        self.assertTrue(win)
+        self.assertEqual(win, list(range(win[0], win[0] + len(win))))   # contiguous
+        self.assertEqual(win[0], 0)                                     # flat -> starts now
+
+    def test_a_full_car_has_no_window(self):
+        self.assertEqual(mod.ev_charge_window(0, {q: 0.22 for q in range(192)}, 100.0, 0), [])
+
+    def test_picks_the_cheap_pocket(self):
+        prices = {q: (0.05 if 12 <= q <= 14 else 0.50) for q in range(192)}
+        self.assertEqual(mod.ev_charge_window(0, prices, 80.0, 0), [12, 13, 14])
 
 
 if __name__ == "__main__":
