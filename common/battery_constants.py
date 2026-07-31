@@ -60,10 +60,13 @@ SOC_HIGH_RESUME    = 88  # releases high-SoC lock (2% hysteresis)
 # the vmin taper and cycles the weakest cell for ~zero € gain (the 17% round-trip loss is
 # already priced into the LP physics, so the intra-quarter arbitrage margin here is nil).
 # Below this SoC the controller substitutes STANDBY (hold + export PV directly). Non-latching:
-# re-evaluated every control cycle against the live SPH SoC, so discharge resumes on its own
-# once SoC recovers above it. Sits well above SOC_DISCHARGE_STOP=17 so it never fights the
-# hardware floor guards.
-SOC_DISCHARGE_DEADBAND = 23  # min SPH SoC (integer %) to allow BATTERY_FIRST+DISCHARGE
+# re-evaluated every control cycle against the live Seplos SoC (2026-07-30 SoC-source fix), so
+# discharge resumes on its own once SoC recovers above it. Sits well above SOC_DISCHARGE_STOP=17
+# so it never fights the hardware floor guards.
+# Lowered 23 -> 21 on 2026-07-31: with the reliable Seplos SoC the near-floor sawtooth was largely
+# an SPH-noise artefact; a 7-day rolling-replay showed 21 strictly >= 23 (never worse, cheaper on
+# the days it fires, identical end-SoC). The vmin taper (3120 mV) remains the physical cell guard.
+SOC_DISCHARGE_DEADBAND = 21  # min Seplos SoC (%) to allow BATTERY_FIRST+DISCHARGE
 
 # ── Cell-voltage guards (mV) — controller fallback when SoC coulomb counter drifts ──
 # SoC is unreliable at low charge (coulomb counter drift, sudden BMS recalibration).
