@@ -1341,7 +1341,7 @@ class TestEvProbeCharging(unittest.TestCase):
     def test_charging_ended_turns_off_and_resets(self):
         mod._ev_session_started = True
         res = self._run(status="CHARGINGENDED")
-        self.assertEqual(res, (False, 80.0))
+        self.assertEqual(res, (False, None))   # done -> no load AND no forecast (even if SoC stale)
         self.assertTrue(self._turned_off())
         self.assertFalse(mod._ev_session_started)
 

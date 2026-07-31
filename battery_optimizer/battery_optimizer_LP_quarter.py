@@ -1485,12 +1485,12 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
 
     today = now.date()
 
-    # Drop stale EV from past slots. write is forward-only, so a forecast written into a slot that
-    # then passes (a sliding cheapest window the car never plugged into, or yesterday's plan for
-    # this morning) would linger and inflate the EV total. The plan/forecast is only meaningful
-    # going forward; real charging is confirmed live via power, not reconstructed from these rows.
+    # Drop only STALE FORECAST from past slots (ev_kwh < 0 = display-only forecast). A forecast
+    # written into a slot the car never plugged into, or yesterday's plan for this morning, would
+    # otherwise linger. Real committed charges are stored POSITIVE and are kept — they are the
+    # honest record of what the car actually drew (which the high measured Load/Grid reflect).
     cur.execute("UPDATE battery_schedule SET ev_kwh = 0 "
-                "WHERE ev_kwh > 0 AND slot_dt < %s AND DATE(slot_dt) = %s",
+                "WHERE ev_kwh < 0 AND slot_dt < %s AND DATE(slot_dt) = %s",
                 (now.replace(minute=qtr_min, second=0, microsecond=0), today.isoformat()))
     conn.commit()
 
@@ -3014,7 +3014,7 @@ def run_ev_charging(current_hour: int, start_qtr_idx: int,
         else:
             log.info("EV: CHARGINGENDED, plug already off")
         _ev_reset_session()
-        return False, soc
+        return False, None   # car is done -> no EV load AND no forecast, even if SoC still reads stale
 
     # Near full -> no new cycle; if plug already on, let it run until CHARGINGENDED
     if soc is not None and soc >= BMW_SOC_START_THRESHOLD_PCT:
@@ -3301,7 +3301,9 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
                 _wset    = set(_win)
                 for _t, _s in enumerate(schedule):
                     if start_qtr_idx + _t in _wset:
-                        _s.ev_kwh = _ev_slot
+                        _s.ev_kwh = -_ev_slot   # NEGATIVE = forecast (display only), so it is
+                                                # distinguishable from a real committed charge
+                                                # (positive) and never confused for one when clearing.
                 log.info("EV forecast: planned start %s, %d qtr(s), %.2f kWh (display only)",
                          schedule[_win[0] - start_qtr_idx].dt.strftime("%d %H:%M"),
                          len(_win), len(_win) * _ev_slot)
