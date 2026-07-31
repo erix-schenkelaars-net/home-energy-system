@@ -38,12 +38,20 @@ like the change silently not working:
 
 | Service | Code arrives via | Applies with |
 |---|---|---|
-| read_seplos, read_p1, read_knmi | bind-mount `.:/app` | `docker compose restart` |
-| battery_optimizer, read_bmw, read_growatt, dashboards | `COPY` into the image | `docker compose build --no-cache && up -d` |
+| read_seplos, read_p1, read_knmi, read_growatt | bind-mount `.:/app` | `docker compose restart` |
+| battery_optimizer, read_bmw, dashboards | `COPY` into the image | `docker compose build && up -d` |
 
-For image-based services, always `--no-cache`: a cached `COPY` layer will happily ship the old
-code. And always pair `build` with `up -d` — building alone leaves the old container running.
-`./rebuild-all.sh` does `down` + `up -d --build` for every service that has a compose file.
+read_growatt mounts `.:/app` (verified 2026-07-31: container `/app` md5 == host), so its code —
+like read_seplos — applies on `restart`; no build. `common/` is bind-mounted (`../common:/app/common:ro`)
+into read_growatt **and** battery_optimizer, so a change to a constant there applies on `restart` too.
+
+For the genuine image-based services, plain `docker compose build` is enough for a code edit: the
+`COPY` layer is content-addressed, so a changed file invalidates exactly that layer and ships the new
+code while the slow `pip install` layer is reused (the big time saver). Reach for `--no-cache` (and
+`--pull`) only when refreshing a dependency you did not bump in requirements.txt, or a base image — or
+as the sledgehammer if a change mysteriously will not apply. Always pair `build` with `up -d` —
+building alone leaves the old container running. `./rebuild-all.sh` does `down` + `up -d --build` for
+every service that has a compose file.
 
 ## Logging
 
