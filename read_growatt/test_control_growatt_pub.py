@@ -29,7 +29,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -1055,8 +1055,66 @@ class TestReadBatteryScheduleSlot(unittest.TestCase):
         self.assertIsNone(result)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class TestSeplosSocFromDb(unittest.TestCase):
+    """soc_glob must come from the live Seplos coulomb counter, not the SPH REG_SOC that freezes
+    at rest (2026-07-30: SPH sat at 19% while the Seplos was ~30%). A stale Seplos value (read_seplos
+    stalled) returns None so the caller falls back to REG_SOC — the safe, conservative fallback."""
+
+    def _conn(self, row):
+        conn = MagicMock()
+        cur  = MagicMock()
+        cur.fetchone.return_value = row
+        conn.cursor.return_value = cur
+        return conn
+
+    def test_fresh_soc_is_returned(self):
+        conn = self._conn((21.7, datetime.now() - timedelta(seconds=60)))
+        with patch.object(ctrl.mysql.connector, "connect", return_value=conn):
+            self.assertAlmostEqual(ctrl.read_seplos_soc_from_db(), 21.7)
+
+    def test_stale_soc_falls_back_to_none(self):
+        conn = self._conn((21.7, datetime.now() - timedelta(seconds=ctrl.SOC_DB_STALE_S + 120)))
+        with patch.object(ctrl.mysql.connector, "connect", return_value=conn):
+            self.assertIsNone(ctrl.read_seplos_soc_from_db())
+
+    def test_no_row_returns_none(self):
+        conn = self._conn(None)
+        with patch.object(ctrl.mysql.connector, "connect", return_value=conn):
+            self.assertIsNone(ctrl.read_seplos_soc_from_db())
+
+    def test_db_error_returns_none(self):
+        with patch.object(ctrl.mysql.connector, "connect", side_effect=Exception("boom")):
+            self.assertIsNone(ctrl.read_seplos_soc_from_db())
+
+
+class TestDischargeDeadband(unittest.TestCase):
+    """Below SOC_DISCHARGE_DEADBAND the controller downgrades EXPORT/DISCHARGE to STANDBY (holds +
+    exports PV) to stop the near-floor charge->export sawtooth. Keyed off the live Seplos soc_glob."""
+
+    def setUp(self):
+        self.base   = make_conf()
+        self.now    = datetime(2026, 7, 30, 8, 0)
+        self._saved = ctrl.soc_glob
+
+    def tearDown(self):
+        ctrl.soc_glob = self._saved
+
+    def _mode(self, action, soc):
+        ctrl.soc_glob = soc
+        return ctrl.slot_to_conf({"action": action, "slot_dt": "2026-07-30 08:00:00"},
+                                 self.now, self.base).mode
+
+    def test_discharge_below_deadband_becomes_standby(self):
+        standby = self._mode("STANDBY", 50)
+        self.assertEqual(self._mode("BATTERY_FIRST+DISCHARGE", ctrl.SOC_DISCHARGE_DEADBAND - 2), standby)
+
+    def test_export_below_deadband_becomes_standby(self):
+        standby = self._mode("STANDBY", 50)
+        self.assertEqual(self._mode("EXPORT", ctrl.SOC_DISCHARGE_DEADBAND - 2), standby)
+
+    def test_discharge_above_deadband_is_not_standby(self):
+        standby = self._mode("STANDBY", 50)
+        self.assertNotEqual(self._mode("BATTERY_FIRST+DISCHARGE", ctrl.SOC_DISCHARGE_DEADBAND + 5), standby)
 
 
 if __name__ == "__main__":

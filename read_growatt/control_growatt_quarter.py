@@ -790,6 +790,40 @@ def read_vmin_from_db() -> Optional[int]:
         return None
 
 
+SOC_DB_STALE_S = 600   # Seplos SoC older than this (read_seplos stalled) -> fall back to SPH REG_SOC
+
+
+def read_seplos_soc_from_db() -> Optional[float]:
+    """Latest Seplos SoC (%) from seplos_soc_pct — the live BMS coulomb counter. The SPH's own
+    REG_SOC is unreliable: it freezes at rest, drifting up to ~15% below the Seplos (2026-07-30).
+    Returns None when unavailable or stale (older than SOC_DB_STALE_S) so the caller falls back to
+    REG_SOC, which is live during discharge and errs conservative (low) at rest — a safe fallback."""
+    try:
+        db = mysql.connector.connect(
+            host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
+            db=DB_NAME, ssl_disabled=True, connection_timeout=3
+        )
+        cur = db.cursor()
+        cur.execute(
+            f"SELECT seplos_soc_pct, ts FROM {DB_TABLE} "
+            f"WHERE seplos_soc_pct > 0 ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        cur.close()
+        db.close()
+        if not row:
+            return None
+        soc, ts = float(row[0]), row[1]
+        age = (datetime.now() - ts).total_seconds()
+        if age > SOC_DB_STALE_S:
+            dbg(1, "DB", f"Seplos SoC stale ({age:.0f}s old) — falling back to SPH REG_SOC")
+            return None
+        return soc
+    except Exception as e:
+        dbg(1, "DB", f"Failed to read Seplos SoC: {e}")
+        return None
+
+
 def read_battery_schedule_slot(now: datetime) -> Optional[dict]:
     """Read the battery_schedule slot for the current quarter from the DB.
 
@@ -860,9 +894,10 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
     # optimizer's quarter-price arbitrage would drain the battery straight back to the
     # ~19.9% floor for ~zero € gain (round-trip loss is already priced in the LP, so the
     # intra-quarter margin here is nil) while firing the vmin taper and cycling the weakest
-    # cell. Substitute STANDBY = hold + export PV directly (no round-trip loss). soc_glob is
-    # the live SPH SoC, refreshed by run_data_collection() earlier in this cycle; the 0<
-    # guard ignores a glitched 0-read so a genuine high-SoC discharge is never halted.
+    # cell. Substitute STANDBY = hold + export PV directly (no round-trip loss). soc_glob is the
+    # live Seplos SoC from the DB (SPH REG_SOC only as fallback — it freezes at rest, 2026-07-30),
+    # refreshed each cycle in main_loop(); the 0< guard ignores a glitched 0-read so a genuine
+    # high-SoC discharge is never halted.
     if action in ("BATTERY_FIRST+DISCHARGE", "EXPORT") \
             and soc_glob is not None and 0 < soc_glob < SOC_DISCHARGE_DEADBAND:
         # Log once per quarter (slot_to_conf runs every control cycle) with a running
@@ -1574,7 +1609,7 @@ def dbg_controller_state(cmd, soc):
 def main_loop():
     global soc_schedule_lock, CHECK_INTERVAL, MAX_TIME_SPAN
     global base_high_lock, base_low_lock, base_low_vmin_lock
-    global vmin_glob
+    global vmin_glob, soc_glob
 
     soc_schedule_lock = False
     base_high_lock    = False
@@ -1741,6 +1776,11 @@ def main_loop():
         vmin_db = read_vmin_from_db()
         if vmin_db is not None:
             vmin_glob = vmin_db
+
+        seplos_soc = read_seplos_soc_from_db()
+        if seplos_soc is not None:
+            soc_glob = seplos_soc   # live BMS SoC; REG_SOC (set in run_data_collection) is now
+                                    # only the fallback — it freezes at rest (see 2026-07-30)
 
         cfg            = read_conf(CONF_PATH)
         CHECK_INTERVAL = cfg.check_interval
