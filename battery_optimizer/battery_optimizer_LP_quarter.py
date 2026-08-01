@@ -1548,8 +1548,8 @@ def store_predicted_snapshot(conn, schedule: list[HourSlot], today: date, overwr
     Stored on the first run of the day (schedule then spans the full day from 00:00) and never
     overwritten, so the dashboard's predicted line is a stable day-ahead grid-flow expectation
     instead of the per-slot frozen plans — which over-predict export because each rolling run
-    planned a near-floor DISCHARGE the deadband later converted to STANDBY. Pure grid cash flow;
-    the battery is deliberately left out (we only show hard euros to/from the grid).
+    re-solves from the actual SoC, diverging from the frozen single-solve plan. Pure grid cash
+    flow; the battery is deliberately left out (we only show hard euros to/from the grid).
     """
     cur = conn.cursor()
     cur.execute("""
@@ -1584,12 +1584,11 @@ def store_predicted_snapshot(conn, schedule: list[HourSlot], today: date, overwr
 
 
 def store_rolling_predicted_snapshot(conn, today: date, initial_soc_pct: float,
-                                     deadband_pct: float, optimise_kwargs: dict,
-                                     overwrite: bool = False):
-    """Optie (b): predicted-snapshot uit de ROLLING projectie (bootst de 15-min lus incl. de
-    deadband na), zodat de predicted-lijn de near-floor arbitrage vangt die het single-solve
-    dagplan mist. ~96 LP-solves — 1x/dag (of via --snapshot backfill). Alleen harde grid-euro s,
-    batterij buiten beschouwing. Valt stil terug (geen snapshot) bij een fout."""
+                                     optimise_kwargs: dict, overwrite: bool = False):
+    """Optie (b): predicted-snapshot uit de ROLLING projectie (bootst de 15-min lus na), zodat de
+    predicted-lijn de rollende MPC-uitvoering vangt die het single-solve dagplan mist. ~96
+    LP-solves — 1x/dag (of via --snapshot backfill). Alleen harde grid-euro s, batterij buiten
+    beschouwing. Valt stil terug (geen snapshot) bij een fout."""
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS predicted_grid_snapshot (
@@ -1605,7 +1604,7 @@ def store_rolling_predicted_snapshot(conn, today: date, initial_soc_pct: float,
     cur.close()
     try:
         results = rolling_replay(start_qtr=0, end_qtr=96, initial_soc_pct=initial_soc_pct,
-                                 deadband_pct=deadband_pct, optimise_kwargs=optimise_kwargs)
+                                 optimise_kwargs=optimise_kwargs)
     except Exception as exc:
         log.error("Rolling snapshot failed (%s) — no predicted snapshot stored", exc)
         return
@@ -1620,8 +1619,7 @@ def store_rolling_predicted_snapshot(conn, today: date, initial_soc_pct: float,
           (snapshot_date, slot_dt, action, pv_kwh, load_kwh, grid_kwh, cost_eur)
           VALUES (%s,%s,%s,%s,%s,%s,%s)""", rows)
     conn.commit(); cur.close()
-    log.info("Rolling predicted snapshot stored: %d slots for %s (deadband=%.0f%%)",
-             len(rows), today, deadband_pct)
+    log.info("Rolling predicted snapshot stored: %d slots for %s", len(rows), today)
 
 
 def mark_slot_applied(conn, slot_dt: datetime):
@@ -3074,16 +3072,14 @@ def rolling_replay(
     start_qtr: int,
     end_qtr: int,
     initial_soc_pct: float,
-    deadband_pct: float,
     optimise_kwargs: dict,
 ) -> list:
     """Rolling-horizon dry-run: mimic the real 15-min control loop on a past day.
 
     Each quarter: re-solve the LP from the live SoC (like a production run), take the
-    CURRENT slot's planned action, apply the discharge deadband (mirror control_growatt),
-    advance the SoC by that one executed slot, then step forward. Reproduces the near-floor
-    charge->hold sawtooth that a single solve cannot (it is a rolling-horizon artefact).
-    Analysis only - never writes to the DB.
+    CURRENT slot's planned action, advance the SoC by that one executed slot, then step
+    forward. This is the realistic executed trajectory (MPC), which a single solve cannot
+    reproduce. Analysis only - never writes to the DB.
 
     Both stores of energy have to move with the replay, not just the house battery. The car's
     SoC used to stay frozen at its midnight value for all 96 solves, so every solve was told
@@ -3092,48 +3088,34 @@ def rolling_replay(
     carried 16.1 kWh of EV load across 28 slots from 00:45 to 18:00, against the 7.1 kWh the
     car actually needed, and the phantom import put roughly 3 euro on the predicted line.
     """
-    soc, cum, fired = initial_soc_pct, 0.0, 0
+    soc, cum = initial_soc_pct, 0.0
     okw      = dict(optimise_kwargs)          # local copy -- ev_soc advances per step
     ev_soc   = okw.pop("ev_soc", None)
     ev_total = 0.0
     results: list = []
-    log.info("ROLL === rolling replay  qtr %d->%d  soc0=%.1f%%  deadband=%.1f%%  ev_soc=%s ===",
-             start_qtr, end_qtr, soc, deadband_pct,
+    log.info("ROLL === rolling replay  qtr %d->%d  soc0=%.1f%%  ev_soc=%s ===",
+             start_qtr, end_qtr, soc,
              f"{ev_soc:.0f}%" if ev_soc is not None else "n/a")
     for qtr in range(start_qtr, end_qtr):
         schedule, _ = optimise(start_qtr_idx=qtr, initial_soc_pct=soc, ev_soc=ev_soc, **okw)
         if not schedule:
             break
         s0 = schedule[0]
-        planned = s0.action
-        if "DISCHARGE" in planned and soc < deadband_pct:
-            executed = "STANDBY"                       # deadband -> hold, export PV directly
-            # The car keeps drawing while the battery holds, so the grid carries it here too --
-            # the same total_demand the dispatch simulation uses for its own STANDBY slots.
-            net      = s0.pv_kwh - s0.load_kwh - s0.ev_kwh
-            gi, ge   = max(-net, 0.0), max(net, 0.0)
-            cost     = gi * s0.import_price() - ge * s0.export_price()
-            grid     = gi - ge                         # +import / -export
-            new_soc  = soc                             # battery passive
-            fired   += 1
-        else:
-            executed = planned
-            cost     = s0.cost_eur
-            grid     = s0.grid_kwh
-            new_soc  = s0.soc_end_pct
+        action  = s0.action
+        cost    = s0.cost_eur
+        grid    = s0.grid_kwh
+        new_soc = s0.soc_end_pct
         cum += cost
-        results.append((s0.dt, executed, s0.pv_kwh, s0.load_kwh, grid, cost))
-        log.info("ROLL  %s  %-24s -> %-10s soc %.1f->%.1f  cost %+.4f  cum %+.4f%s",
-                 s0.dt.strftime("%m-%d %H:%M"), planned, executed, soc, new_soc,
-                 cost, cum, "  <deadband>" if executed != planned else "")
+        results.append((s0.dt, action, s0.pv_kwh, s0.load_kwh, grid, cost))
+        log.info("ROLL  %s  %-24s  soc %.1f->%.1f  cost %+.4f  cum %+.4f",
+                 s0.dt.strftime("%m-%d %H:%M"), action, soc, new_soc, cost, cum)
         soc = new_soc
         # The car charges on its own schedule, whatever the battery was told to do.
         if ev_soc is not None and s0.ev_kwh > 0.0:
             ev_soc    = min(ev_soc + s0.ev_kwh / BMW_BATTERY_KWH * 100.0, BMW_TARGET_SOC_PCT)
             ev_total += s0.ev_kwh
-    log.info("ROLL === done: %d slots, %d deadband firings, cum_cost=EUR %+.4f, end_soc=%.1f%%, "
-             "ev_charged=%.2f kWh ===",
-             end_qtr - start_qtr, fired, cum, soc, ev_total)
+    log.info("ROLL === done: %d slots, cum_cost=EUR %+.4f, end_soc=%.1f%%, ev_charged=%.2f kWh ===",
+             end_qtr - start_qtr, cum, soc, ev_total)
     return results
 
 
@@ -3216,7 +3198,6 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     okw_base = dict(prices=prices, radiation=radiation, load_profile=load_prof, today=today,
                     mode=mode, ev_soc=ev_soc, ref_temp_by_hour=ref_temp_by_hour,
                     inday_load_factor=inday_factor, cooling_factors=cooling_facs)
-    deadband_pct = float(os.getenv("DEADBAND_PCT", str(bc.SOC_DISCHARGE_DEADBAND)))
 
     if rolling_range is not None:
         end_q = round((rolling_range[1] - datetime.combine(today, datetime.min.time())).total_seconds() / 900)
@@ -3224,7 +3205,6 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
             start_qtr       = start_qtr_idx,
             end_qtr         = end_q,
             initial_soc_pct = soc_pct,
-            deadband_pct    = deadband_pct,
             optimise_kwargs = {**okw_base, "replay_date": today},
         )
         conn.close()
@@ -3256,7 +3236,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         # Rebuild the predicted line from the forecast the day was actually planned with,
         # not from the corrections that arrived during it — see the replay_forecast note in
         # optimise(). Without this a backfilled day quietly outperforms a live one.
-        store_rolling_predicted_snapshot(conn, snapshot_date, soc_pct, deadband_pct,
+        store_rolling_predicted_snapshot(conn, snapshot_date, soc_pct,
                                          {**okw_base, "replay_date": snapshot_date,
                                           "replay_forecast": "snapshot"}, overwrite=True)
         conn.close()
@@ -3310,7 +3290,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         write_schedule_to_db(conn, schedule, solver_status)
         mark_slot_applied(conn, next_slot.dt)
         write_simulation_to_db(conn, sim_results)
-        store_rolling_predicted_snapshot(conn, today, soc_pct, deadband_pct,
+        store_rolling_predicted_snapshot(conn, today, soc_pct,
                                          {**okw_base, "replay_date": None}, overwrite=False)
 
     conn.close()

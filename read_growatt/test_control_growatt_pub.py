@@ -1087,34 +1087,37 @@ class TestSeplosSocFromDb(unittest.TestCase):
             self.assertIsNone(ctrl.read_seplos_soc_from_db())
 
 
-class TestDischargeDeadband(unittest.TestCase):
-    """Below SOC_DISCHARGE_DEADBAND the controller downgrades EXPORT/DISCHARGE to STANDBY (holds +
-    exports PV) to stop the near-floor charge->export sawtooth. Keyed off the live Seplos soc_glob."""
+class TestDischargePowerFromPlan(unittest.TestCase):
+    """Discharge power follows the LP's planned bat_kwh (|bat_kwh| x 4 = kW over the 15-min slot),
+    not a blind 3 kW. Near the floor the LP plans a small discharge, so the rate tapers on its own
+    -> a steady slot instead of a 3 kW burst, which keeps the weakest cell's Vmin higher and makes
+    the actual SoC track the plan."""
 
     def setUp(self):
-        self.base   = make_conf()
-        self.now    = datetime(2026, 7, 30, 8, 0)
-        self._saved = ctrl.soc_glob
+        self.base = make_conf()
+        self.now  = datetime(2026, 8, 1, 9, 0)
 
-    def tearDown(self):
-        ctrl.soc_glob = self._saved
+    def _power(self, **slot):
+        slot.setdefault("action", "BATTERY_FIRST+DISCHARGE")
+        return ctrl.slot_to_conf(slot, self.now, self.base).power
 
-    def _mode(self, action, soc):
-        ctrl.soc_glob = soc
-        return ctrl.slot_to_conf({"action": action, "slot_dt": "2026-07-30 08:00:00"},
-                                 self.now, self.base).mode
+    def test_full_rate_is_100pct(self):
+        self.assertEqual(self._power(bat_kwh=-0.75), -100)      # 3 kW
 
-    def test_discharge_below_deadband_becomes_standby(self):
-        standby = self._mode("STANDBY", 50)
-        self.assertEqual(self._mode("BATTERY_FIRST+DISCHARGE", ctrl.SOC_DISCHARGE_DEADBAND - 2), standby)
+    def test_half_rate_is_50pct(self):
+        self.assertEqual(self._power(bat_kwh=-0.375), -50)      # 1.5 kW
 
-    def test_export_below_deadband_becomes_standby(self):
-        standby = self._mode("STANDBY", 50)
-        self.assertEqual(self._mode("EXPORT", ctrl.SOC_DISCHARGE_DEADBAND - 2), standby)
+    def test_small_near_floor_discharge_is_gentle(self):
+        self.assertEqual(self._power(bat_kwh=-0.30), -40)       # 1.2 kW, far below a 3 kW burst
 
-    def test_discharge_above_deadband_is_not_standby(self):
-        standby = self._mode("STANDBY", 50)
-        self.assertNotEqual(self._mode("BATTERY_FIRST+DISCHARGE", ctrl.SOC_DISCHARGE_DEADBAND + 5), standby)
+    def test_missing_bat_kwh_falls_back_to_full(self):
+        self.assertEqual(self._power(), -ctrl.DB_SCHEDULE_EXPORT_PCT)
+
+    def test_export_action_also_follows_the_plan(self):
+        self.assertEqual(self._power(action="EXPORT", bat_kwh=-0.375), -50)
+
+    def test_over_3kw_is_clamped_to_full(self):
+        self.assertEqual(self._power(bat_kwh=-1.0), -100)       # 4 kW clamps to 100%
 
 
 if __name__ == "__main__":

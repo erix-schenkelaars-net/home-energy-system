@@ -53,19 +53,11 @@ SOC_LOW_RESUME     = 20  # releases emergency lock (6% hysteresis above 14)
 SOC_HIGH_STOP      = 90  # emergency forced-discharge
 SOC_HIGH_RESUME    = 88  # releases high-SoC lock (2% hysteresis)
 
-# Discharge deadband (controller execution — NOT the LP plan). The optimizer's
-# quarter-price arbitrage can schedule BATTERY_FIRST+DISCHARGE while SoC sits just above
-# the 20% floor. With PV lower / load higher than forecast the battery barely charges and
-# each discharge slot dumps it straight back to ~19.9%: a charge→export sawtooth that fires
-# the vmin taper and cycles the weakest cell for ~zero € gain (the 17% round-trip loss is
-# already priced into the LP physics, so the intra-quarter arbitrage margin here is nil).
-# Below this SoC the controller substitutes STANDBY (hold + export PV directly). Non-latching:
-# re-evaluated every control cycle against the live Seplos SoC (2026-07-30 SoC-source fix — the SPH
-# REG_SOC freezes at rest), so discharge resumes on its own once SoC recovers above it. Sits well
-# above SOC_DISCHARGE_STOP=17 so it never fights the hardware floor guards.
-# Kept at 23 after a 2026-07-31 rolling-replay: lowering to 21 was a day-dependent wash (net
-# ~EUR 2/yr but a clear counter-example on 07-14), so the documented 23 stands.
-SOC_DISCHARGE_DEADBAND = 23  # min Seplos SoC (%) to allow BATTERY_FIRST+DISCHARGE
+# NB: the discharge deadband (a controller override that downgraded near-floor grid-export to
+# STANDBY) was REMOVED on 2026-08-01. Deterministic rolling-replays showed it was an economic
+# wash that also distorted the plan-vs-reality SoC path, and it partly patched the now-fixed
+# SPH-SoC freeze. The battery still serves load down to the 20% LP floor; the weakest cell is
+# protected by the vmin taper (3120 mV) below. Git history has SOC_DISCHARGE_DEADBAND if needed.
 
 # ── Cell-voltage guards (mV) — controller fallback when SoC coulomb counter drifts ──
 # SoC is unreliable at low charge (coulomb counter drift, sudden BMS recalibration).

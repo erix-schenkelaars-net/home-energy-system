@@ -195,9 +195,6 @@ SOC_HYST          = 2.0
 pdel_glob         = 0.0   # grid import W (positive = importing); updated each loop
 pret_glob         = 0.0   # grid export W (positive = exporting); updated each loop
 _meter_zero_count = 0      # consecutive meter=0.0 readings; alarm 401 fires after 5
-_deadband_last_slot = None # slot_dt of the quarter the discharge deadband last fired (dedup)
-_deadband_day       = None # date of the running deadband counter
-_deadband_count     = 0    # discharge-deadband firings so far today (one per quarter)
 soc_schedule_lock: bool = False  # module-level init; main_loop() declares global
 vmin_glob: Optional[int] = None  # latest min cell voltage in mV from seplos DB; None if unavailable
 
@@ -219,7 +216,6 @@ SOC_HIGH_RESUME    = bc.SOC_HIGH_RESUME    # 88  (2% hysteresis)
 SOC_DISCHARGE_STOP = bc.SOC_DISCHARGE_STOP # 17  (actual 17.0–17.9%)
 SOC_LOW_STOP       = bc.SOC_LOW_STOP       # 14  (actual 14.0–14.9%)
 SOC_LOW_RESUME     = bc.SOC_LOW_RESUME     # 20  (6% hysteresis)
-SOC_DISCHARGE_DEADBAND = bc.SOC_DISCHARGE_DEADBAND  # 23  (below -> STANDBY, non-latching)
 
 # --------------------------------------------------
 # CELL-VOLTAGE GUARDS — mV, parallel to SoC guards above
@@ -841,7 +837,7 @@ def read_battery_schedule_slot(now: datetime) -> Optional[dict]:
         cur = db.cursor(dictionary=True)
         cur.execute("""
             SELECT action, charge_kw, price_eur_kwh, pv_kwh, load_kwh,
-                   soc_start_pct, soc_end_pct, grid_kwh, slot_dt, created_at,
+                   soc_start_pct, soc_end_pct, grid_kwh, bat_kwh, slot_dt, created_at,
                    pv_curtail_kwh
             FROM battery_schedule
             WHERE slot_dt = %s
@@ -880,41 +876,11 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
     DISCHARGE -> same as LOAD_FIRST
     NORMAL    -> same as LOAD_FIRST
 
-    Floor deadband: a BATTERY_FIRST+DISCHARGE/EXPORT slot is downgraded to STANDBY when
-    the live SoC is below SOC_DISCHARGE_DEADBAND (23%), to stop the near-floor charge→
-    export sawtooth. Non-latching — re-evaluated every cycle against live soc_glob.
-
     minutes_end is set to the remaining minutes in the current quarter so the
     inverter timer stays accurate and expires naturally at the top of the quarter.
     """
     action         = (slot.get("action") or "NORMAL").upper().strip()
     mins_remaining = max(1, 15 - now.minute % 15)
-
-    # Floor deadband (execution-time, non-latching): below SOC_DISCHARGE_DEADBAND the
-    # optimizer's quarter-price arbitrage would drain the battery straight back to the
-    # ~19.9% floor for ~zero € gain (round-trip loss is already priced in the LP, so the
-    # intra-quarter margin here is nil) while firing the vmin taper and cycling the weakest
-    # cell. Substitute STANDBY = hold + export PV directly (no round-trip loss). soc_glob is the
-    # live Seplos SoC from the DB (SPH REG_SOC only as fallback — it freezes at rest, 2026-07-30),
-    # refreshed each cycle in main_loop(); the 0< guard ignores a glitched 0-read so a genuine
-    # high-SoC discharge is never halted.
-    if action in ("BATTERY_FIRST+DISCHARGE", "EXPORT") \
-            and soc_glob is not None and 0 < soc_glob < SOC_DISCHARGE_DEADBAND:
-        # Log once per quarter (slot_to_conf runs every control cycle) with a running
-        # daily tally, so `grep 'DISCHARGE deadband FIRED'` gives the day's count and
-        # each line marks a real intercepted charge->export oscillation.
-        global _deadband_last_slot, _deadband_day, _deadband_count
-        slot_key = str(slot.get("slot_dt"))
-        if slot_key != _deadband_last_slot:
-            _deadband_last_slot = slot_key
-            if now.date() != _deadband_day:
-                _deadband_day, _deadband_count = now.date(), 0
-            _deadband_count += 1
-            dbg(1, "CONF", f"DISCHARGE deadband FIRED #{_deadband_count} today @ "
-                           f"{now.strftime('%H:%M')}: live SoC {soc_glob}% < "
-                           f"{SOC_DISCHARGE_DEADBAND}% -> STANDBY (hold, export PV directly; "
-                           f"oscillation intercepted)")
-        action = "STANDBY"
 
     cfg = Conf(
         check_interval=base_cfg.check_interval,
@@ -945,7 +911,19 @@ def slot_to_conf(slot: dict, now: datetime, base_cfg: Conf, ac_meter_power_w: fl
     elif action in ("BATTERY_FIRST+DISCHARGE", "EXPORT"):
         cfg.priority    = Priority.BATTERY_FIRST
         cfg.mode        = RunMode.DISCHARGE
-        cfg.power       = -DB_SCHEDULE_EXPORT_PCT   # negative -> inverter discharges + exports to grid
+        # Discharge at the rate the LP actually planned (bat_kwh over the 15-min slot -> kW =
+        # |bat_kwh| / 0.25 = |bat_kwh| x 4), not a blind 3 kW. Near the floor the LP plans a small
+        # discharge, so the power tapers down on its own: the whole slot delivers steadily instead
+        # of a 3 kW burst that dumps to the floor early, which keeps the weakest cell's Vmin higher
+        # and makes the actual SoC track the plan (only PV/load forecast error left). REG_Remote
+        # power is % of the 3 kW battery rating, matching bat_kwh (the battery's own energy change).
+        # Falls back to full power if bat_kwh is missing (old rows) or non-negative.
+        bat_kwh = slot.get("bat_kwh")
+        if bat_kwh is not None and float(bat_kwh) < 0:
+            discharge_kw = min(bc.BAT_MAX_DISCHARGE_KW, abs(float(bat_kwh)) / 0.25)
+            cfg.power    = -kw_to_pct(discharge_kw)   # negative -> inverter discharges + exports
+        else:
+            cfg.power    = -DB_SCHEDULE_EXPORT_PCT
         cfg.ends_on     = Ends_on.TIME
         cfg.minutes_end = mins_remaining
         cfg.soc_end     = SOC_DISCHARGE_STOP
@@ -1529,7 +1507,7 @@ def select_config(now: datetime, cfg: Conf) -> tuple[Conf | Schedule, Source, Op
 
 
 def cmd_to_action(cmd) -> str:
-    """Canonieke actie-string van het WERKELIJK uitgevoerde commando (ná deadband + guards),
+    """Canonieke actie-string van het WERKELIJK uitgevoerde commando (ná de guards),
     in dezelfde vocabulaire als battery_schedule.action. Zo kan het dashboard plan vs
     uitvoering 1-op-1 vergelijken zonder zelf control-logica te herleiden."""
     if cmd.priority == Priority.LOAD_FIRST:
@@ -1540,7 +1518,7 @@ def cmd_to_action(cmd) -> str:
 
 def store_control_action(action: str) -> None:
     """Schrijf de uitgevoerde actie naar de laatste energy-rij (kolom control_action).
-    De 'intelligentie' (deadband/guards) is hier al opgelost -> de DB bevat de waarheid,
+    De 'intelligentie' (guards) is hier al opgelost -> de DB bevat de waarheid,
     het dashboard leest 'm er dom uit. Faalt stil: control mag nooit breken op een DB-fout."""
     try:
         db = mysql.connector.connect(host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,

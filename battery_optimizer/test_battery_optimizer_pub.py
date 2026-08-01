@@ -1010,7 +1010,6 @@ class TestRollingReplayAdvancesEvSoc(unittest.TestCase):
                    ev_soc=ev_soc, ref_temp_by_hour=REF_TEMP)
         with patch.object(mod, "optimise", side_effect=spy):
             mod.rolling_replay(start_qtr=0, end_qtr=n_qtrs, initial_soc_pct=50.0,
-                               deadband_pct=mod.bc.SOC_DISCHARGE_DEADBAND,
                                optimise_kwargs=okw)
         return seen
 
@@ -1042,47 +1041,6 @@ class TestRollingReplayAdvancesEvSoc(unittest.TestCase):
         """A missing BMW reading must not become a 0% car that the replay then charges."""
         seen = self._spy_replay(None)
         self.assertEqual(set(seen), {None})
-
-
-class TestRollingReplayDeadbandCarriesEv(unittest.TestCase):
-    """A deadband firing holds the battery; it does not unplug the car.
-
-    The forced-STANDBY branch built its own grid figure and left ev_kwh out of it, so every
-    deadband slot understated the import by the car's draw -- the same total_demand the
-    dispatch simulation already uses for its own STANDBY slots.
-    """
-
-    LOAD_KWH = 0.07
-    EV_KWH   = 0.575                      # 2.3 kW for a quarter hour
-
-    def _one_slot_replay(self, ev_kwh):
-        slot = mod.HourSlot(dt=datetime(2026, 7, 23, 3, 0), price_eur_kwh=0.10,
-                            pv_kwh=0.0, load_kwh=self.LOAD_KWH, ev_kwh=ev_kwh,
-                            action="BATTERY_FIRST+DISCHARGE", soc_end_pct=20.0)
-        okw = dict(prices=prices_make(), radiation=_build_radiation(cloud_flat(8)),
-                   load_profile=LOAD_NORM, today=TODAY, mode="DYNAMIC_PRICE",
-                   ev_soc=50.0, ref_temp_by_hour=REF_TEMP)
-        with patch.object(mod, "optimise", return_value=([slot], "OK")):
-            results = mod.rolling_replay(start_qtr=12, end_qtr=13, initial_soc_pct=20.0,
-                                         deadband_pct=23.0, optimise_kwargs=okw)
-        return results[0]
-
-    def test_the_deadband_fired(self):
-        _, executed, _, _, _, _ = self._one_slot_replay(self.EV_KWH)
-        self.assertEqual(executed, "STANDBY")
-
-    def test_the_grid_carries_house_and_car(self):
-        *_, grid, _ = self._one_slot_replay(self.EV_KWH)
-        self.assertAlmostEqual(grid, self.LOAD_KWH + self.EV_KWH, places=6)
-
-    def test_without_a_car_only_the_house_is_carried(self):
-        *_, grid, _ = self._one_slot_replay(0.0)
-        self.assertAlmostEqual(grid, self.LOAD_KWH, places=6)
-
-    def test_the_car_makes_the_slot_more_expensive(self):
-        *_, with_ev   = self._one_slot_replay(self.EV_KWH)
-        *_, without   = self._one_slot_replay(0.0)
-        self.assertGreater(with_ev, without)
 
 
 class TestReplayForecastSource(unittest.TestCase):
