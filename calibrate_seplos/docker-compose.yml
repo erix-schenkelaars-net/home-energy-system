@@ -1,0 +1,23 @@
+services:
+  calibrate_seplos:
+    build: .
+    container_name: calibrate_seplos
+    # profiles => start NIET mee met `docker compose up` / rebuild-all.
+    # Handmatig draaien:
+    #   read-only DB-monitor (stap a):  docker compose run --rm calibrate_seplos
+    #   directe bus-uitlezing (stap b):  CAL_MODE=bus docker compose run --rm calibrate_seplos
+    #   (stap b VEREIST dat read_seplos gestopt is: enige RS485-bus-gebruiker.)
+    profiles: ["calibrate"]
+    network_mode: "host"
+    privileged: true                  # nodig voor /dev/tty_seplos in bus-mode (ongebruikt in db-mode)
+    environment:
+      - TZ=Europe/Amsterdam
+    env_file:
+      - ../.env
+    volumes:
+      - .:/app                        # bind-mount: code-edit werkt op `run` (geen build nodig)
+      - /dev:/dev                     # RS485-device (bus-mode)
+      - ./logs:/logs
+      - ../common:/app/common:ro
+    group_add:
+      - dialout

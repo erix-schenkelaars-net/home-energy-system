@@ -541,3 +541,35 @@ LEFT JOIN `fixed_costs` `f`
       AND (`f`.`valid_until` IS NULL OR CAST(`e`.`ts` AS date) <= `f`.`valid_until`)
 GROUP BY CAST(`e`.`ts` AS date), `f`.`id`
 ORDER BY CAST(`e`.`ts` AS date) DESC;
+
+-- ---------------------------------------------------------------------------
+-- calibration_log
+-- ---------------------------------------------------------------------------
+-- Time series of the monthly top-balance calibration, written by calibrate_seplos.
+-- One session = one monthly calibration (session_id = start timestamp). The cadence is
+-- adaptive: slow low down, 1x/s in the balancing zone (cell_max >= 3500 mV) so the top of
+-- charge -- where the Seplos balancer finally runs and safety matters most -- is captured
+-- at high resolution. source='db' (step a: read from the DB that read_seplos fills) or
+-- 'bus' (step b: direct RS485 read, adds per-NTC temps + balancer bits). Deliberately its
+-- OWN table: calibrate_seplos writes nowhere else, so it can never clobber another service.
+-- Created by calibrate_seplos with CREATE TABLE IF NOT EXISTS; this is documentation only.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `calibration_log` (
+    `id`             BIGINT AUTO_INCREMENT PRIMARY KEY,
+    `session_id`     VARCHAR(32) NOT NULL,
+    `ts`             DATETIME NOT NULL,
+    `phase`          VARCHAR(16),          -- charge | absorb | done | idle | unknown
+    `source`         VARCHAR(8),           -- 'db' (step a) | 'bus' (step b)
+    `cel1_mv` INT, `cel2_mv` INT, `cel3_mv` INT, `cel4_mv` INT, `cel5_mv` INT, `cel6_mv` INT,
+    `cel7_mv` INT, `cel8_mv` INT, `cel9_mv` INT, `cel10_mv` INT, `cel11_mv` INT, `cel12_mv` INT,
+    `cel13_mv` INT, `cel14_mv` INT, `cel15_mv` INT, `cel16_mv` INT,
+    `cell_min_mv`    INT,  `cell_max_mv` INT,  `cell_delta_mv` INT,
+    `pack_v`         FLOAT, `pack_current_a` FLOAT, `soc_pct` FLOAT,
+    `temp_cell_min_c` FLOAT, `temp_cell_max_c` FLOAT, `temp_env_c` FLOAT, `temp_mosfet_c` FLOAT,
+    `sph_power_w`    FLOAT,
+    `balancing_bits` VARCHAR(40),          -- bus-only (step b), NULL in step a
+    `bms_vhigh`      VARCHAR(40),          -- BMS-own cell-Vhigh alarm (which cells); bus-only
+    `guard`          VARCHAR(10),          -- ok | warn | hardstop
+    `note`           VARCHAR(255),
+    INDEX (`session_id`), INDEX (`ts`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
