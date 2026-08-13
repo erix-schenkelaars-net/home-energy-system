@@ -16,3 +16,4 @@ pv_forecast_plot.py
 pv_clearsky_profile.py
 pv_correction_factors*.json
 pv_annual_factors*.json
+pv_correction_from_actuals*.py

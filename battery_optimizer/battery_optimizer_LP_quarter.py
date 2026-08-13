@@ -353,6 +353,7 @@ class HourSlot:
     pv_source: str = ""           # 'KNMI_GTI' | 'OM_GHI' | 'FORECAST_SOLAR' | 'CACHE'
     hp_correction_kwh: float = 0.0       # verwarmings-delta (warmtepomp) t.o.v. referentietemp
     cooling_correction_kwh: float = 0.0  # koel-delta (airco) t.o.v. het temp-blinde profiel
+    pv_clearsky_kwh: float = 0.0         # gemeten clear-sky-PV bij deze zonshoogte (referentielijn)
 
     def hour(self) -> int:
         return self.dt.hour
@@ -557,6 +558,25 @@ CAMS_USERNAME      = os.environ.get("CAMS_USERNAME", "")   # geregistreerd SoDa 
 CAMS_MIN_REFRESH_H = 12.0    # CAMS ververst ~1×/dag; 12 u spaart requests
 CAMS_BACKFILL_DAYS = 7       # rollend venster: laatste N dagen t/m 2 dagen geleden
 CAMS_URL           = "https://api.soda-solardata.com/service/wps"
+
+# --- KNMI nowcast-overlay: STUURT de optimizer WEL (0-4u, ~99.8% accuraat vs AROME ~94%).
+# Overschrijft de AROME-PV voor de eerste uren met de verse KNMI-nowcast, met een soepele
+# overgang naar AROME op de naad en terugval op AROME bij ontbrekende/oude nowcast.
+# Backtest 21-07→05-08 (828 slots): MAE 118.8→87.2 Wh/slot (-27%), bias +20.6→+3.6 Wh (-83%).
+PV_NOWCAST_OVERLAY       = os.environ.get("PV_NOWCAST_OVERLAY", "1") == "1"
+PV_NOWCAST_HORIZON_H     = 4.0    # tot hoe ver vooruit de nowcast de AROME vervangt
+PV_NOWCAST_BLEND_START_H = 3.0    # vanaf hier lineair uitvloeien nowcast -> AROME
+PV_NOWCAST_MAX_AGE_MIN   = 90     # verse run vereist; ouder => geen overlay (val terug op AROME)
+PV_NOWCAST_FALSEZERO_KWH  = 0.01  # nowcast <= dit = "≈0"
+PV_NOWCAST_FALSEZERO_ELEV = 8.0   # ... én zon boven deze hoek (°) => valse nul (satelliet-data mist) -> AROME
+
+# --- Clear-sky-kalibratie: installatie-geometrie-correctie op de AROME-PV, per zonshoogte-graad,
+# afgeleid uit heldere dagen (r = werkelijk/AROME, ná _pv_horizon_factor → geen dubbeltelling).
+# Corrigeert m.n. de oost-string-namiddag-dropout; weer-onafhankelijk. Bestand regenereert bij
+# nieuwe heldere dagen. Schrijft ook de gemeten clear-sky-PV (pcs) per slot voor de grafiek-referentie.
+PV_CLEARSKY_CALIB = os.environ.get("PV_CLEARSKY_CALIB", "1") == "1"
+_PV_CALIB_PATH    = Path(__file__).resolve().parent / "pv_clearsky_calibration.json"
+PCS_BLEND_H       = 0.75   # ±uur rond zonne-middag waarover pcs_m->pcs_a wordt geblend (deuk weg)
 
 
 def _load_weather_cache() -> tuple[dict, dict[int, float]]:
@@ -1280,6 +1300,120 @@ def get_pv_forecast_details(radiation: dict, dt: datetime) -> tuple[float, float
     return 0.0, 0.0, "OM_GHI"
 
 
+def load_nowcast_overlay(conn, now: datetime) -> dict:
+    """Verse KNMI-nowcast (pv_kwh per 15-min slot) van de laatste run, voor de in-day
+    PV-overlay. Leeg dict als uitgeschakeld of als de nieuwste run ouder is dan
+    PV_NOWCAST_MAX_AGE_MIN — dan valt de optimizer terug op AROME (robuust)."""
+    if not PV_NOWCAST_OVERLAY:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(run_dt) FROM pv_knmi_nowcast")
+        run = cur.fetchone()[0]
+        if run is None or (now - run).total_seconds() > PV_NOWCAST_MAX_AGE_MIN * 60:
+            log.info("PV nowcast-overlay: geen verse run (laatste=%s) — AROME only", run)
+            cur.close()
+            return {}
+        cur.execute("SELECT slot_dt, pv_kwh FROM pv_knmi_nowcast WHERE run_dt=%s", (run,))
+        overlay = {r[0]: float(r[1]) for r in cur.fetchall()}
+        cur.close()
+        log.info("PV nowcast-overlay: run %s, %d slots (0-%.0fu)",
+                 run, len(overlay), PV_NOWCAST_HORIZON_H)
+        return overlay
+    except Exception as exc:
+        log.warning("PV nowcast-overlay laden faalde: %s — AROME only", exc)
+        return {}
+
+
+def nowcast_blend_weight(lead_h: float) -> float:
+    """Gewicht [0..1] van de nowcast in de PV-blend op lead-tijd `lead_h` (uren vooruit):
+    1.0 tot PV_NOWCAST_BLEND_START_H, lineair aflopend naar 0.0 op PV_NOWCAST_HORIZON_H,
+    en 0.0 buiten [0, horizon]. Zo geen sprong op de naad tussen nowcast en AROME."""
+    if lead_h < 0.0 or lead_h > PV_NOWCAST_HORIZON_H:
+        return 0.0
+    if lead_h <= PV_NOWCAST_BLEND_START_H:
+        return 1.0
+    span = PV_NOWCAST_HORIZON_H - PV_NOWCAST_BLEND_START_H
+    return max(0.0, (PV_NOWCAST_HORIZON_H - lead_h) / span) if span > 0 else 0.0
+
+
+def nowcast_false_zero(nc, elev_deg: float) -> bool:
+    """True als een nowcast-waarde een VALSE nul is: ≈0 terwijl de zon duidelijk op is.
+
+    De satelliet-nowcast heeft vóór daglicht geen data en levert dan hele runs op 0 (ook voor de
+    daglicht-slots in hun 4u-venster). Bij zon boven de horizon geeft zelfs zwaar bewolkt altijd
+    íets, dus ≈0 = ontbrekende data, niet 'bewolkt' -> die slot niet blenden maar AROME gebruiken."""
+    if nc is None:
+        return False
+    return nc <= PV_NOWCAST_FALSEZERO_KWH and elev_deg > PV_NOWCAST_FALSEZERO_ELEV
+
+
+_pv_calib_cache = None
+def _pv_calib_deg() -> dict:
+    """Laadt de per-graad clear-sky-kalibratie (gecachet). {} als bestand ontbreekt/kapot."""
+    global _pv_calib_cache
+    if _pv_calib_cache is None:
+        try:
+            _pv_calib_cache = json.loads(_PV_CALIB_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning("PV-kalibratie laden faalde: %s — geen correctie", e)
+            _pv_calib_cache = {"deg": {}, "meta": {"clamp": [1.0, 1.0]}}
+    return _pv_calib_cache
+
+
+def pv_clearsky_calib(dt_local: datetime) -> tuple[float, Optional[float]]:
+    """(correctiefactor r, gemeten clear-sky-PV kWh/slot) voor slot dt_local, o.b.v. zonshoogte
+    + ochtend/middag uit de heldere-dag-kalibratie. r=1.0 / pcs=None als uit of onbekend."""
+    if not PV_CLEARSKY_CALIB:
+        return 1.0, None
+    cal  = _pv_calib_deg()
+    elev = _solar_elevation_deg(dt_local)
+    if elev < 4.0:
+        return 1.0, None
+    noon    = _solar_noon(dt_local)
+    t_h     = dt_local.hour + dt_local.minute / 60.0
+    entry = cal.get("deg", {}).get(str(int(round(elev))))
+    if not entry:
+        return 1.0, None
+    # Zachte ochtend->middag-blend over ±PCS_BLEND_H rond zonne-middag (w=1 ochtend, 0 middag), voor
+    # ZOWEL r als pcs: een harde schakelaar geeft een sprong op de naad -> forecast-piek op het middaguur.
+    w = max(0.0, min(1.0, (noon + PCS_BLEND_H - t_h) / (2 * PCS_BLEND_H)))
+    # r (forecast-correctie): geblend i.p.v. harde keuze.
+    r_m, r_a = entry.get("r_m"), entry.get("r_a")
+    if r_m is None and r_a is None:
+        r = 1.0
+    else:
+        r_m = r_m if r_m is not None else 1.0
+        r_a = r_a if r_a is not None else 1.0
+        lo, hi = cal.get("meta", {}).get("clamp", [0.5, 1.15])
+        r = max(lo, min(hi, w * r_m + (1.0 - w) * r_a))
+    # pcs (display-only referentielijn): zelfde blend, plus de seizoensterm.
+    #
+    # kWh/slot = pcs_x + pcs_x_b * zonnedeclinatie. Zonshoogte alleen is niet genoeg: bij
+    # dezelfde hoogte staat de zon in augustus zuidelijker dan in juni, wat op een oost/west-
+    # opstelling gunstiger invalt (en de panelen zijn koeler). Gemeten scheelt dat 6,1% tussen
+    # juli en augustus. Zonder die term las de lijn te laag en kwam de werkelijke opbrengst er
+    # op 11 en 12 augustus 2026 bovenuit, wat voor een clear-sky-plafond onmogelijk is.
+    # Zie pv_clearsky_build.py. Een oude kalibratie zonder _b valt terug op de vlakke waarde.
+    decl_deg = 23.45 * math.sin(math.radians(
+        360 / 365 * (dt_local.timetuple().tm_yday - 81)))
+
+    def _pcs(key: str) -> Optional[float]:
+        base = entry.get(key)
+        if base is None:
+            return None
+        return base + (entry.get(key + "_b") or 0.0) * decl_deg
+
+    pcs_m, pcs_a = _pcs("pcs_m"), _pcs("pcs_a")
+    if pcs_m is None or pcs_a is None:
+        pcs = pcs_a if pcs_m is None else pcs_m
+    else:
+        pcs = round(w * pcs_m + (1 - w) * pcs_a, 3)
+    if pcs is not None:
+        pcs = max(0.0, round(pcs, 3))
+    return r, pcs
+
+
 # ---------------------------------------------------------------------------
 # 4.  DATABASE
 # ---------------------------------------------------------------------------
@@ -1438,6 +1572,7 @@ def ensure_schedule_table(conn):
         ("cooling_correction_kwh","FLOAT"),
         ("total_om_raw_kwh",  "FLOAT"),
         ("total_optimizer_kwh","FLOAT"),
+        ("pv_clearsky_kwh",   "FLOAT"),
     ]:
         try:
             cur.execute(f"ALTER TABLE battery_schedule ADD COLUMN {col} {typedef}")
@@ -1467,8 +1602,8 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
                forecast_temp_c, ref_temp_c, ev_kwh, pv_curtail_kwh,
                solver_status, bat_kwh, cloud_cover_pct, ghi_ratio,
                gti_east_wm2, gti_west_wm2, pv_source, hp_correction_kwh,
-               cooling_correction_kwh)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               cooling_correction_kwh, pv_clearsky_kwh)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             now, slot.dt, slot.action, slot.charge_kw,
             slot.import_price(), slot.pv_kwh, slot.load_kwh,
@@ -1479,7 +1614,7 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
             slot.cloud_cover_pct, slot.ghi_ratio,
             slot.gti_east_wm2, slot.gti_west_wm2,
             slot.pv_source or None, slot.hp_correction_kwh,
-            slot.cooling_correction_kwh,
+            slot.cooling_correction_kwh, slot.pv_clearsky_kwh,
         ))
     conn.commit()
 
@@ -1523,8 +1658,8 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
     else:
         log.warning("OM-raw: Open-Meteo unreachable this run — keeping cached curve")
 
-    # Solcast-vergelijkingsforecast (alleen als geconfigureerd; max. elke 6 u; raakt optimizer niet)
-    update_solcast_cache(conn)
+    # Solcast: UITGEZET 2026-08-05 (slechtste bron, +12%; niet gebruikt). Historie blijft in DB.
+    # update_solcast_cache(conn)
 
     # CAMS satelliet-gemeten instraling (analyse-only, ~2 dagen latency; raakt optimizer niet)
     update_cams_cache(conn)
@@ -2078,11 +2213,14 @@ def optimise(  # noqa: C901
     cooling_factors: Optional[dict] = None,
     replay_date: Optional[date] = None,
     replay_forecast: str = "schedule",
+    nowcast_pv: Optional[dict] = None,
 ) -> tuple[list[HourSlot], str]:
     if ref_temp_by_hour is None:
         ref_temp_by_hour = {}
     if cooling_factors is None:
         cooling_factors = {}
+    if nowcast_pv is None:
+        nowcast_pv = {}
 
     dbg(2, DEBUG_OPT, "OPT",
         f"LP Optimiser  start_qtr_idx={start_qtr_idx}  "
@@ -2130,6 +2268,29 @@ def optimise(  # noqa: C901
         # PV per quarter slot: linear interpolation between hour midpoints
         pv            = estimate_pv_kwh_per_quarter(radiation, dt, qtr)
 
+        # In-day nowcast-overlay: vervang de AROME-PV door de verse KNMI-nowcast voor de
+        # eerste 0-4u (waar de nowcast ~99.8% is vs AROME ~94%), soepel uitvloeiend naar
+        # AROME op de naad. Terugval op AROME als de slot in de nowcast ontbreekt.
+        pv_src_override = None
+        if nowcast_pv:
+            nc = nowcast_pv.get(dt)
+            # Valse nul: ≈0 nowcast terwijl de zon op is = ontbrekende satelliet-data (vroege ochtend,
+            # vóór de eerste daglicht-run) -> negeer die slot en gebruik AROME i.p.v. de ochtend te nullen.
+            if nc is not None and nowcast_false_zero(nc, _solar_elevation_deg(dt)):
+                nc = None
+            if nc is not None:
+                w = nowcast_blend_weight((idx - start_qtr_idx) * SLOT_H)
+                if w > 0.0:
+                    pv = w * nc + (1.0 - w) * pv
+                    pv_src_override = "KNMI_NOWCAST" if w >= 0.999 else "NOWCAST_BLEND"
+
+        # Clear-sky-kalibratie: corrigeer de AROME-PV voor de installatie-geometrie (per zonshoogte).
+        # Alleen waar de nowcast NIET al overschrijft (0-4u = nowcast-waarheid). pv_clearsky = referentie.
+        calib_r, pv_clearsky = pv_clearsky_calib(dt)
+        if pv_src_override is None and calib_r != 1.0:
+            pv *= calib_r
+            pv_src_override = "AROME_CALIB"
+
         # #5 weekdag/weekend-bewust profiel; #2 pessimisme; #1 in-day factor (alleen vandaag)
         db_load_h     = load_profile.get((d.weekday() >= 5, hour),
                                          load_profile.get((False, hour), BASE_LOAD_FALLBACK_W / 1000))
@@ -2150,12 +2311,15 @@ def optimise(  # noqa: C901
 
         cc, ghi_r = get_slot_weather_attrs(radiation, dt)
         gti_e, gti_w, pv_src = get_pv_forecast_details(radiation, dt)
+        if pv_src_override:
+            pv_src = pv_src_override
         slot = HourSlot(dt=dt, price_eur_kwh=raw_price, pv_kwh=pv, load_kwh=load,
                         forecast_temp_c=forecast_temp, ref_temp_c=ref_temp,
                         cloud_cover_pct=cc, ghi_ratio=ghi_r,
                         gti_east_wm2=gti_e, gti_west_wm2=gti_w,
                         pv_source=pv_src, hp_correction_kwh=hp_correction,
-                        cooling_correction_kwh=cooling_corr)
+                        cooling_correction_kwh=cooling_corr,
+                        pv_clearsky_kwh=(pv_clearsky or 0.0))
         slots.append(slot)
         dbg(3, DEBUG_OPT, "OPT",
             f"  Slot idx={idx:03d}  {dt.strftime('%d %H:%M')}  "
@@ -3189,6 +3353,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     load_prof    = build_load_profile(conn, base_load)
     inday_factor = compute_inday_load_factor(conn, load_prof, now)
     cooling_facs = compute_cooling_factors(conn, load_prof, now, radiation)  # begrensd; {} = temp-blind
+    nowcast_pv   = load_nowcast_overlay(conn, now)  # verse KNMI-nowcast voor de 0-4u PV-overlay
 
     mode = "DYNAMIC_PRICE"
     log.info("Optimizer mode: %s", mode)
@@ -3197,7 +3362,8 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
 
     okw_base = dict(prices=prices, radiation=radiation, load_profile=load_prof, today=today,
                     mode=mode, ev_soc=ev_soc, ref_temp_by_hour=ref_temp_by_hour,
-                    inday_load_factor=inday_factor, cooling_factors=cooling_facs)
+                    inday_load_factor=inday_factor, cooling_factors=cooling_facs,
+                    nowcast_pv=nowcast_pv)
 
     if rolling_range is not None:
         end_q = round((rolling_range[1] - datetime.combine(today, datetime.min.time())).total_seconds() / 900)
@@ -3223,6 +3389,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         inday_load_factor = inday_factor,
         cooling_factors   = cooling_facs,
         replay_date       = replay_at.date() if replay_at else None,
+        nowcast_pv        = nowcast_pv,
     )
 
     if not schedule:

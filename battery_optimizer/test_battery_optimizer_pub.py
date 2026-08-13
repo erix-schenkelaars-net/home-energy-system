@@ -1355,5 +1355,136 @@ class TestEvChargeWindow(unittest.TestCase):
         self.assertEqual(mod.ev_charge_window(0, prices, 80.0, 0), [12, 13, 14])
 
 
+class TestPvNowcastOverlay(unittest.TestCase):
+    """In-day KNMI-nowcast-overlay op de PV-forecast (0-4u vervangt AROME, naad-blend)."""
+
+    def test_blend_weight_full_until_blend_start(self):
+        # Binnen 0..BLEND_START: volledig nowcast.
+        self.assertEqual(mod.nowcast_blend_weight(0.0), 1.0)
+        self.assertEqual(mod.nowcast_blend_weight(mod.PV_NOWCAST_BLEND_START_H), 1.0)
+
+    def test_blend_weight_ramps_to_zero_at_horizon(self):
+        # Lineair uitvloeien tussen BLEND_START (w=1) en HORIZON (w=0).
+        mid = (mod.PV_NOWCAST_BLEND_START_H + mod.PV_NOWCAST_HORIZON_H) / 2.0
+        self.assertAlmostEqual(mod.nowcast_blend_weight(mid), 0.5, places=6)
+        self.assertEqual(mod.nowcast_blend_weight(mod.PV_NOWCAST_HORIZON_H), 0.0)
+
+    def test_blend_weight_zero_outside_window(self):
+        # Buiten [0, horizon]: geen nowcast (val terug op AROME).
+        self.assertEqual(mod.nowcast_blend_weight(-0.25), 0.0)
+        self.assertEqual(mod.nowcast_blend_weight(mod.PV_NOWCAST_HORIZON_H + 1.0), 0.0)
+
+    def test_overlay_disabled_returns_empty(self):
+        # Vlag uit => lege overlay, ongeacht DB-inhoud.
+        with patch.object(mod, "PV_NOWCAST_OVERLAY", False):
+            self.assertEqual(mod.load_nowcast_overlay(MagicMock(), datetime(2026, 8, 5, 12, 0)), {})
+
+    def test_overlay_stale_run_falls_back(self):
+        # Nieuwste run ouder dan de max-age => lege overlay (AROME-fallback).
+        now = datetime(2026, 8, 5, 12, 0)
+        stale = now - timedelta(minutes=mod.PV_NOWCAST_MAX_AGE_MIN + 30)
+        conn = MagicMock()
+        conn.cursor.return_value.fetchone.return_value = (stale,)
+        with patch.object(mod, "PV_NOWCAST_OVERLAY", True):
+            self.assertEqual(mod.load_nowcast_overlay(conn, now), {})
+
+
+class TestPvClearskyCalib(unittest.TestCase):
+    """Clear-sky-kalibratie: per-zonshoogte correctiefactor + gemeten clear-sky-PV, met clamp."""
+
+    def test_disabled_returns_neutral(self):
+        with patch.object(mod, "PV_CLEARSKY_CALIB", False):
+            self.assertEqual(mod.pv_clearsky_calib(datetime(2026, 7, 15, 12, 0)), (1.0, None))
+
+    def test_low_sun_no_correction(self):
+        with patch.object(mod, "PV_CLEARSKY_CALIB", True), \
+             patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 2.0):
+            self.assertEqual(mod.pv_clearsky_calib(datetime(2026, 7, 15, 5, 0)), (1.0, None))
+
+    def test_lookup_morning_vs_afternoon_and_clamp(self):
+        fake = {"deg": {"40": {"r_m": 0.96, "r_a": 0.30, "pcs_m": 0.74, "pcs_a": 0.62}},
+                "meta": {"clamp": [0.5, 1.15]}}
+        with patch.object(mod, "PV_CLEARSKY_CALIB", True), \
+             patch.object(mod, "_pv_calib_cache", fake), \
+             patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 40.2), \
+             patch.object(mod, "_solar_noon", lambda d: 13.7):
+            # ochtend (vóór zonnemiddag) -> r_m / pcs_m
+            r, p = mod.pv_clearsky_calib(datetime(2026, 7, 15, 10, 0))
+            self.assertAlmostEqual(r, 0.96); self.assertAlmostEqual(p, 0.74)
+            # middag -> r_a=0.30 wordt geclampd naar 0.5, pcs_a onaangeroerd
+            r2, p2 = mod.pv_clearsky_calib(datetime(2026, 7, 15, 16, 0))
+            self.assertAlmostEqual(r2, 0.5); self.assertAlmostEqual(p2, 0.62)
+
+    def test_season_term_lowers_clearsky_toward_midsummer(self):
+        """Bij gelijke zonshoogte levert de array minder rond de zonnewende.
+
+        Regressie: zonder deze term stond de clear-sky in augustus 4-8% ONDER de
+        werkelijke opbrengst (11 en 12 augustus 2026), wat voor een plafond niet kan.
+        pcs_m_b is negatief, dus hoge declinatie (juni) drukt de lijn omlaag.
+        """
+        fake = {"deg": {"40": {"r_m": 1.0, "r_a": 1.0, "pcs_m": 1.00, "pcs_a": 1.00,
+                               "pcs_m_b": -0.010, "pcs_a_b": -0.010}},
+                "meta": {"clamp": [0.5, 1.15]}}
+        with patch.object(mod, "PV_CLEARSKY_CALIB", True), \
+             patch.object(mod, "_pv_calib_cache", fake), \
+             patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 40.0), \
+             patch.object(mod, "_solar_noon", lambda d: 13.7):
+            # 21 juni: declinatie ~ +23,4 -> 1.00 - 0.010*23.4
+            _, midsummer = mod.pv_clearsky_calib(datetime(2026, 6, 21, 10, 0))
+            # 22 maart = dag 81 -> declinatie exact 0 in deze formule -> onveranderd
+            _, equinox = mod.pv_clearsky_calib(datetime(2026, 3, 22, 10, 0))
+
+        self.assertLess(midsummer, equinox)
+        self.assertAlmostEqual(midsummer, 0.766, places=2)
+        self.assertAlmostEqual(equinox, 1.00, places=2)
+
+    def test_calibration_without_slope_stays_flat(self):
+        """Een oude kalibratie zonder pcs_*_b mag niet stuklopen of verschuiven."""
+        fake = {"deg": {"40": {"r_m": 1.0, "r_a": 1.0, "pcs_m": 0.80, "pcs_a": 0.80}},
+                "meta": {"clamp": [0.5, 1.15]}}
+        with patch.object(mod, "PV_CLEARSKY_CALIB", True), \
+             patch.object(mod, "_pv_calib_cache", fake), \
+             patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 40.0), \
+             patch.object(mod, "_solar_noon", lambda d: 13.7):
+            _, june = mod.pv_clearsky_calib(datetime(2026, 6, 21, 10, 0))
+            _, december = mod.pv_clearsky_calib(datetime(2026, 12, 21, 10, 0))
+
+        self.assertAlmostEqual(june, 0.80)
+        self.assertAlmostEqual(december, 0.80)
+
+    def test_clearsky_never_negative(self):
+        """Doortrekking naar de winter mag de lijn niet onder nul duwen."""
+        fake = {"deg": {"12": {"r_m": 1.0, "r_a": 1.0, "pcs_m": 0.05, "pcs_a": 0.05,
+                               "pcs_m_b": -0.010, "pcs_a_b": -0.010}},
+                "meta": {"clamp": [0.5, 1.15]}}
+        with patch.object(mod, "PV_CLEARSKY_CALIB", True), \
+             patch.object(mod, "_pv_calib_cache", fake), \
+             patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 12.0), \
+             patch.object(mod, "_solar_noon", lambda d: 13.7):
+            _, pcs = mod.pv_clearsky_calib(datetime(2026, 6, 21, 10, 0))
+
+        self.assertGreaterEqual(pcs, 0.0)
+
+
+class TestNowcastFalseZero(unittest.TestCase):
+    """Valse-nul-guard: ≈0 nowcast bij zon-op = ontbrekende satelliet-data -> AROME (niet blenden)."""
+
+    def test_zero_with_sun_up_is_false_zero(self):
+        # zon duidelijk op (>8°) én nowcast ≈0 -> valse nul
+        self.assertTrue(mod.nowcast_false_zero(0.0, 20.0))
+        self.assertTrue(mod.nowcast_false_zero(0.005, 12.0))
+
+    def test_low_but_real_cloud_is_not_false_zero(self):
+        # bewolkt geeft laag maar >drempel -> echte data, wél blenden
+        self.assertFalse(mod.nowcast_false_zero(0.05, 20.0))
+        self.assertFalse(mod.nowcast_false_zero(0.5, 40.0))
+
+    def test_zero_at_low_sun_is_legit(self):
+        # zon (nog) laag -> 0 is legitiem (nacht/schemer), geen valse nul
+        self.assertFalse(mod.nowcast_false_zero(0.0, 3.0))
+        self.assertFalse(mod.nowcast_false_zero(0.0, mod.PV_NOWCAST_FALSEZERO_ELEV))
+        self.assertFalse(mod.nowcast_false_zero(None, 30.0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

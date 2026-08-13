@@ -22,6 +22,9 @@ __pycache__/
 .venv/
 venv/
 
+# Handmatige backups (huisregel: .bak vóór een edit) — git is de historie
+*.bak*
+
 # OS
 .DS_Store
 Thumbs.db
