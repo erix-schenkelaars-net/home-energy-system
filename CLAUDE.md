@@ -15,6 +15,31 @@ had drifted while the code moved on. Nobody noticed, because nothing ran them.
 When a test fails, first work out which side is wrong. If the code is right and the test drifted,
 fix the test to the code — and say so, rather than quietly adjusting the expectation.
 
+## Do not leave `.bak` copies of versioned files
+
+The old habit was a timestamped `.bak` before every edit. That made sense while the files were
+unversioned; it does not any more, and `*.bak*` is now git-ignored so a stray one cannot be
+committed by accident.
+
+**If the file is in a git repo, git is the backup.** Commit before the risky edit, then use
+`git diff`, `git revert` or `git checkout --` to get back. A `.bak` next to a tracked file is
+strictly worse: it duplicates what git already holds, and when there are twelve of them nobody
+can tell which one was the good version. The kadence-child theme had 75 of them (3.0 MB) by
+2026-08-13, and `battery-dashboard-GC.php.bak-hourspread-…` turned out to be byte-identical to a
+commit made an hour earlier.
+
+Two repos cover the code:
+
+| Repo | Covers |
+|---|---|
+| `home-energy-system` (this one) | every service on pi5new |
+| `erix-wordpress` (private) | the `kadence-child` theme on pi5 — see the wordpress memory |
+
+**Outside those, take care but do not reach for `.bak` either.** For anything gitignored the
+answer is usually restic (the nightly backup covers the whole docker root on pi5), not a copy
+beside the original. Never copy `.env` at all — a `.env.bak` is a second unprotected file full of
+secrets, and one already existed on pi5 for months.
+
 ## Tests
 
 - One `test_*pub*.py` per service; `test-all.sh` auto-discovers any directory containing one.
