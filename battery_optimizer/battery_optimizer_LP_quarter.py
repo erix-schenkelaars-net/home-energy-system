@@ -354,6 +354,8 @@ class HourSlot:
     hp_correction_kwh: float = 0.0       # verwarmings-delta (warmtepomp) t.o.v. referentietemp
     cooling_correction_kwh: float = 0.0  # koel-delta (airco) t.o.v. het temp-blinde profiel
     pv_clearsky_kwh: float = 0.0         # gemeten clear-sky-PV bij deze zonshoogte (referentielijn)
+    pv_clearsky_east_kwh: Optional[float] = None  # dezelfde lijn per dakhelft, alleen voor weergave
+    pv_clearsky_west_kwh: Optional[float] = None  # None = oude kalibratie zonder gesplitste sleutels
 
     def hour(self) -> int:
         return self.dt.hour
@@ -1414,6 +1416,54 @@ def pv_clearsky_calib(dt_local: datetime) -> tuple[float, Optional[float]]:
     return r, pcs
 
 
+def pv_clearsky_split(dt_local: datetime) -> tuple[Optional[float], Optional[float]]:
+    """(clear-sky oost, clear-sky west) in kWh voor dit slot — ALLEEN voor weergave.
+
+    Bewust een aparte functie naast pv_clearsky_calib in plaats van een extra retourwaarde
+    daarvan: die functie levert óók `r`, en `r` vermenigvuldigt de forecast waar de LP mee
+    rekent. Door de splitsing hier te houden kan een fout in deze code de besturing niet raken.
+
+    De twee tellen niet exact op tot `pcs`: elke dakhelft krijgt in de fit zijn eigen optil
+    naar het 90-percentiel, en de som van twee bovengrenzen ligt hoger dan de bovengrens van
+    de som. Voor een referentielijn is dat de juiste kant om op te zitten.
+
+    Levert (None, None) als de kalibratie de gesplitste sleutels niet heeft — dan is het een
+    oud bestand en toont het dashboard gewoon alleen de totale lijn.
+    """
+    if not PV_CLEARSKY_CALIB:
+        return None, None
+    cal = _pv_calib_deg()
+    elev = _solar_elevation_deg(dt_local)
+    if elev < 4.0:
+        return None, None
+    entry = cal.get("deg", {}).get(str(int(round(elev))))
+    if not entry:
+        return None, None
+
+    noon = _solar_noon(dt_local)
+    t_h = dt_local.hour + dt_local.minute / 60.0
+    w = max(0.0, min(1.0, (noon + PCS_BLEND_H - t_h) / (2 * PCS_BLEND_H)))
+    decl_deg = 23.45 * math.sin(math.radians(
+        360 / 365 * (dt_local.timetuple().tm_yday - 81)))
+
+    def _half(suffix: str) -> Optional[float]:
+        vals = []
+        for key in (f"pcs_m{suffix}", f"pcs_a{suffix}"):
+            base = entry.get(key)
+            vals.append(None if base is None
+                        else base + (entry.get(key + "_b") or 0.0) * decl_deg)
+        pcs_m, pcs_a = vals
+        if pcs_m is None and pcs_a is None:
+            return None
+        if pcs_m is None or pcs_a is None:
+            blended = pcs_a if pcs_m is None else pcs_m
+        else:
+            blended = w * pcs_m + (1 - w) * pcs_a
+        return max(0.0, round(blended, 3))
+
+    return _half("_e"), _half("_w")
+
+
 # ---------------------------------------------------------------------------
 # 4.  DATABASE
 # ---------------------------------------------------------------------------
@@ -1573,6 +1623,8 @@ def ensure_schedule_table(conn):
         ("total_om_raw_kwh",  "FLOAT"),
         ("total_optimizer_kwh","FLOAT"),
         ("pv_clearsky_kwh",   "FLOAT"),
+        ("pv_clearsky_east_kwh", "FLOAT"),
+        ("pv_clearsky_west_kwh", "FLOAT"),
     ]:
         try:
             cur.execute(f"ALTER TABLE battery_schedule ADD COLUMN {col} {typedef}")
@@ -1602,8 +1654,9 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
                forecast_temp_c, ref_temp_c, ev_kwh, pv_curtail_kwh,
                solver_status, bat_kwh, cloud_cover_pct, ghi_ratio,
                gti_east_wm2, gti_west_wm2, pv_source, hp_correction_kwh,
-               cooling_correction_kwh, pv_clearsky_kwh)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               cooling_correction_kwh, pv_clearsky_kwh,
+               pv_clearsky_east_kwh, pv_clearsky_west_kwh)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             now, slot.dt, slot.action, slot.charge_kw,
             slot.import_price(), slot.pv_kwh, slot.load_kwh,
@@ -1615,6 +1668,7 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
             slot.gti_east_wm2, slot.gti_west_wm2,
             slot.pv_source or None, slot.hp_correction_kwh,
             slot.cooling_correction_kwh, slot.pv_clearsky_kwh,
+            slot.pv_clearsky_east_kwh, slot.pv_clearsky_west_kwh,
         ))
     conn.commit()
 
@@ -2287,6 +2341,7 @@ def optimise(  # noqa: C901
         # Clear-sky-kalibratie: corrigeer de AROME-PV voor de installatie-geometrie (per zonshoogte).
         # Alleen waar de nowcast NIET al overschrijft (0-4u = nowcast-waarheid). pv_clearsky = referentie.
         calib_r, pv_clearsky = pv_clearsky_calib(dt)
+        pcs_east, pcs_west = pv_clearsky_split(dt)
         if pv_src_override is None and calib_r != 1.0:
             pv *= calib_r
             pv_src_override = "AROME_CALIB"
@@ -2319,7 +2374,9 @@ def optimise(  # noqa: C901
                         gti_east_wm2=gti_e, gti_west_wm2=gti_w,
                         pv_source=pv_src, hp_correction_kwh=hp_correction,
                         cooling_correction_kwh=cooling_corr,
-                        pv_clearsky_kwh=(pv_clearsky or 0.0))
+                        pv_clearsky_kwh=(pv_clearsky or 0.0),
+                        pv_clearsky_east_kwh=pcs_east,
+                        pv_clearsky_west_kwh=pcs_west)
         slots.append(slot)
         dbg(3, DEBUG_OPT, "OPT",
             f"  Slot idx={idx:03d}  {dt.strftime('%d %H:%M')}  "

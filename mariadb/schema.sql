@@ -225,6 +225,16 @@ CREATE TABLE IF NOT EXISTS `battery_schedule` (
   `cooling_correction_kwh` float     DEFAULT NULL COMMENT 'Airco load correction kWh (cooling delta vs temp-blind profile, CDH regression, clamped 0.7-1.4)',
   `total_om_raw_kwh`    float        DEFAULT NULL COMMENT 'Total OM-raw GHI forecast for this day kWh',
   `total_optimizer_kwh` float        DEFAULT NULL COMMENT 'Total optimizer PV forecast for this day kWh',
+  -- Clear-sky reference line: what THIS array yields on a cloudless day at this solar elevation,
+  -- fitted from its own clear days (pv_clearsky_build.py). Display only — the LP never reads it.
+  -- The east/west pair splits the same line per roof half, which is how the asymmetric horizon
+  -- (something blocks the east roof until ~08:30; the west has no counterpart) becomes visible.
+  -- They do not sum exactly to pv_clearsky_kwh: each half gets its own lift to the 90th percentile
+  -- of residuals, and the sum of two ceilings sits above the ceiling of the sum.
+  -- NULL on slots written before 2026-08-15 and on any run with an older calibration file.
+  `pv_clearsky_kwh`     float        DEFAULT NULL COMMENT 'Clear-sky PV for this slot kWh (whole array, reference only)',
+  `pv_clearsky_east_kwh` float       DEFAULT NULL COMMENT 'Clear-sky PV east roof half kWh (display only)',
+  `pv_clearsky_west_kwh` float       DEFAULT NULL COMMENT 'Clear-sky PV west roof half kWh (display only)',
 
   PRIMARY KEY (`id`),
   KEY `slot_dt` (`slot_dt`),

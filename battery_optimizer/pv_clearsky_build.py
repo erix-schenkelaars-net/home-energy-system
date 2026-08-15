@@ -91,14 +91,21 @@ def is_morning(dt: datetime) -> bool:
 
 
 def load_days(cur) -> dict:
+    """{"tot"|"east"|"west": {datum: {kwartier: kWh}}}
+
+    Oost is string 2, west is string 1. Dat staat nergens gedocumenteerd; het is afgeleid
+    uit de dagcurve — de string die 's ochtends piekt kijkt naar het oosten.
+    """
     cur.execute("""
-        SELECT DATE(ts), HOUR(ts) * 4 + FLOOR(MINUTE(ts) / 15), AVG(sph_pv_power_tot_w)
+        SELECT DATE(ts), HOUR(ts) * 4 + FLOOR(MINUTE(ts) / 15),
+               AVG(sph_pv_power_tot_w), AVG(sph_pv_power_2_w), AVG(sph_pv_power_1_w)
         FROM energy WHERE sph_pv_power_tot_w IS NOT NULL
         GROUP BY 1, 2 ORDER BY 1, 2
     """)
-    out = defaultdict(dict)
-    for d, q, w in cur.fetchall():
-        out[d][int(q)] = float(w or 0) * 0.25 / 1000.0
+    out = {k: defaultdict(dict) for k in ("tot", "east", "west")}
+    for d, q, tot, east, west in cur.fetchall():
+        for name, w in (("tot", tot), ("east", east), ("west", west)):
+            out[name][d][int(q)] = float(w or 0) * 0.25 / 1000.0
     return out
 
 
@@ -213,6 +220,40 @@ def extend(profile: dict, lo: int, hi: int) -> dict:
     return out
 
 
+def day_check(days: dict, clear: list, prof_m: dict, prof_a: dict) -> dict:
+    """{datum: (werkelijke kWh, model-kWh)} over de heldere dagen."""
+    check = {}
+    for d in clear:
+        dec = declination(d)
+        model = actual = 0.0
+        for q, kwh in days[d].items():
+            dt = datetime(d.year, d.month, d.day, q // 4, (q % 4) * 15)
+            elev = solar_elevation(dt)
+            if elev < MIN_ELEV:
+                continue
+            model += evaluate(prof_m if is_morning(dt) else prof_a, int(round(elev)), dec)
+            actual += kwh
+        if model > 0:
+            check[d] = (actual, model)
+    return check
+
+
+def ceiling_safety(days: dict, clear: list, prof_m: dict, prof_a: dict) -> float:
+    """Laatste vangnet: geen gemeten heldere dag mag boven het model uitkomen (normaal 1.0)."""
+    check = day_check(days, clear, prof_m, prof_a)
+    return round(max([1.0] + [a / m for a, m in check.values()]), 4)
+
+
+def build_profiles(days: dict, clear: list):
+    """(ochtendprofiel, middagprofiel, veiligheidsschaal) of None als de fit niet lukt."""
+    fits = fit_bins(collect(days, clear))
+    prof_m = extend(fill_and_smooth(fits, True), 3, 65)
+    prof_a = extend(fill_and_smooth(fits, False), 3, 65)
+    if not prof_m or not prof_a:
+        return None
+    return prof_m, prof_a, ceiling_safety(days, clear, prof_m, prof_a)
+
+
 def evaluate(profile: dict, elev: int, dec: float) -> float:
     ab = profile.get(elev)
     if ab is None:
@@ -231,48 +272,44 @@ def main() -> None:
     days = load_days(cur)
     conn.close()
 
-    clear = select_clear_days(days)
+    # Heldere dagen worden op de TOTALE opbrengst gekozen: helder is een eigenschap van de dag,
+    # niet van een dakhelft. Dezelfde dagenlijst gaat daarna door alle drie de fits.
+    clear = select_clear_days(days["tot"])
     if len(clear) < 8:
         raise SystemExit(f"te weinig heldere dagen ({len(clear)}) — niets geschreven")
 
-    obs = collect(days, clear)
-    fits = fit_bins(obs)
-    prof_m = extend(fill_and_smooth(fits, True), 3, 65)
-    prof_a = extend(fill_and_smooth(fits, False), 3, 65)
-    if not prof_m or not prof_a:
-        raise SystemExit("fit mislukt — niets geschreven")
+    # Drie keer dezelfde pijplijn. Het achtervoegsel is meteen de sleutelnaam in de JSON:
+    # "" = totaal (de bestaande pcs_m/pcs_a), "_e" = oostdak, "_w" = westdak.
+    built = {}
+    for suffix, name in (("", "tot"), ("_e", "east"), ("_w", "west")):
+        res = build_profiles(days[name], clear)
+        if res is None:
+            if suffix == "":
+                raise SystemExit("fit mislukt — niets geschreven")
+            print(f"waarschuwing: fit voor {name} mislukt, die helft wordt overgeslagen")
+            continue
+        built[suffix] = res
 
-    # Controle: geen enkele gemeten heldere dag mag boven het model uitkomen.
-    check = {}
-    for d in clear:
-        dec = declination(d)
-        model = actual = 0.0
-        for q, kwh in days[d].items():
-            dt = datetime(d.year, d.month, d.day, q // 4, (q % 4) * 15)
-            elev = solar_elevation(dt)
-            if elev < MIN_ELEV:
-                continue
-            src = prof_m if is_morning(dt) else prof_a
-            model += evaluate(src, int(round(elev)), dec)
-            actual += kwh
-        if model > 0:
-            check[d] = (actual, model)
-    worst = max(a / m for a, m in check.values())
-    safety = round(max(1.0, worst), 4)      # laatste vangnet, normaal 1.0
+    prof_m, prof_a, safety = built[""]
 
     cal = json.load(open(IN_PATH))
     deg = cal["deg"]
-    for e in sorted(set(prof_m) | set(prof_a) | {int(k) for k in deg}):
+    all_elev = {int(k) for k in deg}
+    for pm, pa, _ in built.values():
+        all_elev |= set(pm) | set(pa)
+    for e in sorted(all_elev):
         entry = deg.setdefault(str(e), {"r_m": None, "r_a": None, "pcs_m": None,
                                         "pcs_a": None, "n_m": 0.0, "n_a": 0.0})
-        for src, key in ((prof_m, "m"), (prof_a, "a")):
-            ab = src.get(e)
-            if ab is None:
-                entry[f"pcs_{key}"] = None
-                entry.pop(f"pcs_{key}_b", None)
-                continue
-            entry[f"pcs_{key}"] = round(ab[0] * safety, 4)     # a, bij declinatie 0
-            entry[f"pcs_{key}_b"] = round(ab[1] * safety, 5)   # helling per graad
+        for suffix, (p_m, p_a, saf) in built.items():
+            for src, key in ((p_m, "m"), (p_a, "a")):
+                name = f"pcs_{key}{suffix}"
+                ab = src.get(e)
+                if ab is None:
+                    entry[name] = None
+                    entry.pop(f"{name}_b", None)
+                    continue
+                entry[name] = round(ab[0] * saf, 4)         # a, bij declinatie 0
+                entry[f"{name}_b"] = round(ab[1] * saf, 5)  # helling per graad
 
     decls = [declination(d) for d in clear]
     cal["meta"].update({
@@ -281,7 +318,12 @@ def main() -> None:
                   "rechte kWh = pcs_x + pcs_x_b * declinatie, opgetild naar het "
                   "%d-percentiel van de residuen (gedempt onder %d graden zonshoogte)"
                   % (int(LIFT_Q * 100), LIFT_FULL_ELEV),
-        "source": "erix_db.energy sph_pv_power_tot_w",
+        "source": "erix_db.energy sph_pv_power_tot_w (+ _2_w oost, _1_w west)",
+        "split_note": "pcs_x_e / pcs_x_w zijn dezelfde fit op de oost- resp. weststring en "
+                      "zijn ALLEEN voor weergave. Ze tellen niet exact op tot pcs_x: elke "
+                      "helft krijgt zijn eigen optil naar het 90-percentiel, en de som van "
+                      "twee bovengrenzen ligt hoger dan de bovengrens van de som. "
+                      "r_m/r_a (die de forecast stuurt) blijven op de TOTALE fit.",
         "clear_days": [str(d) for d in clear],
         "clear_days_n": len(clear),
         "season_axis": "pcs_m_b / pcs_a_b = kWh per slot per graad zonnedeclinatie",
@@ -310,6 +352,15 @@ def main() -> None:
         top = max(prof)
         print(f"piek {label} (elev {top}): {evaluate(prof, top, 23.4) * safety:.3f} kWh/slot "
               f"bij zonnewende, {evaluate(prof, top, 0.0) * safety:.3f} bij declinatie 0")
+    for suffix, label in (("_e", "oost"), ("_w", "west")):
+        if suffix not in built:
+            continue
+        p_m, p_a, saf = built[suffix]
+        top = max(p_m)
+        print(f"piek {label} (elev {top}): {evaluate(p_m, top, 0.0) * saf:.3f} kWh/slot ochtend, "
+              f"{evaluate(p_a, max(p_a), 0.0) * saf:.3f} middag  (schaal x{saf})")
+
+    check = day_check(days["tot"], clear, prof_m, prof_a)
     print(f"\n{'datum':12} {'werkelijk':>10} {'clear-sky':>10} {'act/cs':>9}")
     for d in sorted(check):
         a, m = check[d]

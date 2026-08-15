@@ -1389,6 +1389,77 @@ class TestPvNowcastOverlay(unittest.TestCase):
             self.assertEqual(mod.load_nowcast_overlay(conn, now), {})
 
 
+class TestPvClearskySplit(unittest.TestCase):
+    """Clear-sky per dakhelft — weergave-only, en het mag `r` niet kunnen raken."""
+
+    FAKE = {"deg": {"40": {"r_m": 0.96, "r_a": 0.30,
+                           "pcs_m": 0.80, "pcs_a": 0.70,
+                           "pcs_m_e": 0.60, "pcs_a_e": 0.10,
+                           "pcs_m_w": 0.25, "pcs_a_w": 0.65}},
+            "meta": {"clamp": [0.5, 1.15]}}
+
+    def _patched(self, cal=None):
+        return (patch.object(mod, "PV_CLEARSKY_CALIB", True),
+                patch.object(mod, "_pv_calib_cache", cal if cal is not None else self.FAKE),
+                patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 40.2),
+                patch.object(mod, "_solar_noon", lambda d: 13.7))
+
+    def test_morning_favours_east_afternoon_favours_west(self):
+        """De hele reden van de splitsing: 's ochtends levert het oostdak, 's middags het westdak."""
+        with contextlib.ExitStack() as st:
+            for p_ in self._patched():
+                st.enter_context(p_)
+            e_m, w_m = mod.pv_clearsky_split(datetime(2026, 7, 15, 10, 0))
+            e_a, w_a = mod.pv_clearsky_split(datetime(2026, 7, 15, 16, 0))
+        self.assertGreater(e_m, w_m)
+        self.assertGreater(w_a, e_a)
+
+    def test_old_calibration_without_split_keys_returns_none(self):
+        """Een kalibratie van vóór deze wijziging mag geen crash geven, alleen geen lijnen."""
+        old = {"deg": {"40": {"r_m": 1.0, "r_a": 1.0, "pcs_m": 0.8, "pcs_a": 0.7}},
+               "meta": {"clamp": [0.5, 1.15]}}
+        with contextlib.ExitStack() as st:
+            for p_ in self._patched(old):
+                st.enter_context(p_)
+            self.assertEqual(mod.pv_clearsky_split(datetime(2026, 7, 15, 10, 0)), (None, None))
+
+    def test_disabled_and_low_sun_return_none(self):
+        with patch.object(mod, "PV_CLEARSKY_CALIB", False):
+            self.assertEqual(mod.pv_clearsky_split(datetime(2026, 7, 15, 12, 0)), (None, None))
+        with contextlib.ExitStack() as st:
+            for p_ in self._patched():
+                st.enter_context(p_)
+            with patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 2.0):
+                self.assertEqual(mod.pv_clearsky_split(datetime(2026, 7, 15, 5, 0)), (None, None))
+
+    def test_never_negative(self):
+        neg = {"deg": {"40": {"pcs_m_e": 0.10, "pcs_m_e_b": -1.0,
+                              "pcs_m_w": 0.10, "pcs_m_w_b": -1.0,
+                              "pcs_a_e": 0.10, "pcs_a_w": 0.10}},
+               "meta": {"clamp": [0.5, 1.15]}}
+        with contextlib.ExitStack() as st:
+            for p_ in self._patched(neg):
+                st.enter_context(p_)
+            e, w = mod.pv_clearsky_split(datetime(2026, 6, 21, 10, 0))
+        self.assertGreaterEqual(e, 0.0)
+        self.assertGreaterEqual(w, 0.0)
+
+    def test_split_does_not_touch_the_forecast_factor(self):
+        """De borging van deze wijziging: `r` stuurt de LP en moet identiek blijven.
+
+        pv_clearsky_split is bewust een APARTE functie; deze test valt om zodra iemand de
+        splitsing alsnog in pv_clearsky_calib vlecht en daarbij r meeneemt.
+        """
+        with contextlib.ExitStack() as st:
+            for p_ in self._patched():
+                st.enter_context(p_)
+            r_before, _ = mod.pv_clearsky_calib(datetime(2026, 7, 15, 10, 0))
+            mod.pv_clearsky_split(datetime(2026, 7, 15, 10, 0))
+            r_after, _ = mod.pv_clearsky_calib(datetime(2026, 7, 15, 10, 0))
+        self.assertEqual(r_before, 0.96)
+        self.assertEqual(r_before, r_after)
+
+
 class TestPvClearskyCalib(unittest.TestCase):
     """Clear-sky-kalibratie: per-zonshoogte correctiefactor + gemeten clear-sky-PV, met clamp."""
 
