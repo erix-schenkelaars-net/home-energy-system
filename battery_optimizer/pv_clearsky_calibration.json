@@ -1,7 +1,5 @@
 {
  "meta": {
-  "lat": 52.0,
-  "lon": 5.0,
   "method": "eigen array (energy.sph_pv_power_tot_w): heldere dagen per maand (gladde belcurve + top-kwart opbrengst); per zonshoogte-graad een rechte kWh = pcs_x + pcs_x_b * declinatie, opgetild naar het 90-percentiel van de residuen (gedempt onder 25 graden zonshoogte)",
   "generated": "2026-08-13T15:00:41",
   "clamp": [

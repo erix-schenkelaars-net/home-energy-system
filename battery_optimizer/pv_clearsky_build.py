@@ -295,6 +295,12 @@ def main() -> None:
     for key in ("ref_days", "scale_factor", "scale_to_peak_kwh", "season"):
         cal["meta"].pop(key, None)
         cal.pop(key, None)
+    # Coordinaten horen niet in dit bestand: het is versioneerd en de repo is publiek. Ze zaten
+    # er via het inputbestand in en werden door .update() ongemerkt meegedragen -- zo stonden ze
+    # op 2026-08-13 in de publieke historie. De locatie komt uit SYSTEM_LAT/SYSTEM_LON in .env
+    # en is voor het lezen van de kalibratie niet nodig.
+    for key in ("lat", "lon", "latitude", "longitude"):
+        cal["meta"].pop(key, None)
     json.dump(cal, open(OUT_PATH, "w"), indent=1)
 
     print(f"heldere dagen: {len(clear)}  ({clear[0]} .. {clear[-1]})")
