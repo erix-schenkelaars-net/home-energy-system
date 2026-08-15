@@ -38,7 +38,7 @@ MAX_SLOT = timedelta(hours=2)                   # vangnet tegen gaten in de reek
 
 def connect():
     return mysql.connector.connect(
-        host=os.environ.get("DB_HOST", "192.168.178.240"),
+        host=os.environ.get("DB_HOST", "localhost"),
         user=os.environ["DB_USER"], password=os.environ["DB_PASSWORD"],
         database=os.environ.get("DB_NAME", "erix_db"))
 

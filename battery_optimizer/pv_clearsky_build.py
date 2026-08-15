@@ -265,7 +265,7 @@ def evaluate(profile: dict, elev: int, dec: float) -> float:
 
 def main() -> None:
     conn = mysql.connector.connect(
-        host=os.environ.get("DB_HOST", "192.168.178.240"),
+        host=os.environ.get("DB_HOST", "localhost"),
         user=os.environ["DB_USER"], password=os.environ["DB_PASSWORD"],
         database=os.environ.get("DB_NAME", "erix_db"))
     cur = conn.cursor()
