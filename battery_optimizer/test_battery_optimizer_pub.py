@@ -1423,14 +1423,21 @@ class TestPvClearskySplit(unittest.TestCase):
                 st.enter_context(p_)
             self.assertEqual(mod.pv_clearsky_split(datetime(2026, 7, 15, 10, 0)), (None, None))
 
-    def test_disabled_and_low_sun_return_none(self):
+    def test_disabled_returns_none(self):
         with patch.object(mod, "PV_CLEARSKY_CALIB", False):
             self.assertEqual(mod.pv_clearsky_split(datetime(2026, 7, 15, 12, 0)), (None, None))
+
+    def test_night_is_a_real_zero_not_a_missing_value(self):
+        """None = "deze kalibratie kent de splitsing niet"; nacht = 0,0.
+
+        Zonder dat onderscheid schreef de backfill NULL voor elk nachtslot, en dan krijgt de
+        grafiek 's nachts gaten terwijl de totale clear-sky-lijn daar over de bodem loopt.
+        """
         with contextlib.ExitStack() as st:
             for p_ in self._patched():
                 st.enter_context(p_)
             with patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 2.0):
-                self.assertEqual(mod.pv_clearsky_split(datetime(2026, 7, 15, 5, 0)), (None, None))
+                self.assertEqual(mod.pv_clearsky_split(datetime(2026, 7, 15, 5, 0)), (0.0, 0.0))
 
     def test_never_negative(self):
         neg = {"deg": {"40": {"pcs_m_e": 0.10, "pcs_m_e_b": -1.0,

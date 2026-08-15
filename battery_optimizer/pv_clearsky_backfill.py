@@ -7,7 +7,9 @@ Rijen die daarvóór zijn weggeschreven houden hun oude, te lage waarde — en v
 huidige berekening, zodat een teruggekeken dag dezelfde referentielijn toont als vandaag.
 
 pv_clearsky_kwh is display-only: de grafiek leest hem, geen enkele optimizer-beslissing
-hangt ervan af. Deze backfill raakt dan ook ALLEEN die kolom.
+hangt ervan af. Sinds 2026-08-15 geldt hetzelfde voor de splitsing per dakhelft
+(pv_clearsky_east_kwh / pv_clearsky_west_kwh). Deze backfill raakt ALLEEN die drie kolommen
+en nooit pv_kwh, want dat is de forecast waar de LP mee rekent.
 
 SLOTDUUR. De tabel is niet overal kwartier-gebaseerd: t/m 2026-05-22 stonden er uurslots
 (24 per dag), daarna kwartieren (96), met 22 mei als gemengde dag. pv_clearsky_calib()
@@ -31,7 +33,9 @@ import mysql.connector
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_optimizer_LP_quarter as opt      # noqa: E402
 
-BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/data")
+# /output is bind-mounted naar de host; /app/data was dat niet, dus daar overleefde de
+# backup de eerstvolgende image-rebuild niet -- precies wanneer je hem nodig hebt.
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "/output")
 QUARTER = timedelta(minutes=15)
 MAX_SLOT = timedelta(hours=2)                   # vangnet tegen gaten in de reeks
 
@@ -43,14 +47,28 @@ def connect():
         database=os.environ.get("DB_NAME", "erix_db"))
 
 
-def clearsky_for(slot: datetime, duration: timedelta) -> float:
-    """Som van de kwartier-clear-sky over de duur van dit slot."""
+def clearsky_for(slot: datetime, duration: timedelta):
+    """(totaal, oost, west) clear-sky-kWh over de duur van dit slot.
+
+    Oost/west zijn None zodra de kalibratie de gesplitste sleutels niet kent, zodat een
+    oude kalibratie geen nullen wegschrijft die als 'gemeten 0' zouden worden gelezen.
+    """
     total = 0.0
+    east = west = 0.0
+    have_split = False
     steps = max(1, int(duration / QUARTER))
     for i in range(steps):
-        _, pcs = opt.pv_clearsky_calib(slot + i * QUARTER)
+        t = slot + i * QUARTER
+        _, pcs = opt.pv_clearsky_calib(t)
         total += pcs or 0.0
-    return round(total, 4)
+        e, w = opt.pv_clearsky_split(t)
+        if e is not None or w is not None:
+            have_split = True
+            east += e or 0.0
+            west += w or 0.0
+    if not have_split:
+        return round(total, 4), None, None
+    return round(total, 4), round(east, 4), round(west, 4)
 
 
 def main() -> None:
@@ -63,15 +81,16 @@ def main() -> None:
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("""SELECT slot_dt, pv_clearsky_kwh FROM battery_schedule
-                   ORDER BY slot_dt""")
+    cur.execute("""SELECT slot_dt, pv_clearsky_kwh,
+                          pv_clearsky_east_kwh, pv_clearsky_west_kwh
+                   FROM battery_schedule ORDER BY slot_dt""")
     rows = cur.fetchall()
 
     # oude waarde per slot bewaren (kan meerdere rijen per slot hebben)
     old = {}
     per_day = defaultdict(list)
-    for slot, cs in rows:
-        old.setdefault(slot, cs)
+    for slot, cs, cse, csw in rows:
+        old.setdefault(slot, (cs, cse, csw))
         if slot not in per_day[slot.date()]:
             per_day[slot.date()].append(slot)
 
@@ -81,9 +100,10 @@ def main() -> None:
                             % datetime.now().strftime("%Y%m%d-%H%M%S"))
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["slot_dt", "pv_clearsky_kwh_oud"])
+            w.writerow(["slot_dt", "pv_clearsky_kwh_oud",
+                        "pv_clearsky_east_kwh_oud", "pv_clearsky_west_kwh_oud"])
             for slot in sorted(old):
-                w.writerow([slot.isoformat(), old[slot]])
+                w.writerow([slot.isoformat()] + list(old[slot]))
         print(f"backup van de oude waarden: {path}  ({len(old)} slots)")
 
     updates, changed_days = [], defaultdict(lambda: [0.0, 0.0])
@@ -94,9 +114,9 @@ def main() -> None:
                 dur = min(slots[i + 1] - slot, MAX_SLOT)
             else:
                 dur = min(slot - slots[i - 1], MAX_SLOT) if len(slots) > 1 else QUARTER
-            new = clearsky_for(slot, dur)
-            updates.append((new, slot))
-            changed_days[day][0] += float(old.get(slot) or 0.0)
+            new, new_e, new_w = clearsky_for(slot, dur)
+            updates.append((new, new_e, new_w, slot))
+            changed_days[day][0] += float((old.get(slot) or (0.0,))[0] or 0.0)
             changed_days[day][1] += new
 
     print(f"\n{'datum':12} {'slots':>6} {'oud':>9} {'nieuw':>9}")
@@ -115,7 +135,8 @@ def main() -> None:
         conn.close()
         return
 
-    cur.executemany("UPDATE battery_schedule SET pv_clearsky_kwh=%s WHERE slot_dt=%s",
+    cur.executemany("UPDATE battery_schedule SET pv_clearsky_kwh=%s, "
+                    "pv_clearsky_east_kwh=%s, pv_clearsky_west_kwh=%s WHERE slot_dt=%s",
                     updates)
     conn.commit()
     print(f"\ngeschreven: {cur.rowcount} rijen bijgewerkt")

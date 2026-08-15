@@ -1432,13 +1432,18 @@ def pv_clearsky_split(dt_local: datetime) -> tuple[Optional[float], Optional[flo
     """
     if not PV_CLEARSKY_CALIB:
         return None, None
-    cal = _pv_calib_deg()
+    deg = _pv_calib_deg().get("deg", {})
+    # None betekent "deze kalibratie kent de splitsing niet" — dat is iets anders dan een
+    # nacht-slot, waar de waarde een echte nul is. Zonder dat onderscheid kreeg de grafiek
+    # 's nachts gaten terwijl de totale lijn daar gewoon over de bodem loopt.
+    if not any("pcs_m_e" in v or "pcs_a_e" in v for v in deg.values()):
+        return None, None
     elev = _solar_elevation_deg(dt_local)
     if elev < 4.0:
-        return None, None
-    entry = cal.get("deg", {}).get(str(int(round(elev))))
+        return 0.0, 0.0
+    entry = deg.get(str(int(round(elev))))
     if not entry:
-        return None, None
+        return 0.0, 0.0
 
     noon = _solar_noon(dt_local)
     t_h = dt_local.hour + dt_local.minute / 60.0
@@ -1461,7 +1466,8 @@ def pv_clearsky_split(dt_local: datetime) -> tuple[Optional[float], Optional[flo
             blended = w * pcs_m + (1 - w) * pcs_a
         return max(0.0, round(blended, 3))
 
-    return _half("_e"), _half("_w")
+    e, w = _half("_e"), _half("_w")
+    return (0.0 if e is None else e), (0.0 if w is None else w)
 
 
 # ---------------------------------------------------------------------------
