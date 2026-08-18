@@ -1564,5 +1564,131 @@ class TestNowcastFalseZero(unittest.TestCase):
         self.assertFalse(mod.nowcast_false_zero(None, 30.0))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Cost-simulation report: SoC correction, tariff split, EV in the baseline
+#
+# Written after the 2026-08-18 report read "Saving A vs D: -0.4735" while the battery was in
+# fact earning money. Three separate faults produced that line: the A-vs-D figure summed a
+# battery effect and a tariff effect, the reference tariff was a hardcoded 0.26 that sat below
+# every quarter of the live dynamic price, and the SoC correction priced a drained battery at
+# the flat mean of the horizon instead of at what refilling it costs.
+# ══════════════════════════════════════════════════════════════════════════════
+class TestRefillPrice(unittest.TestCase):
+
+    @staticmethod
+    def _slot(hour, price, bat=0.0, day=8):
+        s = mod.HourSlot(dt=datetime(2026, 5, day, hour, 0), price_eur_kwh=price)
+        s.bat_kwh = bat
+        return s
+
+    def test_uses_the_charge_weighted_price_not_the_flat_mean(self):
+        # charging happens only in the cheap slot; the flat mean sits far above it
+        sched = [self._slot(2, 0.05, bat=4.0), self._slot(18, 0.45), self._slot(19, 0.45)]
+        flat = sum(x.import_price() for x in sched) / len(sched)
+        self.assertAlmostEqual(mod._refill_price(sched), sched[0].import_price(), places=9)
+        self.assertLess(mod._refill_price(sched), flat - 0.10)
+
+    def test_weights_by_charged_energy(self):
+        sched = [self._slot(2, 0.10, bat=3.0), self._slot(3, 0.20, bat=1.0)]
+        want = (3.0 * sched[0].import_price() + 1.0 * sched[1].import_price()) / 4.0
+        self.assertAlmostEqual(mod._refill_price(sched), want, places=9)
+
+    def test_falls_back_to_the_cheapest_quarter_when_nothing_charges(self):
+        sched = [self._slot(h, 0.10 * (h + 1)) for h in range(8)]   # no charging at all
+        want = (sched[0].import_price() + sched[1].import_price()) / 2.0   # 8 // 4 = 2 slots
+        self.assertAlmostEqual(mod._refill_price(sched), want, places=9)
+
+
+class TestFixedReference(unittest.TestCase):
+    """The reference fixed tariff comes from energy_tariffs.ref_fixed_*, date-versioned."""
+
+    def test_period_with_a_checked_quote(self):
+        imp, exp = mod.fixed_reference_for(date(2026, 8, 18))
+        self.assertAlmostEqual(imp, 0.27, places=6)
+        self.assertAlmostEqual(exp, 0.27, places=6)   # saldering: export == import
+
+    def test_period_without_a_quote_returns_none(self):
+        # from 2027-01-01 saldering is gone, so export != import and no quote has been checked
+        self.assertEqual(mod.fixed_reference_for(date(2027, 6, 1)), (None, None))
+
+    def test_no_module_level_constant_survives(self):
+        # the value used to be a bare 0.26 in the source; it must not creep back
+        self.assertFalse(hasattr(mod, "FIXED_TARIFF_EUR_KWH"))
+        self.assertFalse(hasattr(mod, "FIXED_EXPORT_EUR_KWH"))
+
+
+class TestSimulateAndReport(unittest.TestCase):
+
+    @staticmethod
+    def _sched(year=2026, month=5, soc_start=80.0, soc_end=60.0):
+        """Two slots: charge cheap at 02:00, discharge into an expensive 18:00."""
+        out = []
+        for hour, price, bat, grid in ((2, 0.05, 2.0, 2.0), (18, 0.45, -4.0, -3.0)):
+            s = mod.HourSlot(dt=datetime(year, month, 8, hour, 0), price_eur_kwh=price)
+            s.bat_kwh, s.grid_kwh = bat, grid
+            s.load_kwh, s.pv_kwh, s.ev_kwh, s.pv_curtail_kwh = 0.5, 0.0, 0.0, 0.0
+            s.cost_eur = grid * (s.import_price() if grid > 0 else s.export_price())
+            fi, fe = mod.fixed_reference_for(s.dt.date())
+            s.cost_fixed_eur = 0.0 if fi is None else grid * (fi if grid > 0 else fe)
+            s.baseline_grid_kwh = s.load_kwh - s.pv_kwh
+            s.baseline_cost_eur = s.baseline_grid_kwh * s.import_price()
+            s.baseline_cost_fixed_eur = 0.0 if fi is None else s.baseline_grid_kwh * fi
+            out.append(s)
+        out[0].soc_start_pct, out[0].soc_end_pct = soc_start, soc_start
+        out[-1].soc_start_pct, out[-1].soc_end_pct = soc_start, soc_end
+        return out
+
+    def test_decomposition_adds_up(self):
+        r = mod.simulate_and_report(self._sched())
+        self.assertAlmostEqual(r["saving_vs_baseline"] + r["tariff_effect"],
+                               r["saving_dynamic_vs_fixed"], places=9)
+
+    def test_scenario_c_is_corrected_in_its_own_tariff_world(self):
+        r = mod.simulate_and_report(self._sched())
+        ref, _ = mod.fixed_reference_for(date(2026, 5, 8))
+        self.assertAlmostEqual(r["c_cost_adj"], r["c_cost"] - r["delta_soc_kwh"] * ref, places=9)
+        # and that must NOT be the dynamic correction, or the fix did nothing
+        dynamic = r["c_cost"] - r["delta_soc_kwh"] * r["refill_price"]
+        self.assertNotAlmostEqual(r["c_cost_adj"], dynamic, places=4)
+
+    def test_drained_battery_is_charged_at_the_refill_price(self):
+        r = mod.simulate_and_report(self._sched())
+        self.assertLess(r["delta_soc_kwh"], 0.0)                       # battery ends lower
+        self.assertGreater(r["a_cost_adj"], r["a_cost"])               # so A carries a refill cost
+        self.assertAlmostEqual(r["a_cost_adj"],
+                               r["a_cost"] - r["delta_soc_kwh"] * r["refill_price"], places=9)
+
+    def test_report_omits_c_and_d_without_a_reference(self):
+        r = mod.simulate_and_report(self._sched(year=2027, month=6))
+        for key in ("c_cost", "c_import", "c_export", "d_cost", "d_import", "d_export",
+                    "c_cost_adj", "tariff_effect", "saving_dynamic_vs_fixed"):
+            self.assertIsNone(r[key], key + " must be NULL without a checked quote")
+        # A vs B does not depend on the reference and must survive
+        self.assertIsNotNone(r["saving_vs_baseline"])
+
+    def test_scenario_c_shares_the_grid_flows_of_a(self):
+        r = mod.simulate_and_report(self._sched())
+        self.assertAlmostEqual(r["c_import"], r["a_import"], places=9)
+        self.assertAlmostEqual(r["c_export"], r["a_export"], places=9)
+
+
+class TestBaselineIncludesEv(_ScenarioBase):
+    """B/D described a house without the car, handing A the EV's whole import as a phantom loss."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._run(soc=22.0, rad=_build_radiation(cloud_flat(100)),
+                 prices=prices_make(cheap_h=[2, 3, 4, 5]), ev_soc=30.0, start_h=22)
+
+    def test_the_scenario_really_charges_an_ev(self):
+        self.assertGreater(self.ev, 0.5)
+
+    def test_baseline_grid_covers_load_plus_ev_minus_pv(self):
+        gross_pv = sum(s.pv_kwh + s.pv_curtail_kwh for s in self.slots)
+        demand   = sum(s.load_kwh + s.ev_kwh       for s in self.slots)
+        self.assertAlmostEqual(sum(s.baseline_grid_kwh for s in self.slots),
+                               demand - gross_pv, places=6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

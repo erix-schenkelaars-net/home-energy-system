@@ -192,8 +192,19 @@ def tariff_for(d: date):
     return ec.tariff_for(_TARIFFS, d)
 
 
-FIXED_TARIFF_EUR_KWH            = 0.26
-FIXED_EXPORT_EUR_KWH            = 0.26
+# Reference fixed-price contract for scenarios C/D of the cost report. Date-versioned in
+# energy_tariffs alongside the real tariffs (ref_fixed_* columns) — one place to look when a
+# contract changes. It was a bare 0.26 in this file for a long time, unchecked and undated, and
+# by 2026-08 it sat below EVERY quarter of the live dynamic price, which made the "A vs D" line
+# permanently negative for reasons that had nothing to do with the battery.
+# None = no quote checked for that period; the report then omits C/D instead of inventing one.
+def fixed_reference_for(d: date) -> tuple[Optional[float], Optional[float]]:
+    """(import, export) €/kWh of the reference fixed contract on date d, or (None, None)."""
+    t = tariff_for(d)
+    if t is None or t.ref_fixed_import_kwh is None:
+        return None, None
+    exp = t.ref_fixed_export_kwh
+    return t.ref_fixed_import_kwh, (t.ref_fixed_import_kwh if exp is None else exp)
 
 BASE_LOAD_FALLBACK_W = 400.0
 
@@ -2667,10 +2678,12 @@ def optimise(  # noqa: C901
             slot.ev_kwh         = ev_load[t]
             slot.pv_curtail_kwh = 0.0
             slot.bat_kwh        = 0.0
-            net                 = slot.pv_kwh - slot.load_kwh
+            net                 = slot.pv_kwh - slot.load_kwh - ev_load[t]
             slot.grid_kwh       = -net
             slot.cost_eur       = slot.grid_kwh * (slot.import_price() if net < 0 else slot.export_price())
-            slot.cost_fixed_eur = slot.grid_kwh * (FIXED_TARIFF_EUR_KWH if net < 0 else FIXED_EXPORT_EUR_KWH)
+            _fi, _fe = fixed_reference_for(slot.dt.date())
+            slot.cost_fixed_eur = (0.0 if _fi is None
+                                   else slot.grid_kwh * (_fi if net < 0 else _fe))
         return slots, "MILP_FAILED"
 
     x              = result.x
@@ -2795,7 +2808,8 @@ def optimise(  # noqa: C901
         slot.bat_kwh        = running_soc - soc_before
         slot.grid_kwh       = gi - ge
         slot.cost_eur       = gi * slot.import_price() - ge * slot.export_price()
-        slot.cost_fixed_eur = gi * FIXED_TARIFF_EUR_KWH - ge * FIXED_EXPORT_EUR_KWH
+        _fi, _fe = fixed_reference_for(slot.dt.date())
+        slot.cost_fixed_eur = 0.0 if _fi is None else gi * _fi - ge * _fe
 
         # Tie-break: relabel a battery-at-rest slot to STANDBY. The dispatch sim has
         # the physical truth (bat_kwh); a charge/discharge label that moved no energy
@@ -2842,17 +2856,23 @@ def optimise(  # noqa: C901
             for _r in _rows:
                 dbg(1, DEBUG_OPT, "OPT", _r)
 
-    # Baseline (no battery, no curtailment — comparison scenario)
+    # Baseline (no battery, no curtailment — comparison scenario). The EV belongs in the demand:
+    # every constraint in the LP uses load_kwh + ev_load, so a baseline on load_kwh alone described
+    # a house without the car and charged scenario A for the EV's entire import as a phantom loss
+    # (up to ~10 kWh on a charging day). max() guards the negative "forecast only" ev_kwh marker.
     for slot in slots:
-        net = slot.pv_kwh - slot.load_kwh
+        _fi, _fe = fixed_reference_for(slot.dt.date())
+        net = slot.pv_kwh - slot.load_kwh - max(0.0, slot.ev_kwh)
         if net >= 0:
             slot.baseline_grid_kwh       = -net
             slot.baseline_cost_eur       = slot.baseline_grid_kwh * slot.export_price()
-            slot.baseline_cost_fixed_eur = slot.baseline_grid_kwh * FIXED_EXPORT_EUR_KWH
+            slot.baseline_cost_fixed_eur = (0.0 if _fe is None
+                                            else slot.baseline_grid_kwh * _fe)
         else:
             slot.baseline_grid_kwh       = -net
             slot.baseline_cost_eur       = slot.baseline_grid_kwh * slot.import_price()
-            slot.baseline_cost_fixed_eur = slot.baseline_grid_kwh * FIXED_TARIFF_EUR_KWH
+            slot.baseline_cost_fixed_eur = (0.0 if _fi is None
+                                            else slot.baseline_grid_kwh * _fi)
 
     total_cost = sum(s.cost_eur for s in slots)
     dbg(1, DEBUG_OPT, "OPT",
@@ -2905,6 +2925,23 @@ def _verify_schedule_balance(schedule: list[HourSlot]) -> None:
 # 6c.  COST SIMULATION
 # ---------------------------------------------------------------------------
 
+def _refill_price(schedule: list[HourSlot]) -> float:
+    """€/kWh at which the battery would realistically be topped back up.
+
+    The charge-weighted import price when the plan charges at all, else the mean of the cheapest
+    quarter of the horizon. A flat mean over every slot is the wrong number: it prices battery
+    energy at the moments the optimiser deliberately avoids, so a horizon that ends with a drained
+    battery was over-penalised (€0.14 on a flat day, €0.30+ on a day with a real midday trough).
+    """
+    charged = [(s.bat_kwh, s.import_price()) for s in schedule if s.bat_kwh > 0.0]
+    total   = sum(k for k, _ in charged)
+    if total > 0.01:
+        return sum(k * pr for k, pr in charged) / total
+    prices = sorted(s.import_price() for s in schedule)
+    cheap  = prices[: max(1, len(prices) // 4)]
+    return sum(cheap) / len(cheap)
+
+
 def simulate_and_report(schedule: list[HourSlot]) -> dict:
     a_cost = b_cost = c_cost = d_cost = 0.0
     a_import = a_export = b_import = b_export = 0.0
@@ -2924,21 +2961,27 @@ def simulate_and_report(schedule: list[HourSlot]) -> dict:
         d_cost += s.baseline_cost_fixed_eur
         if s.baseline_grid_kwh > 0:  d_import += s.baseline_grid_kwh
         else:                         d_export -= s.baseline_grid_kwh
-    for s in schedule:
-        if s.grid_kwh > 0:  c_import += s.grid_kwh
-        else:               c_export -= s.grid_kwh
-    # SoC correction: net battery state change has economic value.
-    # If battery ends with more energy, scenario A saved future import that B did not.
+    # C runs the very same schedule as A, so its grid flows are A's by construction.
+    c_import, c_export = a_import, a_export
+    # SoC correction: the battery does not end where it started, and that difference is worth
+    # money — A can simply have spent the battery. Price it at what refilling actually costs.
     soc_begin_kwh  = schedule[0].soc_start_pct  / 100.0 * BAT_CAPACITY_KWH
     soc_end_kwh    = schedule[-1].soc_end_pct   / 100.0 * BAT_CAPACITY_KWH
     delta_soc_kwh  = soc_end_kwh - soc_begin_kwh
-    avg_imp_price  = sum(s.import_price() for s in schedule) / len(schedule)
-    soc_correction = delta_soc_kwh * avg_imp_price
-    a_cost_adj     = a_cost - soc_correction
-    c_cost_adj     = c_cost - soc_correction
+    refill_price   = _refill_price(schedule)
+    soc_correction = delta_soc_kwh * refill_price
+    # Each scenario is corrected inside its OWN tariff world: pricing C's battery at the dynamic
+    # market average dropped a dynamic number into the fixed-tariff column (€0.20 on 2026-08-18).
+    ref_imp, _    = fixed_reference_for(schedule[0].dt.date())
+    have_ref      = ref_imp is not None
+    a_cost_adj    = a_cost - soc_correction
+    c_cost_adj    = (c_cost - delta_soc_kwh * ref_imp) if have_ref else None
 
-    saving_vs_baseline      = b_cost - a_cost_adj
-    saving_dynamic_vs_fixed = d_cost - a_cost_adj
+    # A vs D is the sum of two unrelated effects; reporting only the total invited reading a
+    # tariff comparison as a battery verdict. Split it, and keep the total as the third line.
+    saving_vs_baseline      = b_cost - a_cost_adj                       # battery, dynamic tariff
+    tariff_effect           = (d_cost - b_cost)     if have_ref else None  # tariff regime, no battery
+    saving_dynamic_vs_fixed = (d_cost - a_cost_adj) if have_ref else None  # both effects together
     pv_gross     = pv_total + pv_curtailed   # pv_kwh is already net of curtailment
     pv_effective = pv_total
     log.info("┌─ LP Cost Simulation (%d quarter slots = %.1fh) ────────────────────────────────┐",
@@ -2947,23 +2990,39 @@ def simulate_and_report(schedule: list[HourSlot]) -> dict:
              a_cost_adj, a_import, a_export, soc_end_kwh, delta_soc_kwh)
     log.info("│  B) Dynamic+no-battery  %+8.4f € | imp=%6.2f exp=%6.2f kWh                            │",
              b_cost, b_import, b_export)
-    log.info("│  C) Fixed+LP+curtail    %+8.4f € | imp=%6.2f exp=%6.2f kWh  bat=%5.2fkWh Δ=%+5.2fkWh │",
-             c_cost_adj, c_import, c_export, soc_end_kwh, delta_soc_kwh)
-    log.info("│  D) Fixed+no-battery    %+8.4f € | imp=%6.2f exp=%6.2f kWh                            │",
-             d_cost, d_import, d_export)
-    log.info("│  Saving A vs B (LP+curtail vs no-battery): €%+.4f                                     │", saving_vs_baseline)
-    log.info("│  Saving A vs D (LP+curtail vs fixed/dumb): €%+.4f                                     │", saving_dynamic_vs_fixed)
-    log.info("│  PV generated: %.2f kWh  curtailed: %.2f kWh                                          │", pv_gross, pv_curtailed)
-    log.info("│  PV effectively used: %.2f kWh                                                         │", pv_effective)
+    if have_ref:
+        log.info("│  C) Fixed+LP+curtail    %+8.4f € | imp=%6.2f exp=%6.2f kWh  bat=%5.2fkWh Δ=%+5.2fkWh │",
+                 c_cost_adj, c_import, c_export, soc_end_kwh, delta_soc_kwh)
+        log.info("│  D) Fixed+no-battery    %+8.4f € | imp=%6.2f exp=%6.2f kWh                            │",
+                 d_cost, d_import, d_export)
+    log.info("│  Battery on dynamic     (A vs B): €%+.4f                                              │", saving_vs_baseline)
+    if have_ref:
+        log.info("│  Tariff regime, no accu (B vs D): €%+.4f   (fixed reference %.3f €/kWh)                │", tariff_effect, ref_imp)
+        log.info("│  Combined               (A vs D): €%+.4f   = battery + tariff, NOT a battery verdict  │", saving_dynamic_vs_fixed)
+    else:
+        log.info("│  C/D skipped: no fixed reference in energy_tariffs.ref_fixed_* for this period         │")
+    log.info("│  SoC correction: Δ%+.2f kWh at %.4f €/kWh (charge-weighted) = €%+.4f on A              │", delta_soc_kwh, refill_price, -soc_correction)
+    log.info("│  PV: %.2f kWh gross − %.2f curtailed = %.2f kWh available to house+battery             │", pv_gross, pv_curtailed, pv_effective)
     log.info("└────────────────────────────────────────────────────────────────────────────────────────┘")
     return {
         "horizon_hours": len(schedule) * SLOT_H,
         "a_cost": a_cost, "a_import": a_import, "a_export": a_export,
         "b_cost": b_cost, "b_import": b_import, "b_export": b_export,
-        "c_cost": c_cost, "c_import": c_import, "c_export": c_export,
-        "d_cost": d_cost, "d_import": d_import, "d_export": d_export,
+        # NULL rather than a number when no reference quote was checked for this period, so the
+        # cost_simulation history cannot be read as a comparison that never happened.
+        "c_cost": c_cost if have_ref else None,
+        "c_import": c_import if have_ref else None,
+        "c_export": c_export if have_ref else None,
+        "d_cost": d_cost if have_ref else None,
+        "d_import": d_import if have_ref else None,
+        "d_export": d_export if have_ref else None,
         "saving_vs_baseline": saving_vs_baseline,
         "saving_dynamic_vs_fixed": saving_dynamic_vs_fixed,
+        # a_cost/c_cost above stay RAW so the cost_simulation columns keep their meaning; the
+        # SoC-adjusted figures the report prints are additional keys.
+        "tariff_effect": tariff_effect,
+        "a_cost_adj": a_cost_adj, "c_cost_adj": c_cost_adj,
+        "refill_price": refill_price, "delta_soc_kwh": delta_soc_kwh,
         "pv_total": pv_total,
         "pv_curtailed": pv_curtailed,
     }

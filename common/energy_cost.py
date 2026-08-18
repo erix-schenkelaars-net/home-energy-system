@@ -27,6 +27,14 @@ class Tariff:
     saldering:               bool
     gas_inkoop_m3:           float
     gas_energiebelasting_m3: float
+    # Referentie-vast-contract, ALLEEN voor het C/D-blok in het LP-kostenrapport van de
+    # battery_optimizer. Nooit onderdeel van de all-in/saldering-formule hieronder, en read_p1
+    # en het dashboard doen er niets mee. None = geen gecheckt aanbod voor deze periode; het
+    # rapport laat de vergelijking dan wég in plaats van een verouderd getal te tonen alsof het
+    # klopt (0.26 stond jaren hardcoded en lag onder ELKE dynamische kwartierprijs).
+    ref_fixed_import_kwh:    Optional[float] = None
+    ref_fixed_export_kwh:    Optional[float] = None
+    ref_fixed_note:          Optional[str]   = None
 
 
 @dataclass
@@ -42,8 +50,10 @@ class FixedCosts:
 
 # Fallback (Powerpeers vanaf 2026-06-01) — alleen gebruikt als de DB-read faalt.
 _FALLBACK_TARIFFS = [
-    Tariff(date(2026, 6, 1), date(2026, 12, 31), 0.0100, 0.110848, 0.0100, True,  0.082100, 0.726799),
-    Tariff(date(2027, 1, 1), None,               0.0100, 0.110848, 0.0100, False, 0.082100, 0.726799),
+    Tariff(date(2026, 6, 1), date(2026, 12, 31), 0.0100, 0.110848, 0.0100, True,  0.082100, 0.726799,
+           0.27, 0.27, "1-jaar vast, gecheckt 2026-08-18 (saldering: export=import)"),
+    Tariff(date(2027, 1, 1), None,               0.0100, 0.110848, 0.0100, False, 0.082100, 0.726799,
+           None, None, "geen gecheckt aanbod; saldering weg, export != import"),
 ]
 
 
@@ -65,16 +75,22 @@ def load_tariffs(conn) -> list[Tariff]:
     cur.execute(
         "SELECT valid_from, valid_until, elec_inkoopvergoeding_kwh, elec_energiebelasting_kwh, "
         "elec_verkoopvergoeding_kwh, saldering_active, gas_inkoopvergoeding_m3, "
-        "gas_energiebelasting_m3 FROM energy_tariffs ORDER BY valid_from"
+        "gas_energiebelasting_m3, ref_fixed_import_eur_kwh, ref_fixed_export_eur_kwh, "
+        "ref_fixed_note FROM energy_tariffs ORDER BY valid_from"
     )
     rows = cur.fetchall()
     cur.close()
     if not rows:
         return list(_FALLBACK_TARIFFS)
+    def _opt_float(v):
+        return None if v is None else float(v)
     return [Tariff(r["valid_from"], r["valid_until"],
                    float(r["elec_inkoopvergoeding_kwh"]), float(r["elec_energiebelasting_kwh"]),
                    float(r["elec_verkoopvergoeding_kwh"]), bool(r["saldering_active"]),
-                   float(r["gas_inkoopvergoeding_m3"]), float(r["gas_energiebelasting_m3"]))
+                   float(r["gas_inkoopvergoeding_m3"]), float(r["gas_energiebelasting_m3"]),
+                   _opt_float(r.get("ref_fixed_import_eur_kwh")),
+                   _opt_float(r.get("ref_fixed_export_eur_kwh")),
+                   r.get("ref_fixed_note"))
             for r in rows]
 
 

@@ -500,6 +500,20 @@ CREATE TABLE IF NOT EXISTS `predicted_grid_snapshot` (
 -- Contract tariffs per period (valid_from / valid_until).
 -- Updated manually when the energy supplier changes tariffs.
 -- NULL valid_until means the row is currently active.
+--
+-- The ref_fixed_* columns are NOT a contract term and are never billed: they hold what a
+-- fixed-price contract would have cost, so the battery_optimizer's "LP Cost Simulation" block
+-- can price its C/D comparison scenarios. They live here rather than in a table of their own
+-- because they are date-versioned for exactly the same reason as the real tariffs, and one
+-- place to look beats two near-identical tables. They are deliberately NOT selected by
+-- common/energy_cost.py's load_tariffs() column list, so read_p1 and the WordPress dashboard
+-- cannot pick them up by accident.
+--
+-- NULL ref_fixed_import_eur_kwh means "no quote checked for this period"; the report then omits
+-- C/D entirely instead of printing a stale figure. That is the failure this guards against: the
+-- value sat hardcoded at 0.26 in the optimizer for a long time, undated and unsourced, and by
+-- August 2026 it was below EVERY quarter of the live dynamic price — which made the headline
+-- "A vs D" line permanently negative for reasons that had nothing to do with the battery.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `energy_tariffs` (
   `id`                              int(11)         NOT NULL AUTO_INCREMENT,
@@ -511,6 +525,9 @@ CREATE TABLE IF NOT EXISTS `energy_tariffs` (
   `saldering_active`                tinyint(1)      NOT NULL DEFAULT 1 COMMENT '1=net-metering active',
   `gas_inkoopvergoeding_m3`         decimal(8,6)    NOT NULL COMMENT 'Purchase surcharge gas incl. VAT EUR/m3',
   `gas_energiebelasting_m3`         decimal(8,6)    NOT NULL COMMENT 'Energy tax gas incl. VAT EUR/m3',
+  `ref_fixed_import_eur_kwh`        decimal(8,6)    DEFAULT NULL COMMENT 'Reference FIXED contract: all-in import price incl. VAT EUR/kWh. Report-only (LP cost simulation C/D), never billed. NULL = no quote checked, report omits C/D.',
+  `ref_fixed_export_eur_kwh`        decimal(8,6)    DEFAULT NULL COMMENT 'Reference FIXED contract: feed-in value EUR/kWh. Equals the import price while saldering lasts; from 2027-01-01 it does not, so re-check separately.',
+  `ref_fixed_note`                  varchar(120)    DEFAULT NULL COMMENT 'Provenance + check date of the reference quote, e.g. "1-jaar vast, gecheckt 2026-08-18". Without it the number rots unnoticed.',
 
   PRIMARY KEY (`id`),
   KEY `idx_valid_from` (`valid_from`)
