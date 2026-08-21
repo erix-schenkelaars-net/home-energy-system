@@ -21,7 +21,7 @@ SPH5000 truncation note:
 """
 
 # ── Battery hardware ──────────────────────────────────────────────────────────
-BAT_CAPACITY_KWH     = 16.0   # usable capacity
+BAT_CAPACITY_KWH     = 16.0   # usable capacity (16 × 314 Ah × 3.2 V = 16.08 nameplate)
 BAT_MAX_CHARGE_KW    = 3.0    # SPH5000 hardware charge limit
 BAT_MIN_CHARGE_KW    = 0.3    # minimum meaningful charge power
 BAT_MAX_DISCHARGE_KW = 3.0    # SPH5000 hardware discharge limit
@@ -33,6 +33,52 @@ BAT_CELL_EFF     = 0.95
 BAT_CHARGE_EFF   = BAT_CELL_EFF * INV_EFF   # AC→battery: 0.912
 BAT_DISCHARGE_EFF= BAT_CELL_EFF * INV_EFF   # battery→AC: 0.912
 BAT_ROUNDTRIP_EFF= BAT_CHARGE_EFF * BAT_DISCHARGE_EFF   # ≈ 0.832 AC→AC
+# Measured 2026-02-04..08-19 from the SPH counters: 2011.2 kWh in, 1806.3 kWh out = 0.898,
+# against BAT_CELL_EFF**2 = 0.9025 here. The cell efficiency above is field-confirmed.
+
+# ── Cell wear, as a price the optimiser can weigh against energy ─────────────
+# Cost of one kWh pushed through the cells, so the LP can decline a cycle that earns less than
+# it wears. Derivation, all of it re-checkable:
+#   pack   16 × 314 Ah × 3.2 V            = 16.08 kWh  (BAT_CAPACITY_KWH below)
+#   cells  16 × EVE MB31/LF314, 2026-08   = EUR 1200
+#   spec   >=8000 cycles @ 0.5C/0.5C, 25C, to 70% SOH  (EVE MB31 datasheet)
+#   budget 8000 × 16.08                   = 128 600 kWh of cell-side discharge
+#   wear   1200 / 128 600                 = EUR 0.0093 per kWh discharged
+#
+# This is an UPPER BOUND on the true marginal cost, not an estimate of it. At the measured rate
+# (~11 kWh/day discharged in jun-aug 2026 = ~250 full cycles/year) the 8000 cycles last ~32 years,
+# so calendar ageing ends these cells long before the cycle budget does: the LP is spending a
+# budget it will never exhaust. Re-derive when cell prices move; that is what the two inputs
+# below are for.
+#
+# It does NOT model cell divergence, which is the real degradation path here (cell 16 is the
+# capacity laggard and sets pack capacity). Average throughput wear is an economic term, not a
+# health guard — the top-balance runbook stays responsible for that.
+BAT_CELL_PACK_EUR     = 1200.0
+BAT_CYCLE_LIFE_EFC    = 8000.0
+BAT_WEAR_FULL_EUR_KWH = BAT_CELL_PACK_EUR / (BAT_CYCLE_LIFE_EFC * BAT_CAPACITY_KWH)  # 0.009375
+
+# ...and the optimiser does NOT use that figure. Deliberately, because it prices a scarcity that
+# does not exist here:
+#   - The cells are bought and paid for. A sunk cost must not steer a marginal decision; the only
+#     question that matters is whether one more cycle today brings a future purchase forward.
+#   - It does not. At ~250 full cycles a year the 8000-cycle budget lasts ~32 years, while LFP
+#     ends calendar-wise after 15-20. The budget is never exhausted, so an extra cycle moves no
+#     replacement date and costs, at the margin, essentially nothing.
+# Charging full replacement cost per kWh would buy ~EUR 0.02/day of avoided "wear" that is not
+# actually incurred, at the price of real grid euros — measured, not assumed, on 2026-08-17/18.
+#
+# What survives is the one job the old `1e-4` coefficient in the objective was doing: breaking
+# ties. Without any price the LP is indifferent between equivalent optima and will flip between
+# them from one solve to the next. So the number below is a TIE-BREAKER, not an economic term --
+# 8x the old nudge, 45x under replacement cost, small enough that it never decides anything that
+# carries real money. Set it to BAT_WEAR_FULL_EUR_KWH if you ever want the full-cost behaviour
+# back (both are env-overridable in the optimiser, so a replay can compare them without an edit).
+#
+# The real degradation path here is cell divergence, not average throughput: cell 16 is the
+# capacity laggard and sets pack capacity. A per-kWh price is a poor proxy for that -- the
+# vmin taper, the 20% floor and the monthly top-balance are the guards that actually address it.
+BAT_WEAR_EUR_KWH      = 0.0002
 
 # ── SoC operating limits (LP optimizer — floating-point %) ───────────────────
 BAT_MAX_SOC_PCT           = 89.5  # LP upper bound (Seplos BMS trips at ~89.8%)

@@ -116,6 +116,7 @@ SLOT_H = 0.25  # slot duration: 15 minutes = 0.25 hours
 
 BAT_CAPACITY_KWH     = bc.BAT_CAPACITY_KWH
 BAT_MIN_SOC_PCT      = float(os.getenv("BAT_MIN_SOC_PCT", str(bc.BAT_MIN_SOC_PCT)))  # LP floor; env-overridable (replay/tuning), default bc=20.0%
+BAT_WEAR_EUR_KWH     = float(os.getenv("BAT_WEAR_EUR_KWH", str(bc.BAT_WEAR_EUR_KWH)))  # cell wear per kWh discharged; env-overridable (replay/tuning), default bc=0.009375
 BAT_MIN_SOC_DISCHARGE_PCT = bc.BAT_MIN_SOC_DISCHARGE_PCT  # 18.0% — DISCHARGE floor (doc)
 BAT_DAWN_SOC_PCT     = bc.BAT_DAWN_SOC_PCT              # 20.0% — minimum SoC at 06:00
 BAT_MAX_SOC_PCT      = bc.BAT_MAX_SOC_PCT
@@ -151,7 +152,15 @@ LP_CHARGE_INCENTIVE     = 0.001
 # charges from grid when the roundtrip margin (future_discharge_price × eff − import_price)
 # exceeds this threshold. Prevents marginal daytime supplemental charging where the net gain
 # is only a few cents (e.g. fill 30 min earlier to enable slightly earlier PV export).
-CHARGE_GRID_MIN_MARGIN_EUR_KWH = 0.02
+# Lowered 0.02 -> 0.005 on 2026-08-19 after a rolling replay over 17 paired August days:
+# total economics (grid euros + wear) improved monotonically as this came down, and 0.005
+# captured EUR 0.19/day of the EUR 0.21/day available at 0.00 while keeping a token brake on
+# the marginal midday grid-supplement charging it was built for. Extra cycling was +11%
+# (11.5 -> 12.8 kWh/day discharged) and action switches did NOT rise (24/21, 24/24, 27/27 per
+# 95 slots at 0.02 vs 0.00), so the oscillation this was also suspected of preventing did not
+# materialise. Caveat: August only -- winter has a different price shape and load, so re-run
+# the study once there is a heating season of data. Env-overridable for exactly that.
+CHARGE_GRID_MIN_MARGIN_EUR_KWH = float(os.getenv("CHARGE_GRID_MIN_MARGIN_EUR_KWH", "0.005"))
 PV_ROOM_PENALTY_EUR_KWH = 0.08
 PV_SURPLUS_THRESHOLD_KWH = 0.3
 
@@ -2499,7 +2508,13 @@ def optimise(  # noqa: C901
     for t, slot in enumerate(slots):
         c_obj[gi_base + t] =  slot.import_price() + CHARGE_GRID_MIN_MARGIN_EUR_KWH
         c_obj[ge_base + t] = -slot.export_price()
-        c_obj[bd_base + t] += 1e-4  # tiny tie-breaker to avoid degenerate pointless discharge
+        # Cell wear on the discharge leg. Replaces the 1e-4 tie-breaker that used to sit here:
+        # same purpose (stop degenerate pointless discharge) but a price instead of a nudge, and
+        # ~370x larger. Two unit traps: bd is kW so it needs SLOT_H, and the SoC update spends
+        # bd*SLOT_H/BAT_DISCHARGE_EFF at the cells, which is what the cycle spec counts.
+        # Discharge only, because the >=8000-cycle spec counts DISCHARGE cycles: charging both
+        # legs would bill the same cycle twice. See common/battery_constants.py for the sums.
+        c_obj[bd_base + t] += BAT_WEAR_EUR_KWH * SLOT_H / BAT_DISCHARGE_EFF
         net_demand_t = slot.load_kwh + ev_load[t] - slot.pv_kwh
         if net_demand_t >= 0:
             c_obj[co_base + t] += LP_CHARGE_INCENTIVE  # deficit/night: discourage spurious BATTERY_FIRST
@@ -2889,6 +2904,21 @@ def optimise(  # noqa: C901
 # 6b.  ENERGY BALANCE VERIFICATION
 # ---------------------------------------------------------------------------
 
+def throughput_per_day(schedule: list[HourSlot]) -> tuple[float, float, float]:
+    """(charged, discharged, days) in kWh/day at the CELLS, from the planned SoC track.
+
+    Reported per day and per leg on purpose. The raw sum of |dSoC| over the horizon reads four
+    times too big: the horizon is 48 h, and the sum counts charging AND discharging. Quoting that
+    raw figure as "cycling" once suggested 37 kWh through a 16 kWh battery in a day, which is
+    rightly unbelievable -- it was 9.3 kWh/day discharged, matching the 9.22 kWh/day the SPH
+    counters have measured since february.
+    """
+    days = max(len(schedule) * SLOT_H / 24.0, 1e-9)
+    up   = sum(max(0.0, s.soc_end_pct - s.soc_start_pct) for s in schedule) / 100.0 * BAT_CAPACITY_KWH
+    down = sum(max(0.0, s.soc_start_pct - s.soc_end_pct) for s in schedule) / 100.0 * BAT_CAPACITY_KWH
+    return up / days, down / days, days
+
+
 def _verify_schedule_balance(schedule: list[HourSlot]) -> None:
     if not schedule:
         return
@@ -2903,16 +2933,18 @@ def _verify_schedule_balance(schedule: list[HourSlot]) -> None:
     effective_pv  = total_pv
     gross_pv      = total_pv + total_curtail
     losses        = effective_pv + total_grid - total_load - delta_bat
-    gross_cycle_kwh = sum(
-        abs(s.soc_end_pct - s.soc_start_pct) / 100.0 * BAT_CAPACITY_KWH
-        for s in schedule
-    )
+    chg_day, dis_day, days = throughput_per_day(schedule)
+    gross_cycle_kwh = (chg_day + dis_day) * days
     balance_threshold = max(1.0, 0.12 * gross_cycle_kwh)
     log.info("[BALANCE] GrossPV=%.2f  Curtail=%.2f  EffPV=%.2f  Grid=%+.2f  Load=%.2f  "
              "dBat=%+.2f  Losses=%.3f kWh  threshold=%.2f  (SoC %.1f%%→%.1f%%)",
              gross_pv, total_curtail, effective_pv,
              total_grid, total_load, delta_bat, losses,
              balance_threshold, soc_start, soc_end)
+    log.info("[BATTERY] over %.1f day(s): %.2f kWh/day into the cells, %.2f kWh/day out "
+             "= %.2f full cycles/day, wear %.3f EUR/day at %.5f EUR/kWh",
+             days, chg_day, dis_day, dis_day / BAT_CAPACITY_KWH,
+             dis_day * BAT_WEAR_EUR_KWH, BAT_WEAR_EUR_KWH)
     if losses < -0.05:
         log.warning("[BALANCE] Negative losses (%.3f kWh) – energy from nowhere", losses)
     elif abs(losses) > balance_threshold:

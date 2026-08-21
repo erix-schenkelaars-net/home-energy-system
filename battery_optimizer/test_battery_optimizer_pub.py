@@ -673,9 +673,10 @@ class TestSocConstraintConstants(unittest.TestCase):
     def test_bat_min_charge_kw_positive(self):
         self.assertGreater(mod.BAT_MIN_CHARGE_KW, 0.0)
 
-    def test_charge_grid_min_margin_is_02(self):
-        self.assertAlmostEqual(mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH, 0.02, places=6)
-
+    # test_charge_grid_min_margin_is_02 lived here and pinned the value at 0.02. Removed rather
+    # than re-pinned: the margin moved to 0.005 on measured evidence (see TestChargeGridMargin,
+    # which states the reason), and a bare "is this number still that number" test in a class
+    # about SoC constraints just has to be edited every time the evidence changes.
     def test_charge_grid_min_margin_positive_and_small(self):
         self.assertGreater(mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH, 0.0)
         self.assertLess(mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH, 0.10)
@@ -1688,6 +1689,115 @@ class TestBaselineIncludesEv(_ScenarioBase):
         demand   = sum(s.load_kwh + s.ev_kwh       for s in self.slots)
         self.assertAlmostEqual(sum(s.baseline_grid_kwh for s in self.slots),
                                demand - gross_pv, places=6)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Cell wear as a price in the objective, and reporting throughput in units that
+# cannot be misread.
+#
+# The wear term replaces a 1e-4 tie-breaker that was ~370x too small to mean anything. It is
+# calibrated on the actual cells: EUR 1200 for 16 x EVE MB31/LF314 314Ah, spec >=8000 cycles to
+# 70% SOH, so 8000 x 16 kWh = 128 000 kWh of cell-side discharge for EUR 1200.
+# ══════════════════════════════════════════════════════════════════════════════
+class TestCellWearPrice(unittest.TestCase):
+
+    def test_full_cost_reference_derives_from_cell_cost_and_cycle_life(self):
+        from common import battery_constants as bc
+        self.assertAlmostEqual(
+            bc.BAT_WEAR_FULL_EUR_KWH,
+            bc.BAT_CELL_PACK_EUR / (bc.BAT_CYCLE_LIFE_EFC * bc.BAT_CAPACITY_KWH), places=12)
+        self.assertAlmostEqual(bc.BAT_WEAR_FULL_EUR_KWH, 0.009375, places=9)
+
+    def test_optimizer_default_follows_the_constant(self):
+        from common import battery_constants as bc
+        self.assertAlmostEqual(mod.BAT_WEAR_EUR_KWH, bc.BAT_WEAR_EUR_KWH, places=12)
+
+    def test_the_price_used_is_a_tiebreaker_not_the_full_cost(self):
+        # The cells are paid for and the 8000-cycle budget lasts ~32 years at this usage, so
+        # calendar ageing ends them first: an extra cycle moves no replacement date. Charging
+        # full cost would spend real grid euros to avoid a cost that is not incurred.
+        from common import battery_constants as bc
+        self.assertLess(bc.BAT_WEAR_EUR_KWH, bc.BAT_WEAR_FULL_EUR_KWH / 10)
+
+    def test_it_is_still_bigger_than_the_nudge_it_replaced(self):
+        # Exactly zero would be worse than before: the old 1e-4 EUR/kW on a 0.25 h slot
+        # (= 2.5e-5 EUR/kWh) existed to stop the LP flip-flopping between equal optima.
+        self.assertGreater(mod.BAT_WEAR_EUR_KWH, 2.5e-5)
+
+
+class TestChargeGridMargin(unittest.TestCase):
+    """The remaining brake on cycling, lowered on measured evidence rather than feel."""
+
+    def test_default_is_the_value_the_rolling_replay_settled_on(self):
+        self.assertAlmostEqual(mod.CHARGE_GRID_MIN_MARGIN_EUR_KWH, 0.005, places=9)
+
+    def test_it_is_env_overridable_for_replays(self):
+        import importlib
+        with patch.dict(os.environ, {"CHARGE_GRID_MIN_MARGIN_EUR_KWH": "0.02"}):
+            reloaded = importlib.reload(mod)
+            self.assertAlmostEqual(reloaded.CHARGE_GRID_MIN_MARGIN_EUR_KWH, 0.02, places=9)
+        importlib.reload(mod)   # restore the default for every other test
+
+
+class TestThroughputPerDay(unittest.TestCase):
+    """Reported per day and per leg, because the raw sum over the horizon reads 4x too big."""
+
+    @staticmethod
+    def _schedule(n_slots, step_pct):
+        """First half charges by step_pct per slot, second half discharges by the same."""
+        out, soc = [], 20.0
+        for i in range(n_slots):
+            s = mod.HourSlot(dt=datetime(2026, 8, 18, 0, 0) + timedelta(minutes=15 * i))
+            d = step_pct if i < n_slots // 2 else -step_pct
+            s.soc_start_pct, s.soc_end_pct = soc, soc + d
+            soc += d
+            out.append(s)
+        return out
+
+    def test_splits_the_two_legs_and_divides_by_the_horizon(self):
+        sched = self._schedule(192, 0.5)          # 48 h, 96 slots up then 96 down
+        chg, dis, days = mod.throughput_per_day(sched)
+        self.assertAlmostEqual(days, 2.0, places=9)
+        self.assertAlmostEqual(chg, 96 * 0.5 / 100.0 * mod.BAT_CAPACITY_KWH / 2.0, places=9)
+        self.assertAlmostEqual(dis, chg, places=9)
+
+    def test_daily_figure_is_a_quarter_of_the_raw_two_leg_sum(self):
+        # This is the exact trap: raw sum over a 48 h horizon, both legs, was quoted as if it
+        # were one day of throughput. 37.3 kWh "cycling" was really 9.3 kWh/day discharged.
+        sched = self._schedule(192, 0.5)
+        chg, dis, days = mod.throughput_per_day(sched)
+        raw_sum = sum(abs(s.soc_end_pct - s.soc_start_pct) for s in sched) / 100.0 * mod.BAT_CAPACITY_KWH
+        self.assertAlmostEqual(raw_sum, 4 * dis, places=9)
+
+    def test_no_movement_is_zero_not_a_divide_by_zero(self):
+        sched = self._schedule(8, 0.0)
+        chg, dis, days = mod.throughput_per_day(sched)
+        self.assertEqual((chg, dis), (0.0, 0.0))
+        self.assertGreater(days, 0.0)
+
+
+class TestWearSuppressesCycling(_ScenarioBase):
+    """A wear price the LP can see must reduce cycling; at zero it must not interfere."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.kwargs = dict(soc=55.0, rad=_build_radiation(cloud_flat(40)),
+                          prices=prices_make(), start_h=0)
+
+    def _cycled(self, wear):
+        with patch.object(mod, "BAT_WEAR_EUR_KWH", wear):
+            slots, st = run_scenario(**self.kwargs)
+        self.assertEqual(st, "OK")
+        _, dis, _ = mod.throughput_per_day(slots)
+        return dis
+
+    def test_expensive_wear_cycles_less_than_free_wear(self):
+        free = self._cycled(0.0)
+        dear = self._cycled(0.30)          # absurd price on purpose: effect must be unambiguous
+        self.assertLess(dear, free, "a wear price must make the LP discharge less")
+
+    def test_zero_wear_still_cycles(self):
+        self.assertGreater(self._cycled(0.0), 0.1, "scenario must actually use the battery")
 
 
 if __name__ == "__main__":
