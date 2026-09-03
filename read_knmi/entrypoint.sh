@@ -4,7 +4,11 @@
 # Log rotation is handled by host cron (cleanup_logs.sh), not here.
 
 LOG_DIR=/logs
-LOG_FILE="${LOG_DIR}/debug_$(date +%Y-%m-%d).log"
 mkdir -p "${LOG_DIR}"
 
-exec python3 -u read_knmi.py 2>&1 | tee -a "${LOG_FILE}"
+# Roteer per KALENDERDAG (niet per containerstart), zodat een langlopende container
+# niet meer naar één groeiend bestand schrijft. tee-equivalent: ook naar stdout.
+exec python3 -u read_knmi.py 2>&1 | while IFS= read -r line; do
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >> "${LOG_DIR}/debug_$(date +%Y-%m-%d).log"
+done
