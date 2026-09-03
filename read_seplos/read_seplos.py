@@ -1050,6 +1050,13 @@ def main():
             if charge_limit != MAX_CHARGE_LIMIT or discharge_limit != MAX_DISCHARGE_LIMIT:
                 dbg(1, DEBUG_MAIN, "MAIN", f"⛔ cel#{vmin_idx}={vmin} mV, cel#{vmax_idx}={vmax} mV, vdelta {vmax-vmin} mV, tmax {tmax} °C, soc {soc} %")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⛔ charge_limit_A        {charge_limit} A discharge_limit_A {-discharge_limit} A")
+                # BURST: alle 16 cellen + onafhankelijke klemspanning gelijktijdig, om te scheiden of
+                # een bank-inzakking (bv. cel10-16, 2026-09-02 21:07) ECHT is of een sense-artefact.
+                # gap≈0 -> celsom == klem -> spanning zakt echt; gap≈+0,85V -> meting leest laag, klem niet.
+                _csum = sum(cell_v) / 1000.0
+                dbg(1, DEBUG_MAIN, "MAIN",
+                    f"🔬 BURST cells_mv={cell_v} sum={_csum:.2f}V term={pack_voltage:.2f}V "
+                    f"gap={pack_voltage - _csum:+.3f}V I={pack_current:.1f}A")
 
             # ---- PIC byte explanation ----
             dbg(4, DEBUG_MAIN, "MAIN", "=" * 60)
