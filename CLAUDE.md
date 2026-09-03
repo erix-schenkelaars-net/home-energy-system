@@ -63,35 +63,42 @@ like the change silently not working:
 
 | Service | Code arrives via | Applies with |
 |---|---|---|
-| read_seplos, read_p1, read_knmi, read_growatt | bind-mount `.:/app` | `docker compose restart` |
-| battery_optimizer, read_bmw, dashboards | `COPY` into the image | `docker compose build && up -d` |
+| **all** pi5new services + surebet on pi5 | bind-mount `.:/app` | `docker compose restart` |
 
-read_growatt mounts `.:/app` (verified 2026-07-31: container `/app` md5 == host), so its code —
-like read_seplos — applies on `restart`; no build. `common/` is bind-mounted (`../common:/app/common:ro`)
-into read_growatt **and** battery_optimizer, so a change to a constant there applies on `restart` too.
+Since 2026-09-03 **every** service is bind-mount: the compose mounts `.:/app` (host code shadows the
+image), and the Dockerfile copies only `requirements.txt` + `entrypoint.sh` — no app `.py`. So a code
+or entrypoint edit applies on plain `docker compose restart`; no build, ever. Verified live (container
+`/app` md5 == host). `common/` is bind-mounted (`../common:/app/common:ro`) into the services that use
+it, so a change to a shared constant applies on `restart` too. Adding or changing a **volume/mount** in
+the compose still needs `up -d` (not just restart) to recreate the container; a Dockerfile/base-image or
+`requirements.txt` change still needs `build && up -d`.
 
-For the genuine image-based services, plain `docker compose build` is enough for a code edit: the
-`COPY` layer is content-addressed, so a changed file invalidates exactly that layer and ships the new
-code while the slow `pip install` layer is reused (the big time saver). Reach for `--no-cache` (and
-`--pull`) only when refreshing a dependency you did not bump in requirements.txt, or a base image — or
-as the sledgehammer if a change mysteriously will not apply. Always pair `build` with `up -d` —
-building alone leaves the old container running. `./rebuild-all.sh` does `down` + `up -d --build` for
-every service that has a compose file.
+Before 2026-09-03 four services (battery_optimizer, read_bmw, read_otthing, transfer_p60) were `COPY`-
+based and needed a build per edit; they were converted to bind-mount for consistency (one host, source
+always present, least friction). `./rebuild-all.sh` still does `down` + `up -d --build` for every service
+with a compose file when you do want a full rebuild.
 
 ## Logging
 
 Python logs to **stdout only**. `entrypoint.sh` tees it into `/logs/debug_$(date +%F).log`:
 
 ```sh
-exec python3 -u <service>.py 2>&1 | tee -a "${LOG_FILE}"
+exec python3 -u <service>.py 2>&1 | while IFS= read -r line; do
+    printf '%s\n' "$line"                                         # keep stdout (docker logs)
+    printf '%s\n' "$line" >> "${LOG_DIR}/debug_$(date +%Y-%m-%d).log"
+done
 ```
 
 Do not add a `FileHandler` — it breaks the convention and makes the module unimportable on the
 host, which breaks the test suite.
 
 To read logs, grep `<service>/logs/debug_YYYY-MM-DD.log`, not `docker logs` — container output is
-lost on rebuild. The file is named after the date the **container started**, so a container that
-has been up for days is still writing to an older file.
+lost on rebuild. The date is re-evaluated **per line**, so the file rolls at midnight to the new
+day on its own — one file per calendar day, regardless of how long the container has been up.
+(Until 2026-09-03 the name was fixed at container-start date, so a long-running container grew one
+giant file — read_seplos hit 1.35 GB; that is fixed.) `cleanup_logs.sh` (root cron, daily) then
+deletes files whose **filename date** is older than 5 days — by name, not mtime, since the active
+file's mtime never ages.
 
 Log in local time. The database stores local time; a log in UTC sits two hours off the rows it
 just wrote.

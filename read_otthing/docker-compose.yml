@@ -8,5 +8,6 @@ services:
     env_file:
       - ../.env
     volumes:
+      - .:/app
       - ../common:/app/common:ro
       - ./logs:/logs

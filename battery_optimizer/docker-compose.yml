@@ -7,6 +7,7 @@ services:
     container_name: battery_optimizer
 
     volumes:
+      - .:/app
       - ./output:/output
       - ./logs:/logs
       - ../read_growatt/sph5k.conf:/app/sph5k.conf:ro

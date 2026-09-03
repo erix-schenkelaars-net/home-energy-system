@@ -6,7 +6,6 @@ COPY requirements.txt .
 RUN pip install --upgrade pip --quiet
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY read_bmw.py .
 COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
