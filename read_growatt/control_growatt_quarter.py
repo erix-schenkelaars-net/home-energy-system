@@ -51,7 +51,7 @@ import json
 import paho.mqtt.publish as mqtt_publish
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from common import battery_constants as bc
-from common.battery_alert import alert_trigger, alert_clear
+from common.battery_alert import alert_trigger, alert_clear, alert_active
 from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 
 
@@ -331,6 +331,7 @@ SPH_REG_LIST = [
 ]
 
 REG_ADDR = {r.name.strip(): r.addr for r in SPH_REG_LIST}
+REG_BY_NAME = {r.name.strip(): r for r in SPH_REG_LIST}  # Register-object per naam (losse reads)
 REG_ADDR_TO_NAME = {r.addr: r.name.strip() for r in SPH_REG_LIST}
 
 # VPP on/off control registers (write-only, excluded from normal read cycle)
@@ -547,6 +548,37 @@ def read_register(client, reg: Register):
     val = round((val * reg.factor), 1)
     dbg(3, "SPH", f"{reg.name:45s} @ {reg.addr:6d} = {val:>8}   {reg.comment}")
     return val
+
+
+SPH_BURST_POLL_S   = 3     # hoe vaak de vdelta_taper-latch peilen in de sleep
+SPH_BURST_SAMPLE_S = 2     # samplinginterval van de SPH-pakspanning tijdens een taper
+SPH_BURST_CAP_S    = 180   # veiligheidscap: max burstduur als de latch blijft hangen
+
+def sleep_with_sph_burst(client, seconds):
+    """Slaap `seconds`, maar peil elke ~3 s de vdelta_taper-latch. Zolang die actief is,
+    lees ALLEEN REG_Battery_voltage elke ~2 s en log 'SPH-BURST' -- read-only, geen inverter-
+    writes, geen control. Legt de ONAFHANKELIJKE SPH-pakspanning vast tijdens een Seplos-taper,
+    naast de read_seplos-BURST (op tijdstip te vergelijken in de logs). Cap tegen een blijvende
+    latch. Best-effort: mag de inverterlus nooit breken."""
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            active = alert_active('vdelta_taper')
+        except Exception:
+            active = False
+        if active:
+            burst_end = time.time() + SPH_BURST_CAP_S
+            while time.time() < burst_end:
+                try:
+                    if not alert_active('vdelta_taper'):
+                        break
+                    v = read_register(client, REG_BY_NAME['REG_Battery_voltage'])
+                    dbg(1, 'SPH', f"\U0001f52c SPH-BURST growatt_pack={v}V (vdelta_taper actief)")
+                except Exception as e:
+                    dbg(1, 'SPH', f'SPH-BURST read failed: {e}')
+                sleep(SPH_BURST_SAMPLE_S)
+        else:
+            sleep(min(SPH_BURST_POLL_S, max(0.0, end - time.time())))
 
 
 def read_all_registers(client):
@@ -1852,7 +1884,7 @@ def main_loop():
             dbg(1, "SPH", "SOC lock released: schedule end reached")
             soc_schedule_lock = False
             elapsed = time.time() - loop_start
-            sleep(max(0, CHECK_INTERVAL - elapsed))
+            sleep_with_sph_burst(client, max(0, CHECK_INTERVAL - elapsed))
             continue
 
         if source != Source.SCHEDULE:
@@ -1925,7 +1957,7 @@ def main_loop():
             set_in_standby(client)
 
             elapsed = time.time() - loop_start
-            sleep(max(0, CHECK_INTERVAL - elapsed))
+            sleep_with_sph_burst(client, max(0, CHECK_INTERVAL - elapsed))
             continue
 
         # --------------------------------------------------
@@ -1943,7 +1975,7 @@ def main_loop():
         _last_cfg   = copy.deepcopy(cfg_obj)
 
         elapsed = time.time() - loop_start
-        sleep(max(0, CHECK_INTERVAL - elapsed))
+        sleep_with_sph_burst(client, max(0, CHECK_INTERVAL - elapsed))
 
 
 if __name__ == "__main__":

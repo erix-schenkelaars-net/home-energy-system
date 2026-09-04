@@ -77,6 +77,35 @@ def _mqtt(active: bool, alert_key: str, message: str) -> None:
         print(f"[battery_alert] MQTT publish failed for {alert_key}: {e}", flush=True)
 
 
+def alert_active(alert_key: str) -> bool:
+    """Is deze alert nu actief? Leest de nieuwste latch-rij voor de key (active 1/0).
+
+    De lees-kant van dit gedeelde kanaal: read_seplos zet 'vdelta_taper' aan/uit via
+    alert_trigger/alert_clear, control_growatt peilt hier of er een taper loopt om zijn
+    onafhankelijke SPH-pakspanning tijdens het event te samplen. Best-effort -> False bij
+    een DB-fout: faalt veilig (geen burst i.p.v. een crash in de inverterbesturing)."""
+    try:
+        import mysql.connector
+        db = mysql.connector.connect(
+            host=os.getenv('DB_HOST'),
+            user=os.getenv('DB_USER'),
+            passwd=os.getenv('DB_PASSWORD'),
+            db=os.getenv('DB_NAME'),
+            ssl_disabled=True,
+            connection_timeout=5,
+        )
+        cur = db.cursor()
+        cur.execute("SELECT active FROM battery_alert_latch "
+                    "WHERE alert_key=%s ORDER BY id DESC LIMIT 1", (alert_key,))
+        row = cur.fetchone()
+        cur.close()
+        db.close()
+        return bool(row[0]) if row else False
+    except Exception as e:
+        print(f"[battery_alert] alert_active query failed for {alert_key}: {e}", flush=True)
+        return False
+
+
 def alert_trigger(alert_key: str, message: str) -> None:
     _db_write(alert_key, True,  message)
     _mqtt(True,  alert_key, message)
