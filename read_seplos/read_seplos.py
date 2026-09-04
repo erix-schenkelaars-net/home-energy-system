@@ -784,6 +784,27 @@ def _get_current_lp_action() -> str | None:
         return None
 
 
+def read_sph_voltage():
+    """Nieuwste ONAFHANKELIJKE SPH-pakspanning uit de DB (door read_growatt geschreven, ~60 s
+    cadans). Voor de cross-check op een vdelta-event: is de Seplos-klemspanning betrouwbaar?
+    Baseline (2026-09-04) waren beide binnen 20 mV eens. Returnt (V, bron-ts) of (None, None).
+    Best-effort — mag de BMS-lus NOOIT laten crashen, dus alles in try/except."""
+    try:
+        db = mysql.connector.connect(host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
+                                     db=DB_NAME, connection_timeout=3)
+        cur = db.cursor()
+        cur.execute("SELECT sph_bat_voltage_v, ts FROM energy "
+                    "WHERE sph_bat_voltage_v IS NOT NULL ORDER BY ts DESC LIMIT 1")
+        row = cur.fetchone()
+        db.close()
+        if not row or row[0] is None:
+            return None, None
+        return float(row[0]), row[1]
+    except Exception as exc:
+        dbg(1, DEBUG_MAIN, "MAIN", f"SPH voltage query failed: {exc}")
+        return None, None
+
+
 # ---------------- MAIN ----------------
 def main():
     ser = serial.Serial(PORT, BAUD, parity=PARITY, timeout=TIMEOUT)
@@ -813,6 +834,7 @@ def main():
         LP_ACTION_INTERVAL   = 30.0   # seconds between battery_schedule queries
         last_vdelta_taper_active = False
         last_vmin_taper_active   = False
+        sph_logged_this_event    = False   # SPH-cross-check 1x per limiet-event loggen, niet elke poll
         vdelta_taper_count  = 0   # consecutive readings >= VDELTA_TAPER_START_MV
         vmin_taper_count    = 0   # consecutive readings <= VMIN_TAPER_START_MV
         TAPER_DEBOUNCE      = 5   # readings (~10 s) before taper + alert activate
@@ -1047,6 +1069,8 @@ def main():
             dbg(2, DEBUG_MAIN, "MAIN", f"active current alarms {active_current_alarms}")
             dbg(2, DEBUG_MAIN, "MAIN", f"active FET states     {active_FET_states}")
             dbg(2, DEBUG_MAIN, "MAIN", f"active hard faults    {active_hard_faults}")
+            if charge_limit == MAX_CHARGE_LIMIT and discharge_limit == MAX_DISCHARGE_LIMIT:
+                sph_logged_this_event = False          # limieten terug op normaal -> volgend event mag weer loggen
             if charge_limit != MAX_CHARGE_LIMIT or discharge_limit != MAX_DISCHARGE_LIMIT:
                 dbg(1, DEBUG_MAIN, "MAIN", f"⛔ cel#{vmin_idx}={vmin} mV, cel#{vmax_idx}={vmax} mV, vdelta {vmax-vmin} mV, tmax {tmax} °C, soc {soc} %")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⛔ charge_limit_A        {charge_limit} A discharge_limit_A {-discharge_limit} A")
@@ -1057,6 +1081,16 @@ def main():
                 dbg(1, DEBUG_MAIN, "MAIN",
                     f"🔬 BURST cells_mv={cell_v} sum={_csum:.2f}V term={pack_voltage:.2f}V "
                     f"gap={pack_voltage - _csum:+.3f}V I={pack_current:.1f}A")
+                # Cross-check tegen het TWEEDE, onafhankelijke apparaat (Growatt/SPH). 1x per event,
+                # en pas NA de beschermings-write hierboven, zodat de DB-query de taper nooit vertraagt.
+                # sph≈term -> twee apparaten eens, Seplos-klem betrouwbaar als BURST-referentie.
+                if not sph_logged_this_event:
+                    sph_logged_this_event = True
+                    _sphv, _sphts = read_sph_voltage()
+                    if _sphv is not None:
+                        dbg(1, DEBUG_MAIN, "MAIN",
+                            f"🔬 SPH-XCHECK growatt={_sphv:.2f}V (bron-ts {_sphts}) "
+                            f"vs seplos-term={pack_voltage:.2f}V diff={_sphv - pack_voltage:+.3f}V")
 
             # ---- PIC byte explanation ----
             dbg(4, DEBUG_MAIN, "MAIN", "=" * 60)
