@@ -1800,5 +1800,73 @@ class TestWearSuppressesCycling(_ScenarioBase):
         self.assertGreater(self._cycled(0.0), 0.1, "scenario must actually use the battery")
 
 
+class _FakeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+    def execute(self, *a, **k):
+        pass
+    def fetchall(self):
+        return self._rows
+    def close(self):
+        pass
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self._rows = rows
+    def cursor(self):
+        return _FakeCursor(self._rows)
+
+
+class TestPriceBackfill(unittest.TestCase):
+    """Regressie 2026-09-14: EnergyZero 504 -> lege prijs-dict -> elk slot viel terug
+    op de 0.15-median-van-niets (all-in 0.27), wat de 08:00-piek verkeerd beprijsde en
+    de actie naar LOAD_FIRST omklapte. De fix vult ontbrekende slots uit
+    electricity_prices (de dag-vooruit-prijzen die er al staan)."""
+
+    TODAY = date(2026, 9, 14)
+    TOMORROW = date(2026, 9, 15)
+
+    def _rows(self):
+        # 08:00 = idx 32, 08:15 = idx 33 vandaag; 00:00 morgen = idx 96.
+        return [
+            (datetime(2026, 9, 14, 8, 0), 0.413142),
+            (datetime(2026, 9, 14, 8, 15), 0.361076),
+            (datetime(2026, 9, 15, 0, 0), 0.250000),
+        ]
+
+    def test_empty_fetch_is_filled_from_db(self):
+        prices = {}
+        n = mod.backfill_prices_from_db(_FakeConn(self._rows()), prices,
+                                        self.TODAY, self.TOMORROW)
+        self.assertEqual(n, 3)
+        self.assertAlmostEqual(prices[32], 0.413142)   # 08:00, niet 0.15
+        self.assertAlmostEqual(prices[33], 0.361076)   # 08:15
+        self.assertAlmostEqual(prices[96], 0.250000)   # morgen 00:00
+
+    def test_live_values_are_never_overwritten(self):
+        prices = {32: 0.99}                            # verse live-prijs voor 08:00
+        mod.backfill_prices_from_db(_FakeConn(self._rows()), prices,
+                                    self.TODAY, self.TOMORROW)
+        self.assertEqual(prices[32], 0.99)             # blijft de live-waarde
+        self.assertAlmostEqual(prices[33], 0.361076)   # gat wél gevuld
+
+    def test_nothing_missing_is_a_noop(self):
+        prices = {i: 0.30 for i in range(192)}
+        n = mod.backfill_prices_from_db(_FakeConn(self._rows()), prices,
+                                        self.TODAY, self.TOMORROW)
+        self.assertEqual(n, 0)
+
+    def test_db_failure_is_swallowed(self):
+        class _BoomConn:
+            def cursor(self):
+                raise RuntimeError("db down")
+        prices = {}
+        n = mod.backfill_prices_from_db(_BoomConn(), prices,
+                                        self.TODAY, self.TOMORROW)
+        self.assertEqual(n, 0)          # geen crash, geen slots gevuld
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

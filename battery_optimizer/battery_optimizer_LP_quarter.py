@@ -499,6 +499,60 @@ def fetch_all_prices(today: date) -> dict[int, float]:
     return combined
 
 
+def backfill_prices_from_db(conn, prices: dict[int, float], today: date,
+                            tomorrow: date) -> int:
+    """Vul kwartieren die de live-fetch niet teruggaf aan uit electricity_prices.
+
+    EnergyZero timeout't vaak genoeg (504 / read-timeout) dat een run met weinig of
+    NUL kwartieren terugkomt. Zonder dit viel een ontbrekend kwartier terug op de
+    0.15-median-van-niets ([]-default), all-in 0.27 — wat op 2026-09-14 de 08:00-
+    ochtendpiek verkeerd beprijsde en de actie naar LOAD_FIRST omklapte. De juiste
+    dag-vooruit-prijs staat vrijwel altijd al in de DB (de middernacht-run schrijft
+    hem weg), dus lees hem terug; alleen als de DB óók niks heeft blijft een slot
+    leeg voor de 0.15-laatste-redmiddel. Live-waarden worden nooit overschreven —
+    er worden uitsluitend gaten gevuld.
+    """
+    missing = [idx for idx in range(192) if idx not in prices]
+    if not missing:
+        return 0
+    live_count = 192 - len(missing)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT ts, markttarief_kwh FROM electricity_prices "
+            "WHERE ts >= %s AND ts < %s ORDER BY ts",
+            (datetime(today.year, today.month, today.day),
+             datetime(tomorrow.year, tomorrow.month, tomorrow.day) + timedelta(days=1)),
+        )
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as exc:
+        log.warning("Prijs-DB-fallback faalde: %s", exc)
+        return 0
+
+    filled = 0
+    for ts, val in rows:
+        if val is None:
+            continue
+        d = ts.date()
+        if d == today:
+            base = 0
+        elif d == tomorrow:
+            base = 96
+        else:
+            continue
+        idx = base + ts.hour * 4 + ts.minute // 15
+        if 0 <= idx < 192 and idx not in prices:
+            prices[idx] = float(val)
+            filled += 1
+
+    if filled:
+        log.warning("Prijs-fetch gaf %d/192 slots live; %d aangevuld uit "
+                    "electricity_prices (EnergyZero-storing opgevangen)",
+                    live_count, filled)
+    return filled
+
+
 def store_day_prices_to_db(conn, prices_0_95: dict, day) -> None:
     """Store EPEX quarter prices for one day in electricity_prices.
     Future dates use ON DUPLICATE KEY UPDATE so that day-ahead prices (published ~13:00)
@@ -3477,6 +3531,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
 
     prices    = fetch_all_prices(today)
     _tomorrow = today + timedelta(days=1)
+    backfill_prices_from_db(conn, prices, today, _tomorrow)
     store_day_prices_to_db(conn, {q: v for q, v in prices.items() if q < 96}, today)
     store_day_prices_to_db(conn, {q - 96: v for q, v in prices.items() if q >= 96}, _tomorrow)
     fetch_store_gas_price(conn, today)
