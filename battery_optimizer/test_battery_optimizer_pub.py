@@ -1868,5 +1868,42 @@ class TestPriceBackfill(unittest.TestCase):
 
 
 
+class TestAdaptiveFloor(unittest.TestCase):
+    """Ratchet-logica van de adaptieve SoC-vloer (decide_soc_floor). Alleen omhoog,
+    bij een bodem-taper, met snelheidsbegrenzer en cap."""
+
+    def test_raises_on_floor_taper(self):
+        new, act = mod.decide_soc_floor(20.0, 20.0, [19.9], hours_since_update=10)
+        self.assertEqual(act, "raise")
+        self.assertEqual(new, 22.0)
+
+    def test_rate_limited_within_interval(self):
+        new, act = mod.decide_soc_floor(20.0, 20.0, [19.9], hours_since_update=2)
+        self.assertIsNone(act)
+        self.assertEqual(new, 20.0)
+
+    def test_taper_far_above_floor_ignored(self):
+        # een taper bij hoge SoC (bv. transient) mag de vloer niet optillen
+        new, act = mod.decide_soc_floor(20.0, 20.0, [55.0], hours_since_update=10)
+        self.assertIsNone(act)
+        self.assertEqual(new, 20.0)
+
+    def test_no_taper_no_change(self):
+        new, act = mod.decide_soc_floor(24.0, 20.0, [], hours_since_update=10)
+        self.assertIsNone(act)
+        self.assertEqual(new, 24.0)
+
+    def test_cap_reached_signals_but_does_not_exceed(self):
+        new, act = mod.decide_soc_floor(30.0, 20.0, [29.9], hours_since_update=10)
+        self.assertEqual(act, "cap")
+        self.assertEqual(new, 30.0)
+
+    def test_never_exceeds_cap_on_raise(self):
+        new, act = mod.decide_soc_floor(29.0, 20.0, [28.9], hours_since_update=10)
+        self.assertEqual(act, "raise")
+        self.assertEqual(new, 30.0)   # 29+2 geclamped naar cap 30
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

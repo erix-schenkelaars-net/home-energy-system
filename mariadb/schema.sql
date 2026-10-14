@@ -276,13 +276,13 @@ CREATE TABLE IF NOT EXISTS `electricity_prices` (
 
 
 -- ---------------------------------------------------------------------------
--- battery_alert_latch
+-- alert_latch
 -- ---------------------------------------------------------------------------
 -- One row per alert key. Written by common/battery_alert.py (read_seplos and
 -- control_growatt). Tracks active/cleared state and acknowledgement by the user.
 -- Read by WordPress battery page and homepage tile shortcode.
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS `battery_alert_latch` (
+CREATE TABLE IF NOT EXISTS `alert_latch` (
   `id`              bigint(20)   NOT NULL AUTO_INCREMENT,
   `ts`              datetime     DEFAULT NULL               COMMENT 'Event timestamp (trigger or clear)',
   `alert_key`       varchar(40)  NOT NULL                   COMMENT 'vdelta_taper | vmin_taper | soc_low_lock | vmin_low_lock',
@@ -599,4 +599,20 @@ CREATE TABLE IF NOT EXISTS `calibration_log` (
     `guard`          VARCHAR(10),          -- ok | warn | hardstop
     `note`           VARCHAR(255),
     INDEX (`session_id`), INDEX (`ts`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- battery_soc_floor — adaptieve LP-SoC-vloer (1 rij, id=1).
+-- De battery_optimizer ratchet floor_pct omhoog (stap SOC_FLOOR_STEP_PCT, cap
+-- SOC_FLOOR_CAP_PCT, max ~1 stap per SOC_FLOOR_MIN_INTERVAL_H) zodra een vmin/vdelta-
+-- taper bij de bodem (binnen SOC_FLOOR_PROX_PCT van de vloer) vuurt — om de zwakke
+-- cel #16 van z'n knik te houden tot de balans is hersteld. Terug naar base_pct gaat
+-- HANDMATIG na een top-balancering via tools/reset_soc_floor.py. Waarom een tabel en
+-- geen env: de verhoogde vloer moet herstarts overleven en door de optimizer per run
+-- gelezen worden.
+CREATE TABLE IF NOT EXISTS battery_soc_floor (
+  id         TINYINT      PRIMARY KEY,
+  floor_pct  FLOAT        NOT NULL,
+  base_pct   FLOAT        NOT NULL,
+  updated_at DATETIME,
+  reason     VARCHAR(255)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -116,6 +116,14 @@ SLOT_H = 0.25  # slot duration: 15 minutes = 0.25 hours
 
 BAT_CAPACITY_KWH     = bc.BAT_CAPACITY_KWH
 BAT_MIN_SOC_PCT      = float(os.getenv("BAT_MIN_SOC_PCT", str(bc.BAT_MIN_SOC_PCT)))  # LP floor; env-overridable (replay/tuning), default bc=20.0%
+# Adaptieve SoC-vloer: ratchet omhoog bij een bodem-taper (vmin/vdelta), handmatig
+# terug na top-balancering. Basis wordt bij import vastgelegd; BAT_MIN_SOC_PCT zelf
+# wordt per run in main() herzet naar de DB-vloer.
+SOC_FLOOR_BASE_PCT       = BAT_MIN_SOC_PCT
+SOC_FLOOR_STEP_PCT       = float(os.getenv("SOC_FLOOR_STEP_PCT", "2.0"))
+SOC_FLOOR_CAP_PCT        = float(os.getenv("SOC_FLOOR_CAP_PCT", "30.0"))
+SOC_FLOOR_PROX_PCT       = float(os.getenv("SOC_FLOOR_PROX_PCT", "2.0"))   # taper geldt als bodem-event binnen deze marge van de vloer
+SOC_FLOOR_MIN_INTERVAL_H = float(os.getenv("SOC_FLOOR_MIN_INTERVAL_H", "8"))  # snelheidsbegrenzer: max ~1 stap per 8u
 BAT_WEAR_EUR_KWH     = float(os.getenv("BAT_WEAR_EUR_KWH", str(bc.BAT_WEAR_EUR_KWH)))  # cell wear per kWh discharged; env-overridable (replay/tuning), default bc=0.009375
 BAT_MIN_SOC_DISCHARGE_PCT = bc.BAT_MIN_SOC_DISCHARGE_PCT  # 18.0% — DISCHARGE floor (doc)
 BAT_DAWN_SOC_PCT     = bc.BAT_DAWN_SOC_PCT              # 20.0% — minimum SoC at 06:00
@@ -3491,7 +3499,73 @@ def rolling_replay(
     return results
 
 
+def decide_soc_floor(current_pct, base_pct, taper_socs, hours_since_update):
+    """Pure ratchet-beslissing voor de adaptieve SoC-vloer.
+
+    taper_socs = SoC-waarden van recente vmin/vdelta-taper-events. We verhogen alleen
+    als er een taper bij de BODEM was (binnen SOC_FLOOR_PROX_PCT van de huidige vloer)
+    en de snelheidsbegrenzer het toelaat. Retour: (nieuwe_vloer, actie) met actie in
+    {None, 'raise', 'cap'}. Omlaag gaat NOOIT automatisch (handmatig na calibratie)."""
+    if hours_since_update is not None and hours_since_update < SOC_FLOOR_MIN_INTERVAL_H:
+        return current_pct, None
+    at_floor = [s for s in taper_socs if s is not None and s <= current_pct + SOC_FLOOR_PROX_PCT]
+    if not at_floor:
+        return current_pct, None
+    if current_pct >= SOC_FLOOR_CAP_PCT:
+        return current_pct, 'cap'
+    return min(SOC_FLOOR_CAP_PCT, current_pct + SOC_FLOOR_STEP_PCT), 'raise'
+
+
+def apply_adaptive_floor(conn):
+    """Lees de adaptieve SoC-vloer uit de DB, ratchet 'm bij een bodem-taper, en geef
+    de (evt. verhoogde) vloer % terug. State in battery_soc_floor (1 rij)."""
+    import re as _re
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS battery_soc_floor (
+        id TINYINT PRIMARY KEY, floor_pct FLOAT NOT NULL, base_pct FLOAT NOT NULL,
+        updated_at DATETIME, reason VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+    cur.execute("INSERT IGNORE INTO battery_soc_floor (id,floor_pct,base_pct,updated_at,reason) "
+                "VALUES (1,%s,%s,NOW(),'init')", (SOC_FLOOR_BASE_PCT, SOC_FLOOR_BASE_PCT))
+    conn.commit()
+    cur.execute("SELECT floor_pct, TIMESTAMPDIFF(MINUTE, updated_at, NOW())/60.0 FROM battery_soc_floor WHERE id=1")
+    row = cur.fetchone()
+    floor = float(row[0]); hrs = float(row[1]) if row[1] is not None else None
+    cur.execute("""SELECT message FROM alert_latch
+                   WHERE active=1 AND alert_key IN ('vmin_taper','vdelta_taper')
+                   AND ts >= NOW() - INTERVAL 20 MINUTE""")
+    socs = []
+    for (msg,) in cur.fetchall():
+        m = _re.search(r"soc[=\s]+([0-9.]+)", msg or "", _re.I)
+        if m:
+            socs.append(float(m.group(1)))
+    new, action = decide_soc_floor(floor, SOC_FLOOR_BASE_PCT, socs, hrs)
+    if action == 'raise':
+        reason = f"bodem-taper bij SoC {min(socs):.1f}% -> vloer {floor:.0f}%->{new:.0f}%"
+        cur.execute("UPDATE battery_soc_floor SET floor_pct=%s, updated_at=NOW(), reason=%s WHERE id=1", (new, reason))
+        conn.commit()
+        log.warning("Adaptieve SoC-vloer VERHOOGD: %s (reset handmatig na top-balancering)", reason)
+        try:
+            from common.battery_alert import alert_trigger
+            alert_trigger('soc_floor_raised', reason + " — reset handmatig na top-balancering")
+        except Exception as exc:
+            log.warning("alert_trigger(soc_floor_raised) faalde: %s", exc)
+        return new
+    if action == 'cap':
+        cur.execute("UPDATE battery_soc_floor SET updated_at=NOW(), reason=%s WHERE id=1",
+                    (f"op cap {SOC_FLOOR_CAP_PCT:.0f}% en blijft taperen", ))
+        conn.commit()
+        log.warning("Adaptieve SoC-vloer op CAP %.0f%% terwijl de bodem nog tapert — top-balanceer / check cel #16", SOC_FLOOR_CAP_PCT)
+        try:
+            from common.battery_alert import alert_trigger
+            alert_trigger('soc_floor_cap', f"SoC-vloer op cap {SOC_FLOOR_CAP_PCT:.0f}% en blijft taperen — top-balancering/service nodig")
+        except Exception:
+            pass
+        return floor
+    return floor
+
+
 def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_range: Optional[tuple] = None, snapshot_date: Optional[date] = None):
+    global BAT_MIN_SOC_PCT, BAT_MIN_KWH
     log.info("=== Battery Optimizer LP %s start%s ===", WIP, "  [DRY-RUN]" if dry_run else "")
 
     now           = datetime.now()
@@ -3514,6 +3588,13 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         sys.exit(1)
 
     load_tariffs_from_db(conn)
+
+    # Adaptieve SoC-vloer (alleen live, niet bij replay/snapshot): ratchet omhoog bij
+    # bodem-tapers; herzet de LP-vloer-globals voordat optimise() ze leest.
+    if replay_at is None and snapshot_date is None:
+        BAT_MIN_SOC_PCT = apply_adaptive_floor(conn)
+        BAT_MIN_KWH = BAT_CAPACITY_KWH * BAT_MIN_SOC_PCT / 100.0
+        log.info("SoC-vloer actief: %.1f%% (basis %.1f%%, cap %.1f%%)", BAT_MIN_SOC_PCT, SOC_FLOOR_BASE_PCT, SOC_FLOOR_CAP_PCT)
 
     state   = read_current_state(conn)
     soc_pct = state.get("seplos_soc_pct")
