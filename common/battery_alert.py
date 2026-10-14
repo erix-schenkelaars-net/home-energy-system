@@ -1,7 +1,7 @@
 """
 battery_alert.py — shared alert helper for read_seplos and control_growatt.
 
-Every trigger and clear event gets its own row in battery_alert_latch so the
+Every trigger and clear event gets its own row in alert_latch so the
 full history is preserved. WordPress banner shows all unacknowledged rows.
 
 Usage:
@@ -38,13 +38,13 @@ def _db_write(alert_key: str, active: bool, message: str) -> None:
         cur = db.cursor()
         if active:
             cur.execute("""
-                INSERT INTO battery_alert_latch
+                INSERT INTO alert_latch
                     (ts, alert_key, active, triggered_at, cleared_at, message, acknowledged)
                 VALUES (%s, %s, 1, %s, NULL, %s, 0)
             """, (ts, alert_key, ts, message))
         else:
             cur.execute("""
-                INSERT INTO battery_alert_latch
+                INSERT INTO alert_latch
                     (ts, alert_key, active, triggered_at, cleared_at, message, acknowledged)
                 VALUES (%s, %s, 0, NULL, %s, %s, 0)
             """, (ts, alert_key, ts, message))
@@ -95,7 +95,7 @@ def alert_active(alert_key: str) -> bool:
             connection_timeout=5,
         )
         cur = db.cursor()
-        cur.execute("SELECT active FROM battery_alert_latch "
+        cur.execute("SELECT active FROM alert_latch "
                     "WHERE alert_key=%s ORDER BY id DESC LIMIT 1", (alert_key,))
         row = cur.fetchone()
         cur.close()

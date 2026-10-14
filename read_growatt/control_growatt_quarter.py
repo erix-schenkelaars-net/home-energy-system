@@ -188,6 +188,15 @@ MQTT_PASSWORD      = os.environ.get("MQTT_PASSWORD", "")
 RELAY_TOPIC        = "zigbee2mqtt/PV MHCOZY 4 channel relais/set"  # configurable: Zigbee relay for PV contactors
 PV_CURTAIL_MIN_KWH = 0.05   # threshold below which curtailment is ignored
 
+# --- PV-string-foutalarm (puur op SPANNING, niet vermogen) -------------------
+# Eén string produceert (> PV_FAULT_LIVE_V) terwijl de ander "echt 0 V" geeft
+# (< PV_FAULT_DEAD_V = open circuit, bv. losgeschakelde DC/MC4/zekering) gedurende
+# PV_FAULT_HOLD_S onafgebroken → latch in alert_latch → WordPress-banner.
+# De 1-uurs hold filtert dag/nacht- en dageraad-ruis (dan is één string even laag).
+PV_FAULT_LIVE_V  = 100.0    # boven deze spanning telt een string als "producerend"
+PV_FAULT_DEAD_V  = 5.0      # onder deze spanning telt een string als "dood" (open)
+PV_FAULT_HOLD_S  = 3600     # pas alarmeren na 1 uur aangehouden fout
+
 PVO_COUNTER       = 0
 soc_glob          = 50
 last_soc          = None
@@ -682,6 +691,45 @@ def set_in_standby(sph_client):
     except Exception as e:
         dbg(1, "SPH", f"Standby failed: {e}")
         return False
+
+
+# ---------------------------------------
+# PV STRING-FAULT DETECTION (voltage-only)
+# ---------------------------------------
+
+def pv_dead_string(pv1v, pv2v):
+    """Geef 1 of 2 terug (de DODE string) als precies één string dood is
+    (< PV_FAULT_DEAD_V = ~0 V, open circuit) terwijl de ander duidelijk produceert
+    (> PV_FAULT_LIVE_V); anders 0. None (geen meting) → 0 (geen oordeel).
+
+    Puur op spanning: 's nachts zijn beide ~0 (→0), overdag beide hoog (→0); alleen
+    een echt losgekoppelde string (0 V) naast een producerende (>100 V) geeft 1 of 2."""
+    if pv1v is None or pv2v is None:
+        return 0
+    if pv1v > PV_FAULT_LIVE_V and pv2v < PV_FAULT_DEAD_V:
+        return 2
+    if pv2v > PV_FAULT_LIVE_V and pv1v < PV_FAULT_DEAD_V:
+        return 1
+    return 0
+
+
+def pv_fault_step(pv1v, pv2v, fault_since, latched, now, hold_s=PV_FAULT_HOLD_S):
+    """Pure toestandsmachine voor het PV-string-foutalarm — testbaar los van de I/O-lus.
+
+    In : huidige spanningen, de lopende staat (fault_since/latched) en `now` (datetime).
+    Uit: (new_fault_since, new_latched, action, dead_string)
+         action = 'trigger'  (fout nu > hold_s aangehouden en nog niet gelatcht),
+                  'clear'     (fout weg terwijl 'ie gelatcht was),
+                  None        (geen overgang).
+    De lus hoeft alleen op 'trigger'/'clear' alert_trigger/alert_clear aan te roepen."""
+    dead = pv_dead_string(pv1v, pv2v)
+    if dead == 0:
+        return (None, False, ('clear' if latched else None), 0)
+    if fault_since is None:
+        fault_since = now
+    if not latched and (now - fault_since).total_seconds() >= hold_s:
+        return (fault_since, True, 'trigger', dead)
+    return (fault_since, latched, None, dead)
 
 
 # ---------------------------------------
@@ -1630,6 +1678,8 @@ def main_loop():
     _last_db_created_at = None   # tracks last seen optimizer run timestamp
     _pv_panels_on      = True    # assumed ON at startup; avoids unnecessary switch on first tick
     _pv_soc_curtail    = False   # SoC-based curtailment latch (True = panels OFF due to SoC)
+    _pv_fault_since    = None    # datetime: wanneer één PV-string voor 't eerst dood werd gezien
+    _pv_fault_latched  = False   # True zodra het >1u-foutalarm is afgegeven (één trigger per fout)
 
     # --------------------------------------------------
     # Build ActiveRun
@@ -1873,6 +1923,27 @@ def main_loop():
                 base_low_vmin_lock = False
                 alert_clear('vmin_low_lock',
                             f"VMIN lock opgeheven: {vmin_glob} mV ≥ {VMIN_LOW_RESUME_MV} mV")
+
+        # --------------------------------------------------
+        # PV-string-foutalarm: één string dood (open circuit) terwijl de ander
+        # produceert, > 1 uur aangehouden → alert_latch → WordPress-banner.
+        # Puur op spanning; faalt veilig als regs/metingen ontbreken (dead=0).
+        # --------------------------------------------------
+        _pv1v = regs.get("REG_PV1_VOLTS") if regs else None
+        _pv2v = regs.get("REG_PV2_VOLTS") if regs else None
+        _pv_fault_since, _pv_fault_latched, _pv_action, _pv_dead = pv_fault_step(
+            _pv1v, _pv2v, _pv_fault_since, _pv_fault_latched, now)
+        if _pv_action == 'trigger':
+            _live_v = _pv2v if _pv_dead == 1 else _pv1v
+            _live_s = 1 if _pv_dead == 2 else 2
+            dbg(1, "SPH", f"⚠ PV-string {_pv_dead} DOOD: PV1={_pv1v}V PV2={_pv2v}V (>1u)")
+            alert_trigger('pv_string_fault',
+                          f"⚠ PV-string {_pv_dead} geeft 0 V terwijl string {_live_s} "
+                          f"{_live_v:.0f} V geeft (>1 uur) — check DC-schakelaar/MC4/zekering")
+        elif _pv_action == 'clear':
+            dbg(1, "SPH", f"✓ PV-string-fout hersteld: PV1={_pv1v}V PV2={_pv2v}V")
+            alert_clear('pv_string_fault',
+                        f"PV-strings weer in balans (PV1={_pv1v}V PV2={_pv2v}V)")
 
         # --------------------------------------------------
         # Build pipeline

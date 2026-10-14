@@ -10,7 +10,7 @@ Reads the Seplos 16 kWh LiFePO4 battery management system via Modbus RTU every ~
 
 2. **Enforces dynamic current limits** on the inverter by writing to Seplos PCS registers — protecting individual cells from over-voltage, under-voltage, temperature extremes, and voltage imbalance. This is a second layer of protection independent of the battery_optimizer's schedule.
 
-3. **Fires battery alerts** via `common/battery_alert.py` when taper conditions persist (debounced), pushing to MariaDB (`battery_alert_latch`) and MQTT so Home Assistant can send a phone notification and WordPress can show a red banner.
+3. **Fires battery alerts** via `common/battery_alert.py` when taper conditions persist (debounced), pushing to MariaDB (`alert_latch`) and MQTT so Home Assistant can send a phone notification and WordPress can show a red banner.
 
 ## Hardware connection
 
@@ -78,7 +78,7 @@ When a debounced taper condition starts or stops, `read_seplos` calls `common/ba
 | `vdelta_taper` | vdelta ≥ 25 mV for 5 consecutive readings |
 | `vmin_taper` | vmin ≤ 3150 mV for 5 consecutive readings |
 
-Each alert writes to `battery_alert_latch` in MariaDB (separate `trigger_message` and stop `message` columns — the trigger text is never overwritten) and publishes to MQTT topic `battery/alert` (retain=True) so Home Assistant fires a TTS phone notification.
+Each alert writes to `alert_latch` in MariaDB (separate `trigger_message` and stop `message` columns — the trigger text is never overwritten) and publishes to MQTT topic `battery/alert` (retain=True) so Home Assistant fires a TTS phone notification.
 
 Thresholds are defined in `common/battery_constants.py` and shared with `control_growatt`.
 

@@ -34,9 +34,9 @@ mysql -h 127.0.0.1 -u root -p your_db_name < schema.sql
 | `pv_solcast_forecast` | battery_optimizer | Per-quarter Solcast PV forecast (latest snapshot, when available) |
 | `pv_knmi_nowcast` | read_knmi | Per-quarter KNMI satellite radiation nowcast, every run kept — analysis-only |
 | `predicted_grid_snapshot` | battery_optimizer | The day's plan frozen at its start — grid kWh + euros for the predicted line |
-| `battery_alert_latch` | common/battery_alert.py | One row per alert key — active/cleared state + acknowledgement |
+| `alert_latch` | common/battery_alert.py | One row per alert key — active/cleared state + acknowledgement |
 
-### `battery_alert_latch` table
+### `alert_latch` table
 
 | Column | Description |
 |--------|-------------|

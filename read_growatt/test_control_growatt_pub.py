@@ -1120,5 +1120,86 @@ class TestDischargePowerFromPlan(unittest.TestCase):
         self.assertEqual(self._power(bat_kwh=-1.0), -100)       # 4 kW clamps to 100%
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# O.  PV string-fault detection (voltage-only) — pv_dead_string + pv_fault_step
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPvDeadString(unittest.TestCase):
+    def test_both_zero_night_no_fault(self):
+        self.assertEqual(ctrl.pv_dead_string(0, 0), 0)
+
+    def test_both_producing_no_fault(self):
+        self.assertEqual(ctrl.pv_dead_string(267, 285), 0)
+
+    def test_string2_dead(self):
+        self.assertEqual(ctrl.pv_dead_string(267, 0), 2)
+
+    def test_string1_dead(self):
+        self.assertEqual(ctrl.pv_dead_string(0, 285), 1)
+
+    def test_dead_threshold_just_below(self):
+        self.assertEqual(ctrl.pv_dead_string(267, 3), 2)   # 3 V < DEAD(5) + ander produceert
+
+    def test_low_but_not_dead_is_no_fault(self):
+        self.assertEqual(ctrl.pv_dead_string(267, 50), 0)  # 50 V = laag/schaduw, niet "echt 0"
+
+    def test_live_must_exceed_threshold(self):
+        self.assertEqual(ctrl.pv_dead_string(80, 0), 0)    # producerende string moet > 100 V
+
+    def test_none_reading_no_fault(self):
+        self.assertEqual(ctrl.pv_dead_string(None, 285), 0)
+        self.assertEqual(ctrl.pv_dead_string(267, None), 0)
+
+
+class TestPvFaultStep(unittest.TestCase):
+    def setUp(self):
+        self.t0 = datetime(2026, 10, 13, 10, 0, 0)
+
+    def test_fault_before_hold_no_trigger(self):
+        since, latched, action, dead = ctrl.pv_fault_step(267, 0, None, False, self.t0)
+        self.assertEqual(since, self.t0)
+        self.assertFalse(latched)
+        self.assertIsNone(action)
+        self.assertEqual(dead, 2)
+
+    def test_fault_still_before_hold(self):
+        t = self.t0 + timedelta(minutes=59)
+        _, latched, action, _ = ctrl.pv_fault_step(267, 0, self.t0, False, t)
+        self.assertIsNone(action)
+        self.assertFalse(latched)
+
+    def test_fault_after_hold_triggers(self):
+        t = self.t0 + timedelta(hours=1, seconds=1)
+        _, latched, action, dead = ctrl.pv_fault_step(267, 0, self.t0, False, t)
+        self.assertEqual(action, 'trigger')
+        self.assertTrue(latched)
+        self.assertEqual(dead, 2)
+
+    def test_no_repeat_trigger_when_latched(self):
+        t = self.t0 + timedelta(hours=2)
+        _, latched, action, _ = ctrl.pv_fault_step(267, 0, self.t0, True, t)
+        self.assertIsNone(action)
+        self.assertTrue(latched)
+
+    def test_clear_when_fault_gone_and_latched(self):
+        since, latched, action, _ = ctrl.pv_fault_step(267, 285, self.t0, True, self.t0)
+        self.assertEqual(action, 'clear')
+        self.assertFalse(latched)
+        self.assertIsNone(since)
+
+    def test_no_clear_when_not_latched(self):
+        since, latched, action, _ = ctrl.pv_fault_step(0, 0, None, False, self.t0)
+        self.assertIsNone(action)
+        self.assertFalse(latched)
+        self.assertIsNone(since)
+
+    def test_timer_resets_after_recovery(self):
+        since, latched, action, _ = ctrl.pv_fault_step(267, 285, self.t0, False, self.t0)
+        self.assertIsNone(since)                       # fout weg -> timer gewist
+        t2 = self.t0 + timedelta(hours=3)
+        since2, _, action2, _ = ctrl.pv_fault_step(267, 0, since, latched, t2)
+        self.assertEqual(since2, t2)                   # timer herstart vanaf t2, niet t0
+        self.assertIsNone(action2)                     # dus nog geen trigger
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
