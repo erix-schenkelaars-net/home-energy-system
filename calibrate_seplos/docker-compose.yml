@@ -5,7 +5,9 @@ services:
     # profiles => start NIET mee met `docker compose up` / rebuild-all.
     # Handmatig draaien:
     #   read-only DB-monitor (stap a):  docker compose run --rm calibrate_seplos
-    #   directe bus-uitlezing (stap b):  CAL_MODE=bus docker compose run --rm calibrate_seplos
+    #   directe bus-uitlezing (stap b):  docker compose run --rm -e CAL_MODE=bus calibrate_seplos
+    #   (NB: `CAL_MODE=bus docker compose run ...` werkt NIET — een shell-prefix bereikt de
+    #    container niet; CAL_MODE staat niet in `environment:`, dus geef hem mee met `-e`.)
     #   (stap b VEREIST dat read_seplos gestopt is: enige RS485-bus-gebruiker.)
     profiles: ["calibrate"]
     network_mode: "host"

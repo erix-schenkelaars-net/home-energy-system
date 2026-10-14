@@ -11,7 +11,7 @@
 # Cron (root): 0 7 * * * /home/pi/docker/cleanup_logs.sh >> /home/pi/docker/logs/debug_cleanup_$(date +\%F).log 2>&1
 
 DOCKER_ROOT=/home/pi/docker
-MAX_DAYS=5
+MAX_DAYS=7
 CUTOFF=$(date -d "${MAX_DAYS} days ago" +%Y-%m-%d)   # bestanden gedateerd VÓÓR deze dag gaan weg
 TOTAL=0
 KEPT=0
