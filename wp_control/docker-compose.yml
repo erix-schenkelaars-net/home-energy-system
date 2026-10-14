@@ -1,0 +1,20 @@
+services:
+  wp_control:
+    build: .
+    container_name: wp_controller
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: host
+    env_file:
+      - ../.env
+    environment:
+      # Veilige default: nooit publiceren tot dit bewust op 0 gaat. Overschrijft ../.env.
+      WP_DRY_RUN: "1"          # roomSetpoint-sturing: DROOG (nog niet vrijgegeven)
+      # Buitentemp LIVE (2026-09-10): geverifieerd dat niets anders naar outsideTemp/set publiceert
+      # (niet in automations.yaml/configuration.yaml; OTThing stond op OT-slave, nu op MQTT gezet),
+      # dus wp_control is de enige bron. roomSetpoint blijft droog via WP_DRY_RUN.
+      WP_OUTSIDE_DRY_RUN: "0"
+    volumes:
+      - .:/app
+      - ../common:/app/common:ro
+      - ./logs:/logs

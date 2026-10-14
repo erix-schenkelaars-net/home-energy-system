@@ -1,0 +1,33 @@
+# Secrets
+.env
+*.env*
+
+# Editor artefacts
+*.swp
+*.swo
+*.sw?
+.vscode/
+
+# Runtime logs
+logs/
+*.log
+
+# Development history (not for public repos)
+old_stuff/
+old-stuf/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test artefacts
+.pytest_cache/
+.coverage
+test-logs/
+
+# OS
+.DS_Store
+Thumbs.db
