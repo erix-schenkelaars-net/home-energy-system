@@ -891,6 +891,8 @@ def main():
             vmin_idx  = cell_v.index(vmin) + 1   # 1-based cell number
             vmax_idx  = cell_v.index(vmax) + 1
             tmin, tmax = min(cell_t), max(cell_t)
+            tmin_idx  = cell_t.index(tmin) + 1   # 1-based temp-sensor number (4 sensors, not per-cell)
+            tmax_idx  = cell_t.index(tmax) + 1
             vdelta = vmax - vmin
 
             # ------------------------------------------
@@ -1056,8 +1058,8 @@ def main():
             dbg(2, DEBUG_MAIN, "MAIN", f"Current          :    {pack_current:6.2f} A")
             dbg(2, DEBUG_MAIN, "MAIN", f"Mode             :    {mode_str} (0x{mode_raw:02X})")
             dbg(2, DEBUG_MAIN, "MAIN", f"Power            :    {power:7.1f} W ({direction})")
-            dbg(2, DEBUG_MAIN, "MAIN", f"Cell ΔV          :    {(vmax-vmin):6.1f} mV")
-            dbg(2, DEBUG_MAIN, "MAIN", f"Cell Temp        :    {tmin:5.1f} – {tmax:5.1f} °C")
+            dbg(2, DEBUG_MAIN, "MAIN", f"Cell V           :    min {vmin:4.0f} mV (cel {vmin_idx:2d}) – max {vmax:4.0f} mV (cel {vmax_idx:2d})   Δ {(vmax-vmin):5.1f} mV")
+            dbg(2, DEBUG_MAIN, "MAIN", f"Cell Temp        :    min {tmin:5.1f} °C (sensor {tmin_idx}) – max {tmax:5.1f} °C (sensor {tmax_idx})")
             dbg(2, DEBUG_MAIN, "MAIN", f"Environm Temp    :    {env_t:5.1f} °C")
             dbg(2, DEBUG_MAIN, "MAIN", f"Power PCB Temp   :    {pow_t:5.1f} °C")
             dbg(2, DEBUG_MAIN, "MAIN", f"energy_char_kwh  :    {energy_charged_kwh:5.3f} kWh")
