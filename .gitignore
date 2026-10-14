@@ -37,3 +37,5 @@ energy-agent/
 
 # Docker mountpoint placeholder (leeg): read_growatt/sph5k.conf wordt hier overheen gemount
 battery_optimizer/sph5k.conf
+tools/*.csv
+tools/*.png
