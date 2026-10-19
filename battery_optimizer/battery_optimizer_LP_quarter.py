@@ -302,11 +302,21 @@ HA_EV_PLUG_POWER_ENTITY = "sensor.antela_smart_plug_power"
 # ---------------------------------------------------------------------------
 
 HP_UA_W_PER_K   = 248.0  # building heat loss coefficient W/K (from 2019–2024 gas data)
-HP_T_SETPOINT_C = 20.0
+# Scheduled room setpoint by hour, mirroring the thermostat / wp_control WP_SCHEDULE: night 19.0,
+# 05:00->20.0, 06:00->20.5, 07:00->21.0, 19:00->19.0. The HP heating-load model uses the setpoint
+# actually held at each hour instead of a flat value, so the UA*dT term is right across the morning
+# ramp (smaller steps, earlier start) and the 21 C day. Night hours are gated out by HP_ACTIVE_HOURS,
+# so only the active-window values (05-18) matter here. Keep in sync with wp_control WP_SCHEDULE.
+HP_SETPOINT_DAY_C = 21.0
+HP_SETPOINT_RAMP  = {5: 20.0, 6: 20.5}   # before 07:00; 07:00-18:59 use HP_SETPOINT_DAY_C
 HP_COP_A        = 3.2
 HP_COP_B        = 0.04
 HP_COP_MIN      = 2.0
-HP_ACTIVE_HOURS = set(range(7, 19))  # 07:00–18:59: thermostat active, HP may run
+HP_ACTIVE_HOURS = set(range(5, 19))  # 05:00–18:59: thermostat active, HP may run. Was 07-18, but
+                                     # the schedule now ramps from 05:00 (20.0/20.5/21.0) and optimum
+                                     # start pulls it earlier still -- measured WP power peaks at 06:00
+                                     # (~880 W avg), so 07-18 missed the whole morning. Night (19-05,
+                                     # 19.0 setback) stays off, so the window ends, not widens to 24 h.
 
 # ---------------------------------------------------------------------------
 # DEBUG LEVELS
@@ -2158,10 +2168,11 @@ def compute_cooling_factors(conn, load_prof, now, radiation):
 def predict_hp_correction_kwh(forecast_temp_c: float, ref_temp_c: float, hour: int) -> float:
     if hour not in HP_ACTIVE_HOURS:
         return 0.0
+    setpoint = HP_SETPOINT_RAMP.get(hour, HP_SETPOINT_DAY_C)   # scheduled setpoint at this hour
     def _cop(t: float) -> float:
         return max(HP_COP_MIN, HP_COP_A + HP_COP_B * t)
     def _hp_kwh(t: float) -> float:
-        thermal_kw = HP_UA_W_PER_K * max(0.0, HP_T_SETPOINT_C - t) / 1000.0
+        thermal_kw = HP_UA_W_PER_K * max(0.0, setpoint - t) / 1000.0
         return thermal_kw / _cop(t)
     return _hp_kwh(forecast_temp_c) - _hp_kwh(ref_temp_c)
 

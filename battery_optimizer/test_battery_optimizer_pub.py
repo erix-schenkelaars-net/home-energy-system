@@ -953,6 +953,29 @@ class TestSeasonalGate(unittest.TestCase):
         self.assertEqual(sum(s.cooling_correction_kwh for s in cold_cooled), 0.0)
 
 
+class TestHpSetpointSchedule(unittest.TestCase):
+    """The HP heating-load model uses the setpoint actually scheduled at each hour (night 19 gated
+    out, 05:00 ramp 20.0/20.5, 21.0 by 07:00), not a flat value -- so the UA*dT term is right across
+    the morning ramp and the day."""
+
+    def test_night_hours_are_gated_out(self):
+        self.assertEqual(mod.predict_hp_correction_kwh(5.0, 10.0, 3), 0.0)   # 03:00, outside 05-18
+        self.assertEqual(mod.predict_hp_correction_kwh(5.0, 10.0, 20), 0.0)  # 20:00, setback
+
+    def test_early_morning_is_now_in_the_window(self):
+        """05:00 and 06:00 used to be missed (window was 07-18) -- the WP's morning peak."""
+        self.assertNotEqual(mod.predict_hp_correction_kwh(2.0, 10.0, 5), 0.0)
+        self.assertNotEqual(mod.predict_hp_correction_kwh(2.0, 10.0, 6), 0.0)
+
+    def test_day_setpoint_exceeds_the_morning_ramp(self):
+        """Same temps, higher scheduled setpoint -> larger heating correction. Day (21) > 06:00
+        (20.5) > 05:00 (20.0)."""
+        c5 = mod.predict_hp_correction_kwh(5.0, 10.0, 5)    # setpoint 20.0
+        c6 = mod.predict_hp_correction_kwh(5.0, 10.0, 6)    # setpoint 20.5
+        c_day = mod.predict_hp_correction_kwh(5.0, 10.0, 10)  # setpoint 21.0
+        self.assertTrue(c_day > c6 > c5 > 0.0)
+
+
 class TestCoolingFactor(unittest.TestCase):
     """The clamp is the safety rail around the raw temp-aware/temp-blind ratio."""
 
