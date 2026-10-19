@@ -285,5 +285,48 @@ class TestOnMessage(unittest.TestCase):
         mod.on_message(MagicMock(), userdata, msg)   # must not raise
 
 
+class TestMasterUnwrap(unittest.TestCase):
+    """Firmware wrapt master-velden als {"result","data"} (otvalues.cpp OTValue::getJson).
+    _md pakt data uit als result waar is, en honoreert de scalar-vorm (oude firmware)."""
+
+    def test_md_unwraps_valid(self):
+        self.assertEqual(mod._md({"result": True, "data": 21.0}), 21.0)
+
+    def test_md_invalid_result_is_none(self):
+        self.assertIsNone(mod._md({"result": False, "data": 21.0}))  # niet ge-ACK't -> niet vertrouwen
+
+    def test_md_scalar_passthrough(self):
+        self.assertEqual(mod._md(20.5), 20.5)                        # oude firmware zonder wrapper
+
+    def test_md_data_without_result_defaults_trusted(self):
+        self.assertEqual(mod._md({"data": 19.0}), 19.0)
+
+    def test_parse_wrapped_master_fills_thermo_columns(self):
+        payload = {
+            "slave":  {"flow_t": 31.6, "status": {"flame": False}},
+            "master": {
+                "ch_set_t":    {"result": True, "data": 65},
+                "room_t":      {"result": True, "data": 21.1},
+                "room_set_t":  {"result": True, "data": 21.0},
+                "max_rel_mod": {"result": True, "data": 0},
+                "status":      {"result": True, "data": {"ch_enable": True, "otc_active": False}},
+                "smartPower":  "low",
+            },
+            "heatercircuit": [{"roomsetpoint": 21.0, "action": "idle"}],
+        }
+        d = mod.parse_payload(payload)
+        self.assertEqual(d["honeywell_ot_thermo_room_set_t_c"], 21.0)   # DE knop
+        self.assertEqual(d["honeywell_ot_thermo_room_t_c"], 21.1)
+        self.assertEqual(d["honeywell_ot_thermo_ch_set_t_c"], 65.0)
+        self.assertTrue(d["honeywell_ot_thermo_ch_enable"])
+        self.assertEqual(d["honeywell_ot_thermo_smart_power"], "low")
+        self.assertEqual(d["honeywell_ot_boiler_flow_t_c"], 31.6)       # slave (ongewrapt) intact
+
+    def test_parse_invalid_master_read_is_none(self):
+        payload = {"master": {"room_set_t": {"result": False, "data": 99.0}}}
+        d = mod.parse_payload(payload)
+        self.assertIsNone(d["honeywell_ot_thermo_room_set_t_c"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

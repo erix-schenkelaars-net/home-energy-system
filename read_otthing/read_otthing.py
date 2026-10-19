@@ -122,6 +122,20 @@ def on_message(client, userdata, msg):
 # ---------------------------
 # PARSE PAYLOAD → DB DICT
 # ---------------------------
+def _md(v):
+    """Uitpakken van een OTThing MASTER-veld.
+
+    De OT-Thing-firmware (otvalues.cpp `OTValue::getJson`) wrapt elke OpenTherm-waarde als
+    {"result": <bool>, "data": <X>}, waar `result` = of het laatste OT-bericht ge-ACK't is
+    (READ_ACK/WRITE_ACK) → of de waarde geldig is. We geven `data` daarom ALLEEN terug als `result`
+    waar is; bij een niet-ge-ACK'te read → None (i.p.v. een stale/ongeldige waarde doorschrijven).
+    Een kale scalar (oudere firmware zonder wrapper) gaat ongewijzigd door. Dit herstelt de
+    honeywell_ot_thermo_*-kolommen: de wrapper brak de oude scalar-parser → ze stonden op NULL."""
+    if isinstance(v, dict) and "data" in v:
+        return v["data"] if v.get("result", True) else None
+    return v
+
+
 def parse_payload(p):
     slave  = p.get("slave")  or {}
     master = p.get("master") or {}
@@ -129,7 +143,7 @@ def parse_payload(p):
     ff     = slave.get("fault_flags") or {}
     fs     = slave.get("flameStats")  or {}
     ss     = slave.get("status")      or {}
-    ms     = master.get("status")     or {}
+    ms     = _md(master.get("status")) or {}
 
     return {
         # --- boiler (slave) ---
@@ -151,14 +165,14 @@ def parse_payload(p):
         "honeywell_ot_boiler_air_pressure_fault":  boolean(ff.get("air_pressure_fault")),
         "honeywell_ot_boiler_water_over_temp":     boolean(ff.get("water_over_temp")),
 
-        # --- thermostat (master) ---
-        "honeywell_ot_thermo_ch_set_t_c":          flt(master.get("ch_set_t")),
-        "honeywell_ot_thermo_room_t_c":            flt(master.get("room_t")),
-        "honeywell_ot_thermo_room_set_t_c":        flt(master.get("room_set_t")),
-        "honeywell_ot_thermo_max_rel_mod_perc":    flt(master.get("max_rel_mod")),
+        # --- thermostat (master) --- master-velden zijn {"result","data"}-gewrapt, zie _md() ---
+        "honeywell_ot_thermo_ch_set_t_c":          flt(_md(master.get("ch_set_t"))),
+        "honeywell_ot_thermo_room_t_c":            flt(_md(master.get("room_t"))),
+        "honeywell_ot_thermo_room_set_t_c":        flt(_md(master.get("room_set_t"))),
+        "honeywell_ot_thermo_max_rel_mod_perc":    flt(_md(master.get("max_rel_mod"))),
         "honeywell_ot_thermo_ch_enable":           boolean(ms.get("ch_enable")),
         "honeywell_ot_thermo_otc_active":          boolean(ms.get("otc_active")),
-        "honeywell_ot_thermo_smart_power":         master.get("smartPower"),
+        "honeywell_ot_thermo_smart_power":         _md(master.get("smartPower")),
 
         # --- heater circuit 0 ---
         "honeywell_ot_heater0_action":             hc0.get("action"),
