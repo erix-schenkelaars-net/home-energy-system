@@ -92,6 +92,20 @@ CELL_STEP_MAX_MV       = 25    # mV - largest believable move for one cell betwe
 CELL_STEP_CURRENT_TOL_A = 5.0  # A  - above this change in pack current, the move may well be real
 MAX_CELL_REJECTS       = 5     # polls - after this many in a row, accept anyway and let it be seen
 
+# Sum-consistency guard. The rate limit above has a hole: it waves a frame through whenever the
+# current changed more than CELL_STEP_CURRENT_TOL_A, on the reasoning that a load step explains a
+# big cell move. On 2026-10-19 08:50 a poll came back with one cell at 3091 mV (127 mV low) while
+# the current register read 0 A -- a ~60 A "change" from the -60 A discharge the moment before --
+# so the exemption let it through, and GREATEST()/LEAST() pinned the five-minute bucket to a 140 mV
+# vdelta the pack never had. The high-res log (every cell at delta 15 mV right through that minute)
+# and the independent SPH terminal (steady 51.6 V) both denied it. The fix uses what the BURST
+# diagnostic below already knew: the 16 cells (PIB) must add up to the terminal voltage (PIA) from
+# the same poll. A real sag drops the cell sum AND the terminal together, so the gap stays ~0; a
+# corrupt cell read the terminal does not corroborate opens a gap of 100+ mV. Real frames sit within
+# ~5 mV (measured over days), so this only ever rejects sense artefacts -- and, being independent of
+# current, it closes the load-step hole. A genuine fault, which keeps the gap ~0, is never touched.
+PACK_SUM_TOL_MV        = 60    # mV - max gap between the 16-cell sum and the terminal, same poll
+
 VDELTA_TAPER_START_MV = 25     # mV - begin reducing discharge when cells diverge
 VDELTA_TAPER_END_MV   = 35     # mV - discharge = 0A (well below EVE MB31 BMS intervention ~100 mV)
 
@@ -288,26 +302,39 @@ def linear_taper(value, start, end, limit_high, limit_low):
     return limit_high - ratio * (limit_high - limit_low)
 
 
-def check_cell_frame(cell_v, prev_cell_v, current_a, prev_current_a, reject_count):
-    """Whether a 16-cell voltage frame is believable, given the one before it.
+def check_cell_frame(cell_v, prev_cell_v, current_a, prev_current_a, reject_count,
+                     pack_voltage=None):
+    """Whether a 16-cell voltage frame is believable, given the one before it and the terminal.
 
     Returns (accept, reason). `reason` is None when the frame is accepted; otherwise it is a
     short string naming the worst offender, for the log.
 
-    Rejects a frame in which any cell moved more than CELL_STEP_MAX_MV since the previous
-    accepted frame while the pack current barely changed. Cells only move that fast because
-    current moved -- so if it did (more than CELL_STEP_CURRENT_TOL_A), the frame is let through
-    even if it looks dramatic.
+    Two independent tests:
+      * Sum-consistency (needs `pack_voltage`): the cells must add up to the terminal voltage from
+        the same poll, within PACK_SUM_TOL_MV. A corrupt cell read the terminal does not corroborate
+        is a sense artefact; a real sag drops both together (gap ~0). Runs regardless of current, so
+        it catches glitches the load-step exemption below would otherwise wave through.
+      * Rate limit: rejects a frame in which any cell moved more than CELL_STEP_MAX_MV since the
+        previous accepted frame while the pack current barely changed. Cells only move that fast
+        because current moved -- so if it did (more than CELL_STEP_CURRENT_TOL_A), that test is
+        skipped even if the move looks dramatic.
 
     After MAX_CELL_REJECTS consecutive rejections the frame is accepted regardless: a fault that
     persists is real and must reach the database, alarms and taper. This only ever costs a few
     seconds of delay on something genuine, and it stops one corrupt poll from pinning the
     five-minute minimum.
     """
-    if prev_cell_v is None or len(cell_v) != len(prev_cell_v):
-        return True, None                      # nothing to compare against yet
     if reject_count >= MAX_CELL_REJECTS:
         return True, "budget exhausted"        # persistent -> treat as real
+
+    if pack_voltage is not None:
+        gap_mv = abs(pack_voltage * 1000.0 - sum(cell_v))
+        if gap_mv > PACK_SUM_TOL_MV:
+            return False, (f"cells sum {sum(cell_v)} mV vs terminal {pack_voltage * 1000:.0f} mV, "
+                           f"gap {gap_mv:.0f} mV at {current_a:.1f} A")
+
+    if prev_cell_v is None or len(cell_v) != len(prev_cell_v):
+        return True, None                      # nothing to compare against yet
 
     if abs(current_a - prev_current_a) > CELL_STEP_CURRENT_TOL_A:
         return True, None                      # a load step explains a big move
@@ -871,7 +898,7 @@ def main():
             # debounce and above all update_db(), whose LEAST() would otherwise pin this bucket's
             # minimum to a value the pack never had. See check_cell_frame().
             accept, why = check_cell_frame(cell_v, prev_cell_v, pack_current,
-                                           prev_current_a, cell_rejects)
+                                           prev_current_a, cell_rejects, pack_voltage)
             if not accept:
                 cell_rejects += 1
                 # Log the whole frame, not just the verdict: RESOL-style, the only way to work out

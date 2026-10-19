@@ -414,6 +414,40 @@ class TestCheckCellFrame(unittest.TestCase):
         like and must not throw on a length it did not expect."""
         self.assertTrue(mod.check_cell_frame([3278] * 16, [3278] * 8, -4.0, -4.0, 0)[0])
 
+    # --- sum-consistency guard (PIB cells vs PIA terminal, same poll) -------------------------
+
+    def test_sum_matching_terminal_is_accepted(self):
+        """When the cells add up to the terminal, the frame passes the sum test."""
+        term = sum(self.FLAT) / 1000.0          # 52.448 V
+        self.assertTrue(mod.check_cell_frame(self.FLAT, self.FLAT, -4.0, -4.0, 0, term)[0])
+
+    def test_the_real_19_oct_crash_is_rejected_despite_current_change(self):
+        """08:50:00 2026-10-19: one cell read 3091 mV (127 mV low) while the current register read
+        0 A, a ~60 A 'change' from the discharge the moment before. The load-step exemption waved it
+        through and pinned the bucket to a 140 mV vdelta; the terminal (52.45 V, consistent with the
+        real 3278 mV cell) never corroborated it. The sum test must reject it regardless of current."""
+        now = [3278] * 15 + [3091]
+        term = sum(self.FLAT) / 1000.0          # terminal as if the cell were still 3278
+        ok, why = mod.check_cell_frame(now, self.FLAT, 0.0, -60.0, 0, term)
+        self.assertFalse(ok, "a cell the terminal does not corroborate must not reach the database")
+        self.assertIn("gap", why)
+
+    def test_a_real_sag_the_terminal_confirms_is_accepted(self):
+        """Every cell sags together under load and the terminal drops with them -- gap ~0. A real
+        event must never be hidden, even though the cells moved far and the current stepped."""
+        now = [3100] * 16
+        term = sum(now) / 1000.0                # 49.6 V, terminal fell too
+        self.assertTrue(mod.check_cell_frame(now, self.FLAT, -60.0, 0.0, 0, term)[0])
+
+    def test_budget_exhausted_overrides_the_sum_test(self):
+        """A persistent sum mismatch (the sense genuinely broken) is accepted after the budget, so
+        it reaches the record instead of being filtered forever."""
+        now = [3278] * 15 + [3091]
+        term = sum(self.FLAT) / 1000.0
+        ok, why = mod.check_cell_frame(now, self.FLAT, 0.0, -60.0, mod.MAX_CELL_REJECTS, term)
+        self.assertTrue(ok)
+        self.assertEqual(why, "budget exhausted")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
