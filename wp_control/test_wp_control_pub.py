@@ -8,7 +8,7 @@ read_forecast_outside). Geen namaak-logica in de test — dat zou voor eeuwig sl
 import os
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 # ── stub zware/apparaat-imports vóór de module ─────────────────────────────────────────
@@ -17,6 +17,7 @@ sys.modules["mysql.connector"] = MagicMock()
 sys.modules["paho"] = MagicMock()
 sys.modules["paho.mqtt"] = MagicMock()
 sys.modules["paho.mqtt.publish"] = MagicMock()
+sys.modules["paho.mqtt.client"] = MagicMock()
 
 # ── neutrale env (nooit echte hosts/keys — deze repo is publiek) ───────────────────────
 os.environ.update({
@@ -31,53 +32,53 @@ import wp_control as wp  # noqa: E402
 
 
 def cfg(**over):
-    c = dict(day_sp=22.0, night_sp=21.0, day_start_min=360, night_start_min=1380,
-             preheat_lead_min=60, preheat_max_min=180, preheat_ref_out=8.0,
-             preheat_min_per_deg=6, comfort_floor=19.5)
+    c = dict(schedule=wp.parse_schedule("05:00=20.0,06:00=20.5,07:00=21.0,19:00=19.0"),
+             ovr_threshold=21.5, ovr_max=23.0, ovr_hold_s=3600)
     c.update(over)
     return c
 
 
+class TestParseSchedule(unittest.TestCase):
+    def test_parses_and_sorts(self):
+        self.assertEqual(wp.parse_schedule("07:00=21,05:00=20.0,19:00=19"),
+                         [(300, 20.0), (420, 21.0), (1140, 19.0)])
+
+    def test_skips_garbage_entries(self):
+        self.assertEqual(wp.parse_schedule("05:00=20, rommel, 06:00=x, 19:00=19"),
+                         [(300, 20.0), (1140, 19.0)])
+
+    def test_empty_is_empty_list(self):
+        self.assertEqual(wp.parse_schedule(""), [])
+        self.assertEqual(wp.parse_schedule(None), [])
+
+
 class TestDecideSetpoint(unittest.TestCase):
-    def test_day_window(self):
-        sp, r = wp.decide_setpoint(datetime(2026, 1, 5, 12, 0), 5.0, 21.0, cfg())
-        self.assertEqual(sp, 22.0); self.assertEqual(r, "dag")
+    """Schema 05:00=20.0 / 06:00=20.5 / 07:00=21.0 / 19:00=19.0 — volledige 24u-dekking."""
+    def _sp(self, h, m=0):
+        return wp.decide_setpoint(datetime(2026, 1, 5, h, m), cfg())[0]
 
-    def test_night_setback(self):
-        sp, r = wp.decide_setpoint(datetime(2026, 1, 5, 2, 0), 5.0, 21.0, cfg())
-        self.assertEqual(sp, 21.0); self.assertIn("nacht", r)
+    def test_full_24h_matches_schedule(self):
+        expect = {0: 19.0, 1: 19.0, 2: 19.0, 3: 19.0, 4: 19.0, 5: 20.0, 6: 20.5, 7: 21.0,
+                  8: 21.0, 9: 21.0, 10: 21.0, 11: 21.0, 12: 21.0, 13: 21.0, 14: 21.0, 15: 21.0,
+                  16: 21.0, 17: 21.0, 18: 21.0, 19: 19.0, 20: 19.0, 21: 19.0, 22: 19.0, 23: 19.0}
+        for h, t in expect.items():
+            self.assertEqual(self._sp(h), t, f"uur {h:02d}:00 verwacht {t}")
 
-    def test_preheat_uses_day_setpoint_before_daystart(self):
-        # 05:15, basis-aanloop 60m -> voorverwarmen actief vanaf 05:00
-        sp, r = wp.decide_setpoint(datetime(2026, 1, 5, 5, 15), 8.0, 20.0, cfg())
-        self.assertEqual(sp, 22.0); self.assertIn("voorverwarmen", r)
+    def test_boundaries_inclusive(self):
+        self.assertEqual(self._sp(5, 0), 20.0)      # exact 05:00 -> nieuw blok
+        self.assertEqual(self._sp(4, 59), 19.0)     # net ervoor -> nacht (wrap naar 19:00)
+        self.assertEqual(self._sp(19, 0), 19.0)     # exact 19:00 -> nacht
+        self.assertEqual(self._sp(18, 59), 21.0)    # net ervoor -> dag
+        self.assertEqual(self._sp(5, 59), 20.0)     # binnen het 05:00-blok
+        self.assertEqual(self._sp(6, 59), 20.5)     # binnen het 06:00-blok
 
-    def test_cold_morning_preheats_earlier_than_mild(self):
-        # 04:00: bij vorst is de aanloop lang genoeg om al voor te verwarmen; mild niet.
-        sp_cold, _ = wp.decide_setpoint(datetime(2026, 1, 5, 4, 0), -5.0, 19.0, cfg())
-        sp_mild, r_mild = wp.decide_setpoint(datetime(2026, 1, 5, 4, 0), 8.0, 19.0, cfg())
-        self.assertEqual(sp_cold, 22.0)          # koud -> al aan het voorverwarmen
-        self.assertEqual(sp_mild, 21.0)          # mild -> nog setback
-        self.assertIn("nacht", r_mild)
+    def test_reason_names_block(self):
+        _, r = wp.decide_setpoint(datetime(2026, 1, 5, 6, 30), cfg())
+        self.assertIn("06:00", r); self.assertIn("20.5", r)
 
-    def test_comfort_floor_clamps(self):
-        sp, _ = wp.decide_setpoint(datetime(2026, 1, 5, 2, 0), 5.0, 18.0,
-                                   cfg(night_sp=18.0, comfort_floor=19.5))
-        self.assertEqual(sp, 19.5)
-
-
-class TestPreheatLead(unittest.TestCase):
-    def test_mild_is_base_lead(self):
-        self.assertEqual(wp.preheat_lead(10.0, cfg()), 60)
-
-    def test_colder_is_longer(self):
-        self.assertGreater(wp.preheat_lead(-2.0, cfg()), wp.preheat_lead(8.0, cfg()))
-
-    def test_capped_at_max(self):
-        self.assertEqual(wp.preheat_lead(-40.0, cfg()), 180)  # cap
-
-    def test_unknown_outside_is_base(self):
-        self.assertEqual(wp.preheat_lead(None, cfg()), 60)
+    def test_empty_schedule_safe_fallback(self):
+        sp, r = wp.decide_setpoint(datetime(2026, 1, 5, 12, 0), cfg(schedule=[]))
+        self.assertEqual(sp, 20.0); self.assertIn("leeg", r)
 
 
 class TestConfigAndPublish(unittest.TestCase):
@@ -160,6 +161,154 @@ class TestReadForecastOutside(unittest.TestCase):
     def test_no_current_slot_row_is_none(self):
         self._set_fetchone(None)                         # optimizer-gat: geen huidig slot -> None
         self.assertIsNone(wp.read_forecast_outside(wp.build_cfg()))
+
+
+class TestParseValve(unittest.TestCase):
+    def test_on_maps_to_1_with_power(self):
+        self.assertEqual(wp.parse_valve('{"state":"ON","power":1.8}'), (1, 1.8))
+
+    def test_off_maps_to_0(self):
+        self.assertEqual(wp.parse_valve('{"state":"OFF","power":0}'), (0, 0.0))
+
+    def test_unknown_state_is_none_power_kept(self):
+        self.assertEqual(wp.parse_valve('{"state":"weird","power":2.5}'), (None, 2.5))
+
+    def test_missing_power_is_none(self):
+        self.assertEqual(wp.parse_valve('{"state":"ON"}'), (1, None))
+
+    def test_bad_power_type_is_none(self):
+        self.assertEqual(wp.parse_valve('{"state":"ON","power":"n/a"}'), (1, None))
+
+    def test_invalid_json_is_none_none(self):
+        self.assertEqual(wp.parse_valve("not json"), (None, None))
+
+    def test_non_object_is_none_none(self):
+        self.assertEqual(wp.parse_valve("[1,2,3]"), (None, None))
+
+    def test_accepts_already_parsed_dict(self):
+        self.assertEqual(wp.parse_valve({"state": "OFF", "power": 0.0}), (0, 0.0))
+
+
+class TestDecideWithOverride(unittest.TestCase):
+    # nominaal valt nu op het schema terug: 12:00 -> 21.0, 02:00 -> 19.0 (reden bevat "schema")
+    def _cfg(self, **over):
+        return cfg(**over)
+
+    def _state(self, last_setp=21.5):
+        return {"ovr_until": None, "ovr_target": None, "last_setp": last_setp}
+
+    def test_below_threshold_is_nominal(self):
+        sp, r = wp.decide_with_override(datetime(2026, 1, 5, 12, 0), 21.5,
+                                        self._state(), self._cfg())
+        self.assertEqual(sp, 21.0); self.assertIn("schema", r)           # 12:00 -> dag 21.0
+
+    def test_turnup_is_honored_and_capped(self):
+        sp, r = wp.decide_with_override(datetime(2026, 1, 5, 2, 0), 25.0,
+                                        self._state(), self._cfg())       # knop naar 25
+        self.assertEqual(sp, 23.0); self.assertIn("override", r)          # gecapt op ovr_max
+
+    def test_turnup_just_above_threshold(self):
+        sp, _ = wp.decide_with_override(datetime(2026, 1, 5, 2, 0), 22.0,
+                                        self._state(), self._cfg())
+        self.assertEqual(sp, 22.0)                                        # 22 < cap -> exact
+
+    def test_no_arm_on_first_observation(self):
+        sp, r = wp.decide_with_override(datetime(2026, 1, 5, 2, 0), 23.0,
+                                        self._state(last_setp=None), self._cfg())
+        self.assertEqual(sp, 19.0); self.assertIn("schema", r)            # prev None -> geen venster
+
+    def test_window_expires_back_to_nominal(self):
+        st, cf = self._state(), self._cfg()
+        t0 = datetime(2026, 1, 5, 2, 0)
+        wp.decide_with_override(t0, 22.5, st, cf)                          # arm, target 22.5
+        sp1, r1 = wp.decide_with_override(t0 + timedelta(minutes=30), 22.5, st, cf)
+        self.assertEqual(sp1, 22.5); self.assertIn("override", r1)         # binnen uur
+        sp2, r2 = wp.decide_with_override(t0 + timedelta(minutes=61), 22.5, st, cf)
+        self.assertEqual(sp2, 19.0); self.assertIn("schema", r2)          # na uur -> nominaal
+
+    def test_steady_high_does_not_rearm(self):
+        sp, r = wp.decide_with_override(datetime(2026, 1, 5, 2, 0), 22.5,
+                                        self._state(last_setp=22.5), self._cfg())
+        self.assertEqual(sp, 19.0); self.assertIn("schema", r)            # geen nieuw venster
+
+    def test_none_setpoint_is_nominal(self):
+        _, r = wp.decide_with_override(datetime(2026, 1, 5, 2, 0), None,
+                                       self._state(last_setp=None), self._cfg())
+        self.assertIn("schema", r)                                        # geen lezing -> nominaal
+
+    def test_return_to_baseline_cancels_override(self):
+        st, cf = self._state(), self._cfg()
+        t0 = datetime(2026, 1, 5, 2, 0)
+        wp.decide_with_override(t0, 22.5, st, cf)                          # arm @ 22.5
+        _, r1 = wp.decide_with_override(t0 + timedelta(minutes=10), 22.5, st, cf)
+        self.assertIn("override", r1)                                     # nog actief
+        # knop terug naar 21 (<= drempel) binnen het uur -> METEEN nominaal, venster gewist
+        _, r2 = wp.decide_with_override(t0 + timedelta(minutes=12), 21.0, st, cf)
+        self.assertIn("schema", r2); self.assertIsNone(st["ovr_until"])
+
+    def test_none_reading_does_not_cancel_active_override(self):
+        st, cf = self._state(), self._cfg()
+        t0 = datetime(2026, 1, 5, 2, 0)
+        wp.decide_with_override(t0, 22.5, st, cf)                          # arm
+        _, r = wp.decide_with_override(t0 + timedelta(minutes=10), None, st, cf)
+        self.assertIn("override", r)                                      # read-fout breekt niet af
+
+    def test_at_threshold_cancels(self):
+        st, cf = self._state(), self._cfg()
+        t0 = datetime(2026, 1, 5, 2, 0)
+        wp.decide_with_override(t0, 22.0, st, cf)                          # arm
+        _, r = wp.decide_with_override(t0 + timedelta(minutes=5), 21.5, st, cf)  # exact grens
+        self.assertIn("schema", r); self.assertIsNone(st["ovr_until"])    # 21.5 = baseline
+
+
+class TestBuildCfgValve(unittest.TestCase):
+    def test_valve_defaults(self):
+        c = wp.build_cfg()
+        self.assertTrue(c["valve_log"])
+        self.assertEqual(c["valve_topic"],
+                         "zigbee2mqtt/230V smart switch 5 3-way retour-buffer-valve")
+        self.assertEqual(c["valve_stale_s"], 660)
+
+    def test_override_defaults(self):
+        c = wp.build_cfg()
+        self.assertEqual(c["ovr_threshold"], 21.5)
+        self.assertEqual(c["ovr_max"], 23.0)
+        self.assertEqual(c["ovr_hold_s"], 3600)
+
+
+class TestWriteValve(unittest.TestCase):
+    def setUp(self):
+        self.exec = wp.mysql.connector.connect.return_value.cursor.return_value.execute
+        self.exec.reset_mock()
+
+    def _set_cache(self, state, power, ts):
+        with wp._valve_lock:
+            wp._valve_cache.update(state=state, power=power, ts=ts)
+
+    def test_fresh_value_is_upserted_with_own_columns(self):
+        now = datetime(2026, 1, 5, 10, 3, 12)
+        self._set_cache(1, 1.8, now)                       # vers (age 0)
+        wp.write_valve(wp.build_cfg(), now=now)
+        self.exec.assert_called_once()
+        sql, params = self.exec.call_args.args
+        self.assertIn("buffer_valve_state", sql)
+        self.assertIn("buffer_valve_power_w", sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", sql)       # schrijft alleen eigen kolommen
+        # params = (bucket(now), state, power); bucket trunceert naar 10:00
+        self.assertEqual(params[0], datetime(2026, 1, 5, 10, 0))
+        self.assertEqual(params[1:], (1, 1.8))
+
+    def test_stale_value_is_not_written(self):
+        now = datetime(2026, 1, 5, 10, 3, 12)
+        self._set_cache(1, 1.8, now)
+        later = now.replace(minute=20)                      # 17 min later > 660 s
+        wp.write_valve(wp.build_cfg(), now=later)
+        self.exec.assert_not_called()
+
+    def test_no_data_yet_is_not_written(self):
+        self._set_cache(None, None, None)
+        wp.write_valve(wp.build_cfg())
+        self.exec.assert_not_called()
 
 
 if __name__ == "__main__":

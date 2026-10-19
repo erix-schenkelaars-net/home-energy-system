@@ -45,7 +45,16 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `resol_relay_1`                       tinyint(4)   DEFAULT NULL COMMENT '% solar collector pump',
   `resol_relay_2`                       tinyint(4)   DEFAULT NULL COMMENT '% 3-way valve glycol',
   `resol_relay_3`                       tinyint(4)   DEFAULT NULL COMMENT '% wood gasifier pump',
-  `resol_relay_6`                       tinyint(4)   DEFAULT NULL COMMENT '% 3-way valve return',
+  `resol_relay_6`                       tinyint(4)   DEFAULT NULL COMMENT 'OLD/DEFUNCT R6 channel for the return 3-way valve: valve shorted ~2026-10, likely killed the R6 thyristor on the Resol M1, and the valve was rewired off Resol onto a Zigbee plug 2026-10-15. Resol may still log its intent here but it no longer drives the valve -- ignore for valve state; use buffer_valve_* instead',
+  -- The return 3-way valve (radiator return -> via the buffer vs direct) by its FUNCTION, not a
+  -- Resol channel name. Driven since 2026-10-15 by a Third Reality Zigbee plug (zigbee2mqtt
+  -- "230V smart switch 5 3-way retour-buffer-valve"), Resol out of the loop. wp_control is the sole
+  -- writer: each cycle it reads the plug's retained MQTT state back and upserts both here, so the
+  -- real buffer routing lands in the same 5-minute row as the resol_* hydraulics data.
+  -- power is the closed-loop confirmation: the Watts 22CX coil draws ~1.8 W energized, ~0 W not,
+  -- so a commanded ON that reads ~0 W means the valve (or plug) did not actually switch.
+  `buffer_valve_state`                  tinyint(4)   DEFAULT NULL COMMENT 'Return 3-way valve: 1=ON (energized=via buffer), 0=OFF (direct); from the Zigbee plug state',
+  `buffer_valve_power_w`                float        DEFAULT NULL COMMENT 'Measured plug power W (~1.8=energized/via buffer, ~0=not) -- confirms the valve really switched',
   `resol_temp_1_c`                      float        DEFAULT NULL COMMENT 'T1 solar collector °C',
   `resol_temp_2_c`                      float        DEFAULT NULL COMMENT 'T2 tank upper-middle °C',
   `resol_temp_3_c`                      float        DEFAULT NULL COMMENT 'T3 tank lower-middle °C',

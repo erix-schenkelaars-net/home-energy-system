@@ -29,30 +29,43 @@ ENV (met veilige defaults; .env hoeft niet aangepast om in DRY_RUN te draaien):
   MQTT_OTTHING_TOPIC                                — bv. otthing/CE150C/state -> basis otthing/CE150C
   WP_DRY_RUN            (default 1)   roomSetpoint: 1=alleen loggen, 0=echt publiceren
   WP_CHANNEL           (default 1)   OTThing-verwarmingscircuit (1 = P60)
-  WP_DAY_SETPOINT      (default 22.0)
-  WP_NIGHT_SETPOINT    (default 21.0)
-  WP_DAY_START         (default 06:00)
-  WP_NIGHT_START       (default 23:00)
-  WP_PREHEAT_LEAD_MIN  (default 60)   basis-voorverwarming vóór dag-start
-  WP_PREHEAT_MAX_MIN   (default 180)  cap op de voorverwarm-aanloop
-  WP_PREHEAT_REF_OUT   (default 8.0)  onder deze buitentemp begint de aanloop te groeien
-  WP_PREHEAT_MIN_PER_DEG (default 6)  extra minuten aanloop per °C onder de ref
-  WP_COMFORT_FLOOR     (default 19.5)
+  WP_SCHEDULE          (default "05:00=20.0,06:00=20.5,07:00=21.0,19:00=19.0")  dag/nacht-breekpunten
+                                     "HH:MM=temp,...". Elk breekpunt geldt tot het volgende; vóór het
+                                     eerste wrapt het naar het laatste (vorige dag). Getrapte ochtend-
+                                     recovery = zacht voor de WP (hoge COP). Geen comfort-bodem/cold-
+                                     scaled preheat meer: het schema is expliciet (fallback = de fysieke
+                                     thermostaat + OTThing-suspend).
   WP_CHECK_INTERVAL    (default 300)  seconden
   WP_PUBLISH_OUTSIDE   (default 1)    schone forecast-buitentemp -> outsideTemp/set publiceren
   WP_OUTSIDE_DRY_RUN   (default = WP_DRY_RUN)  APARTE dry-run voor de buitentemp; zo kun je de
                                      buitentemp LIVE zetten (0) terwijl roomSetpoint droog blijft
   WP_SCHED_TABLE       (default battery_schedule)  bron van forecast_temp_c (huidig slot)
   WP_OUTSIDE_MIN/MAX   (default -40/50)  plausibiliteits-clip tegen een default/garbage-waarde
+
+Retour-buffer-klep-LOGGING (fase 1 = ALLEEN loggen, nog GEEN besturing):
+  De 3-weg retour-buffer-klep hangt sinds 2026-10-15 aan een Zigbee-plug (Third Reality) i.p.v. de
+  Resol (het oude Resol-R6-kanaal is defect). Deze service is de sole writer van de echte klepstand in
+  energy.buffer_valve_state (1=ON=via buffer, 0=direct) + energy.buffer_valve_power_w (~1,8 W bekrachtigd
+  = bevestiging dat de klep écht schakelde). We LEZEN alleen (een achtergrond-abonnement op de plug +
+  een read-only /get-prik per cyclus voor een verse meting); het COMMANDEREN van de klep komt in fase 2.
+  WP_VALVE_LOG         (default 1)   0 = klep-logging uit
+  WP_VALVE_TOPIC       (default zigbee2mqtt/230V smart switch 5 3-way retour-buffer-valve)
+  WP_VALVE_STALE_S     (default 660) ouder dan dit (s) sinds de laatste plug-melding -> eerlijke NULL
+                                     (plug stil/offline) i.p.v. een bevroren waarde doorschrijven
 """
 
+import json
 import os
 import sys
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from time import sleep
 
 import mysql.connector
 import paho.mqtt.publish as mqtt_publish
+import paho.mqtt.client as mqtt_client
+
+from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 
 # ── logging (stdout-only; entrypoint tee't naar /logs/debug_YYYY-MM-DD.log) ──────────────
 def dbg(area, msg):
@@ -61,12 +74,29 @@ def dbg(area, msg):
 
 
 # ── config ───────────────────────────────────────────────────────────────────────────
-def _hhmm_to_min(s, default_min):
-    try:
-        h, m = s.split(":")
-        return int(h) * 60 + int(m)
-    except Exception:
-        return default_min
+# Dag/nacht-schema als breekpunten "HH:MM=temp,...". Elk breekpunt geldt TOT het volgende; vóór het
+# eerste breekpunt wrapt het naar het laatste (vorige dag). Zo is een getrapte ochtend-recovery
+# (zacht voor de WP → hoge COP) gewoon een paar punten. Nacht = de laagste blokken; geen comfort-bodem
+# (in bed), en geen cold-scaled voorverwarming meer — het schema is expliciet (fallback-thermostaat +
+# OTThing-suspend blijven het echte veiligheidsvangnet).
+DEFAULT_SCHEDULE = "05:00=20.0,06:00=20.5,07:00=21.0,19:00=19.0"
+
+
+def parse_schedule(s):
+    """'HH:MM=T,HH:MM=T,...' -> gesorteerde lijst [(minuten_sinds_middernacht, temp), ...].
+    Ongeldige/lege entries worden overgeslagen (robuust tegen een typefout in .env)."""
+    out = []
+    for part in (s or "").split(","):
+        hhmm, sep, temp = part.strip().partition("=")
+        if not sep:
+            continue
+        try:
+            h, m = hhmm.strip().split(":")
+            out.append((int(h) * 60 + int(m), round(float(temp.strip()), 1)))
+        except (ValueError, TypeError):
+            continue
+    out.sort()
+    return out
 
 
 def build_cfg():
@@ -86,51 +116,107 @@ def build_cfg():
         # aparte vlag voor de buitentemp-publicatie; niet gezet => erft WP_DRY_RUN
         "outside_dry_run": os.environ.get("WP_OUTSIDE_DRY_RUN",
                                           os.environ.get("WP_DRY_RUN", "1")) not in ("0", "false", "False", ""),
-        "day_sp":    float(os.environ.get("WP_DAY_SETPOINT", "22.0")),
-        "night_sp":  float(os.environ.get("WP_NIGHT_SETPOINT", "21.0")),
-        "day_start_min":   _hhmm_to_min(os.environ.get("WP_DAY_START", "06:00"), 360),
-        "night_start_min": _hhmm_to_min(os.environ.get("WP_NIGHT_START", "23:00"), 1380),
-        "preheat_lead_min": float(os.environ.get("WP_PREHEAT_LEAD_MIN", "60")),
-        "preheat_max_min":  float(os.environ.get("WP_PREHEAT_MAX_MIN", "180")),
-        "preheat_ref_out":  float(os.environ.get("WP_PREHEAT_REF_OUT", "8.0")),
-        "preheat_min_per_deg": float(os.environ.get("WP_PREHEAT_MIN_PER_DEG", "6")),
-        "comfort_floor": float(os.environ.get("WP_COMFORT_FLOOR", "19.5")),
+        "schedule":  parse_schedule(os.environ.get("WP_SCHEDULE", DEFAULT_SCHEDULE)),
         "interval":  int(os.environ.get("WP_CHECK_INTERVAL", "300")),
         "sched_table": os.environ.get("WP_SCHED_TABLE", "battery_schedule"),
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
         "out_max":   float(os.environ.get("WP_OUTSIDE_MAX", "50")),
+        "valve_log": os.environ.get("WP_VALVE_LOG", "1") not in ("0", "false", "False", ""),
+        "valve_topic": os.environ.get("WP_VALVE_TOPIC",
+                                      "zigbee2mqtt/230V smart switch 5 3-way retour-buffer-valve"),
+        "valve_stale_s": int(os.environ.get("WP_VALVE_STALE_S", "660")),
+        # handmatige-override: kamerthermostaat staat (door user) op max ovr_threshold in alle periodes;
+        # vraagt hij meer -> iemand draaide eraan -> honoreer (gecapt op ovr_max) voor ovr_hold_s, dan nominaal
+        "ovr_threshold": float(os.environ.get("WP_OVERRIDE_THRESHOLD", "21.5")),
+        "ovr_max":       float(os.environ.get("WP_OVERRIDE_MAX", "23.0")),
+        "ovr_hold_s":    int(os.environ.get("WP_OVERRIDE_HOLD_S", "3600")),
     }
 
 
 # ── de beslissing (PUUR — geen I/O; dit is wat de test aanvalt) ─────────────────────────
-def preheat_lead(outside_c, cfg):
-    """Hoeveel minuten vóór dag-start beginnen met voorverwarmen. Kouder = eerder (de recovery
-    duurt langer), begrensd op preheat_max_min. Geen buitentemp bekend -> basis-aanloop."""
-    lead = cfg["preheat_lead_min"]
-    if outside_c is not None and outside_c < cfg["preheat_ref_out"]:
-        lead += (cfg["preheat_ref_out"] - outside_c) * cfg["preheat_min_per_deg"]
-    return min(lead, cfg["preheat_max_min"])
-
-
-def decide_setpoint(now, outside_c, room_c, cfg):
-    """Gewenste roomSetpoint (°C) + reden, puur uit tijd + buitentemp. Dag-venster
-    [day_start, night_start); daarbuiten nacht-setback; in de aanloop vóór dag-start alvast
-    het dag-setpoint (voorverwarmen). Nooit onder de comfort-bodem."""
+def schedule_setpoint(now, schedule):
+    """Actieve setpoint (°C) + reden uit een breekpunt-schema op tijdstip `now`. Kiest het LAATSTE
+    breekpunt waarvan de tijd ≤ now; vóór het eerste breekpunt wrapt het naar het laatste (vorige
+    dag). Leeg schema -> veilige 20.0."""
+    if not schedule:
+        return 20.0, "schema leeg (fallback 20.0°C)"
     m = now.hour * 60 + now.minute
-    day_start, night_start = cfg["day_start_min"], cfg["night_start_min"]
-    lead = preheat_lead(outside_c, cfg)
-    preheat_start = day_start - lead
+    active = None
+    for mins, temp in schedule:          # schedule is gesorteerd op tijd
+        if mins <= m:
+            active = (mins, temp)
+        else:
+            break
+    if active is None:                   # vóór het eerste breekpunt -> wrap naar gisteren-laatst
+        active = schedule[-1]
+    hh, mm = divmod(active[0], 60)
+    return active[1], f"schema {active[1]}°C (vanaf {hh:02d}:{mm:02d})"
 
-    if day_start <= m < night_start:
-        sp, reason = cfg["day_sp"], "dag"
-    elif preheat_start <= m < day_start:
-        sp, reason = cfg["day_sp"], f"voorverwarmen (aanloop {lead:.0f}m, buiten {outside_c})"
-    else:
-        sp, reason = cfg["night_sp"], "nacht-setback"
 
-    sp = max(sp, cfg["comfort_floor"])
-    return round(sp, 1), reason
+def decide_setpoint(now, cfg):
+    """Nominale roomSetpoint uit het dag/nacht-breekpunt-schema (puur tijd). Zie schedule_setpoint.
+    Geen comfort-bodem en geen cold-scaled voorverwarming: het schema is de expliciete waarheid; het
+    veiligheidsvangnet bij software-uitval is de fysieke fallback-thermostaat + de OTThing-suspend."""
+    return schedule_setpoint(now, cfg["schedule"])
+
+
+def decide_with_override(now, thermostat_setp, state, cfg):
+    """PUUR: wrapt decide_setpoint met de handmatige-override-regel.
+
+    `thermostat_setp` = de door de FYSIEKE thermostaat gevraagde room-setpoint
+    (honeywell_ot_thermo_room_set_t_c = OTThing master.room_set_t.data). Dat is de knop/het schema,
+    ONAFHANKELIJK van wat wij injecteren (onze injectie loopt via slave.tr_override) → geen zelf-trigger.
+
+    Regel (user 2026-10-15): de kamerthermostaat staat op max `ovr_threshold` (bv. 21,5) in álle
+    periodes. Vraagt hij méér, dan heeft iemand aan de knop gedraaid → honoreer die nieuwe wens
+    (gecapt op `ovr_max`, bv. 23) gedurende `ovr_hold_s` (bv. 1 u); daarna weer het nominale algo.
+    Een NIEUWE/gewijzigde verhoging (≠ vorige meting) herstart het venster. **Draait de knop terug
+    naar ≤ drempel, dan eindigt de boost METEEN** (venster wissen) — niet het uur volmaken.
+
+    `state` = mutabele dict {ovr_until: datetime|None, ovr_target: float|None, last_setp: float|None}
+    die tussen cycli bewaard blijft. Returnt (sp, reason)."""
+    thr, mx, hold = cfg["ovr_threshold"], cfg["ovr_max"], cfg["ovr_hold_s"]
+    prev = state.get("last_setp")
+    # een (nieuwe) handmatige verhoging = boven de drempel én veranderd t.o.v. de vorige meting.
+    # `prev is not None` voorkomt dat een herstart-mét-knop-al-omhoog meteen een venster opent.
+    if (thermostat_setp is not None and thermostat_setp > thr
+            and prev is not None and abs(thermostat_setp - prev) > 0.05):
+        state["ovr_until"]  = now + timedelta(seconds=hold)
+        state["ovr_target"] = round(min(thermostat_setp, mx), 1)
+    elif thermostat_setp is not None and thermostat_setp <= thr:
+        # knop terug op (of onder) de baseline → de gebruiker is klaar met de boost → direct nominaal.
+        # (een None-lezing wist het venster NIET: een transiënte read-fout mag een boost niet afbreken.)
+        state["ovr_until"] = None
+        state["ovr_target"] = None
+    state["last_setp"] = thermostat_setp
+
+    until = state.get("ovr_until")
+    if until is not None and now < until:
+        mins = (until - now).total_seconds() / 60
+        return state["ovr_target"], f"handmatige override {state['ovr_target']}°C (nog {mins:.0f}m)"
+    return decide_setpoint(now, cfg)
+
+
+def parse_valve(payload):
+    """PUUR: een zigbee2mqtt-plug-payload -> (state, power_w). `state` = 1 bij "ON"
+    (bekrachtigd = retour via de buffer), 0 bij "OFF" (direct), anders None. `power_w` = float of
+    None. Faalt veilig naar (None, None) bij ongeldige JSON / onverwachte vorm, zodat een rare
+    boodschap nooit de lus breekt en nooit een valse klepstand logt."""
+    try:
+        d = json.loads(payload) if isinstance(payload, (str, bytes, bytearray)) else payload
+    except Exception:
+        return None, None
+    if not isinstance(d, dict):
+        return None, None
+    s = d.get("state")
+    state = 1 if s == "ON" else 0 if s == "OFF" else None
+    p = d.get("power")
+    try:
+        power = None if p is None else float(p)
+    except (TypeError, ValueError):
+        power = None
+    return state, power
 
 
 # ── I/O ────────────────────────────────────────────────────────────────────────────────
@@ -222,24 +308,125 @@ def publish_outside(temp, cfg):
                   cfg["outside_dry_run"], retain=True)
 
 
+# ── retour-buffer-klep: lezen + loggen (fase 1 = GEEN besturing) ───────────────────────
+# De plug publiceert zelf state+power (op verandering/interval); een achtergrond-abonnement cachet
+# de laatste, en elke cyclus prikken we met een read-only /get zodat ook een stabiele klep een verse
+# rij krijgt. We schrijven alléén een verse waarde (stale -> eerlijke NULL), zodat een stille/offline
+# plug niet als een bevroren-maar-levende feed doorschrijft (vgl. de P60-feed-freeze-casus).
+_valve_cache = {"state": None, "power": None, "ts": None}
+_valve_lock = threading.Lock()
+
+
+def ensure_valve_columns(cfg):
+    """Zorg idempotent dat energy de buffer_valve_*-kolommen heeft (MariaDB ADD COLUMN IF NOT EXISTS).
+    Best-effort -> loggen en doorgaan (de upsert faalt dan gewoon tot de kolommen er zijn)."""
+    try:
+        c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
+        cur = c.cursor()
+        cur.execute(f"ALTER TABLE {cfg['db_table']} "
+                    f"ADD COLUMN IF NOT EXISTS `buffer_valve_state` tinyint(4) DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `buffer_valve_power_w` float DEFAULT NULL")
+        c.commit(); cur.close(); c.close()
+        dbg("VALVE", "schema OK (buffer_valve_* aanwezig)")
+    except Exception as e:
+        dbg("VALVE", f"ensure_valve_columns faalde: {e}")
+
+
+def _on_valve_msg(client, userdata, msg):
+    """on_message: parse + cache de laatste geldige klepstand/power (thread-safe)."""
+    state, power = parse_valve(msg.payload)
+    if state is None and power is None:
+        return
+    with _valve_lock:
+        if state is not None:
+            _valve_cache["state"] = state
+        if power is not None:
+            _valve_cache["power"] = power
+        _valve_cache["ts"] = datetime.now()
+
+
+def start_valve_listener(cfg):
+    """Achtergrond-MQTT-client die het plug-statustopic volgt en de cache bijwerkt. Best-effort ->
+    None bij een fout (de lus draait dan door zonder klep-logging)."""
+    try:
+        c = mqtt_client.Client()
+        if cfg["mqtt_user"]:
+            c.username_pw_set(cfg["mqtt_user"], cfg["mqtt_pass"])
+        c.on_message = _on_valve_msg
+        c.on_connect = lambda cl, u, f, rc, *a: cl.subscribe(cfg["valve_topic"])
+        c.connect(cfg["broker"], cfg["port"], 30)
+        c.loop_start()
+        dbg("VALVE", f"luistert op '{cfg['valve_topic']}'")
+        return c
+    except Exception as e:
+        dbg("VALVE", f"listener-start faalde: {e}")
+        return None
+
+
+def request_valve(cfg):
+    """Prik de plug met een read-only /get zodat zigbee2mqtt een VERSE state+power publiceert — dan
+    krijgt ook een niet-veranderende klep elke 5 min een actuele rij. Dit is GEEN besturing (het
+    stuurt geen state), dus niet door DRY_RUN gated. Best-effort."""
+    try:
+        auth = {"username": cfg["mqtt_user"], "password": cfg["mqtt_pass"]} if cfg["mqtt_user"] else None
+        mqtt_publish.single(f"{cfg['valve_topic']}/get", payload='{"state":""}',
+                            hostname=cfg["broker"], port=cfg["port"], auth=auth, qos=0, retain=False)
+    except Exception as e:
+        dbg("VALVE", f"get-prik faalde: {e}")
+
+
+def write_valve(cfg, now=None):
+    """Schrijf de gecachete klepstand+power naar de energy-bucket (sole writer van buffer_valve_*).
+    Schrijft NIETS als er nog geen data is, of als de laatste melding ouder is dan valve_stale_s
+    (dan laten we de kolommen NULL = eerlijk 'geen verse meting' i.p.v. een bevroren waarde). Best-effort."""
+    now = now or datetime.now()
+    with _valve_lock:
+        state, power, ts = _valve_cache["state"], _valve_cache["power"], _valve_cache["ts"]
+    if ts is None:
+        dbg("VALVE", "nog geen plug-data ontvangen -> niets geschreven")
+        return
+    age = (now - ts).total_seconds()
+    if age > cfg["valve_stale_s"]:
+        dbg("VALVE", f"plug stil ({age:.0f}s > {cfg['valve_stale_s']}s) -> stale, niets geschreven (NULL)")
+        return
+    try:
+        c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
+        cur = c.cursor()
+        cur.execute(er.upsert_sql(["buffer_valve_state", "buffer_valve_power_w"], cfg["db_table"]),
+                    (er.bucket(now), state, power))
+        c.commit(); cur.close(); c.close()
+        dbg("VALVE", f"state={state} power={power}W (age {age:.0f}s) -> energy")
+    except Exception as e:
+        dbg("VALVE", f"write_valve faalde: {e}")
+
+
 # ── hoofdlus ─────────────────────────────────────────────────────────────────────────
 def main():
     cfg = build_cfg()
+    sched_txt = ",".join(f"{mm//60:02d}:{mm%60:02d}->{t}" for mm, t in cfg["schedule"]) or "(leeg)"
     dbg("CONF", f"wp_control start — DRY_RUN={cfg['dry_run']} kanaal={cfg['channel']} "
-                f"dag={cfg['day_sp']}@{cfg['day_start_min']//60:02d}:00 "
-                f"nacht={cfg['night_sp']}@{cfg['night_start_min']//60:02d}:00 "
-                f"voorverwarm={cfg['preheat_lead_min']:.0f}-{cfg['preheat_max_min']:.0f}m "
-                f"bodem={cfg['comfort_floor']} interval={cfg['interval']}s "
+                f"schema=[{sched_txt}] interval={cfg['interval']}s "
                 f"setpoint[{'DRY' if cfg['dry_run'] else 'LIVE'}]->{cfg['base_topic']}/roomSetpoint{cfg['channel']}/set "
                 f"buiten[{'uit' if not cfg['publish_outside'] else ('DRY' if cfg['outside_dry_run'] else 'LIVE')}]"
                 f"->{cfg['base_topic']}/outsideTemp/set")
     dbg("CONF", f"roomSetpoint = {'DROOG (logt alleen)' if cfg['dry_run'] else 'LIVE — publiceert!'} | "
                 f"buitentemp = {'DROOG' if cfg['outside_dry_run'] else 'LIVE — publiceert!'}"
                 + ("" if cfg["outside_dry_run"] else "  (zorg dat de HA-P60-inlaat-publisher UIT staat!)"))
+    dbg("CONF", f"klep-logging {'AAN' if cfg['valve_log'] else 'UIT'}"
+                + (f" -> energy.buffer_valve_* uit '{cfg['valve_topic']}' (ALLEEN lezen, geen besturing)"
+                   if cfg["valve_log"] else ""))
+    dbg("CONF", f"handmatige override: thermostaat > {cfg['ovr_threshold']}°C → honoreer "
+                f"(cap {cfg['ovr_max']}°C) voor {cfg['ovr_hold_s']//60}m, dan nominaal")
+    if cfg["valve_log"]:
+        ensure_valve_columns(cfg)
+        start_valve_listener(cfg)
+    ovr_state = {"ovr_until": None, "ovr_target": None, "last_setp": None}
     while True:
+        if cfg["valve_log"]:
+            write_valve(cfg)              # schrijf de verse (door reports + vorige /get) gecachete stand
         room, outside, sp_now = read_latest(cfg)
-        sp, reason = decide_setpoint(datetime.now(), outside, room, cfg)
-        dbg("CTRL", f"kamer={room} buiten={outside} setpoint_nu={sp_now} "
+        sp, reason = decide_with_override(datetime.now(), sp_now, ovr_state, cfg)
+        dbg("CTRL", f"kamer={room} buiten={outside} thermostaat_vraag={sp_now} "
                     f"-> gewenst={sp} ({reason})")
         publish_setpoint(sp, cfg)
 
@@ -252,6 +439,10 @@ def main():
             else:
                 dbg("CTRL", "geen verse forecast-buitentemp (geen huidig slot / buiten bereik) "
                             "-> outsideTemp niet gepubliceerd")
+
+        # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
+        if cfg["valve_log"]:
+            request_valve(cfg)
         sleep(cfg["interval"])
 
 
