@@ -164,8 +164,8 @@ def decide_setpoint(now, cfg):
 def decide_with_override(now, thermostat_setp, state, cfg):
     """PUUR: wrapt decide_setpoint met de handmatige-override-regel.
 
-    `thermostat_setp` = de door de FYSIEKE thermostaat gevraagde room-setpoint
-    (honeywell_ot_thermo_room_set_t_c = OTThing master.room_set_t.data). Dat is de knop/het schema,
+    `thermostat_setp` = de door de FYSIEKE Honeywell gevraagde room-setpoint
+    (otthing_roomunit_set_t_c = roomunit.room_set_t, de ECHTE wand-knop in Master-mode). Dat is de knop/het schema,
     ONAFHANKELIJK van wat wij injecteren (onze injectie loopt via slave.tr_override) → geen zelf-trigger.
 
     Regel (user 2026-10-15): de kamerthermostaat staat op max `ovr_threshold` (bv. 21,5) in álle
@@ -223,20 +223,23 @@ def parse_valve(payload):
 def read_latest(cfg):
     """Nieuwste kamer/buiten uit de energy-tabel. Best-effort -> (None, None) bij een fout.
 
-    Bron = de OTThing-velden, NIET de sparrow-velden:
-      * buiten = honeywell_ot_boiler_outside_t_c -> exact wat de OTThing-stooklijn gebruikt
-        (bron=MQTT/HA, ~1,7 °C koeler dan de P60-luchtinlaat sparrow_outside_temp_c, die door de
-        unit/zon wordt opgestookt). De OTThing duwt deze waarde zelf naar de P60 over OT.
-      * kamer  = honeywell_ot_thermo_room_t_c -> de thermostaat-kamersensor die de OTThing regelt
-        (de P60's eigen sparrow_room_temp_c is onbetrouwbaar/vaak unavailable).
+    Bron = de OTThing-velden, NIET de sparrow-velden. In MASTER-mode is de FYSIEKE Honeywell de
+    `roomunit`-groep (otthing_roomunit_*); honeywell_ot_thermo_* is daar juist de OTThing->WP-kant
+    (de circuit-setpoint, bv. 21), NIET de wand-setpoint die de mens bedient. Daarom lezen we de
+    roomunit-kolommen:
+      * buiten  = honeywell_ot_boiler_outside_t_c -> exact wat de OTThing-stooklijn gebruikt
+        (bron=MQTT/HA; de OTThing duwt deze zelf naar de P60 over OT).
+      * kamer   = otthing_roomunit_room_t_c -> de door de Honeywell gemeten kamertemp.
+      * setpoint= otthing_roomunit_set_t_c  -> de ECHTE wand-setpoint (de knop/comfort-dial).
+    NB: de snelle bump-detectie loopt straks via de MQTT-listener; dit DB-pad is de rustige 5-min-bron.
     """
     try:
         c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
         cur = c.cursor()
         cur.execute(
-            f"SELECT honeywell_ot_thermo_room_t_c, honeywell_ot_boiler_outside_t_c, "
-            f"honeywell_ot_thermo_room_set_t_c "
-            f"FROM {cfg['db_table']} WHERE honeywell_ot_boiler_outside_t_c IS NOT NULL "
+            f"SELECT otthing_roomunit_room_t_c, honeywell_ot_boiler_outside_t_c, "
+            f"otthing_roomunit_set_t_c "
+            f"FROM {cfg['db_table']} WHERE otthing_roomunit_set_t_c IS NOT NULL "
             f"ORDER BY ts DESC LIMIT 1")
         row = cur.fetchone()
         cur.close(); c.close()
@@ -375,6 +378,85 @@ def request_valve(cfg):
         dbg("VALVE", f"get-prik faalde: {e}")
 
 
+# ── thermostaat-bump-listener (snelle reactie op een draai aan de Honeywell) ──────────────
+# De 5-min DB-lus is prima voor de rustige flow-modulatie, maar traag voor een comfort-bump
+# (iemand draait de wandthermostaat omhoog). Daarom een APARTE achtergrond-MQTT-client op
+# <base>/state (update elke 1-2 s): die houdt de Honeywell-setpoint seconden-vers en wekt de
+# hoofdlus bij een draai-omhoog, zodat de WP binnen seconden reageert i.p.v. na ~5-10 min.
+_thermo_cache = {"setpoint": None, "ts": None}
+_thermo_lock  = threading.Lock()
+_bump_event   = threading.Event()
+
+
+def parse_roomunit_setpoint(payload):
+    """Pak roomunit.room_set_t (de FYSIEKE Honeywell-wand-setpoint in Master-mode) uit een
+    OTThing /state-payload. -> float of None; crasht niet op rare/partiele payloads."""
+    try:
+        d = json.loads(payload.decode() if isinstance(payload, (bytes, bytearray)) else payload)
+    except Exception:
+        return None
+    ru = (d.get("roomunit") if isinstance(d, dict) else None) or {}
+    v = ru.get("room_set_t")
+    if isinstance(v, dict):               # robuust tegen een {"result","data"}-firmwarevariant
+        v = v.get("data") if v.get("result", True) else None
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_bump(setp, prev, thr):
+    """True als iemand de Honeywell OMHOOG draaide, boven de drempel — de comfort-vraag die een
+    snelle reactie verdient. Een turn-DOWN is nooit urgent, die laten we de 5-min-cyclus oppakken."""
+    return (setp is not None and prev is not None
+            and setp > prev + 0.05 and setp > thr)
+
+
+def _on_thermo_msg(client, userdata, msg):
+    """on_message: cache de verse Honeywell-setpoint (thread-safe) en wek de lus bij een bump."""
+    setp = parse_roomunit_setpoint(msg.payload)
+    if setp is None:
+        return
+    thr = userdata["thr"]
+    with _thermo_lock:
+        prev = _thermo_cache["setpoint"]
+        _thermo_cache["setpoint"] = setp
+        _thermo_cache["ts"] = datetime.now()
+    if is_bump(setp, prev, thr):
+        dbg("CTRL", f"BUMP via MQTT: {prev} -> {setp}°C (wek de lus voor directe reactie)")
+        _bump_event.set()
+
+
+def start_thermo_listener(cfg):
+    """Achtergrond-MQTT-client op <base>/state. Best-effort -> None bij een fout (de lus draait dan
+    door op het 5-min DB-pad; de fallback-curve + Honeywell blijven sowieso het vangnet)."""
+    topic = f"{cfg['base_topic']}/state"
+    try:
+        c = mqtt_client.Client(userdata={"thr": cfg["ovr_threshold"]})
+        if cfg["mqtt_user"]:
+            c.username_pw_set(cfg["mqtt_user"], cfg["mqtt_pass"])
+        c.on_message = _on_thermo_msg
+        c.on_connect = lambda cl, u, f, rc, *a: cl.subscribe(topic)
+        c.connect(cfg["broker"], cfg["port"], 30)
+        c.loop_start()
+        dbg("CTRL", f"bump-listener luistert op '{topic}' (drempel {cfg['ovr_threshold']}°C)")
+        return c
+    except Exception as e:
+        dbg("CTRL", f"bump-listener-start faalde: {e}")
+        return None
+
+
+def live_setpoint(cfg, now=None, max_age_s=90):
+    """De seconden-verse Honeywell-setpoint uit de MQTT-listener, of None als er nog niets is of de
+    listener stil ligt (> max_age_s) -> dan valt de lus terug op het 5-min DB-pad."""
+    now = now or datetime.now()
+    with _thermo_lock:
+        setp, ts = _thermo_cache["setpoint"], _thermo_cache["ts"]
+    if setp is None or ts is None or (now - ts).total_seconds() > max_age_s:
+        return None
+    return setp
+
+
 def write_valve(cfg, now=None):
     """Schrijf de gecachete klepstand+power naar de energy-bucket (sole writer van buffer_valve_*).
     Schrijft NIETS als er nog geen data is, of als de laatste melding ouder is dan valve_stale_s
@@ -420,13 +502,17 @@ def main():
     if cfg["valve_log"]:
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
+    start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
     ovr_state = {"ovr_until": None, "ovr_target": None, "last_setp": None}
     while True:
         if cfg["valve_log"]:
             write_valve(cfg)              # schrijf de verse (door reports + vorige /get) gecachete stand
-        room, outside, sp_now = read_latest(cfg)
+        room, outside, sp_db = read_latest(cfg)
+        sp_live = live_setpoint(cfg)                 # seconden-verse Honeywell-setpoint (MQTT)
+        sp_now = sp_live if sp_live is not None else sp_db
+        src = "MQTT-live" if sp_live is not None else "DB-5min"
         sp, reason = decide_with_override(datetime.now(), sp_now, ovr_state, cfg)
-        dbg("CTRL", f"kamer={room} buiten={outside} thermostaat_vraag={sp_now} "
+        dbg("CTRL", f"kamer={room} buiten={outside} thermostaat_vraag={sp_now}({src}) "
                     f"-> gewenst={sp} ({reason})")
         publish_setpoint(sp, cfg)
 
@@ -443,7 +529,10 @@ def main():
         # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
         if cfg["valve_log"]:
             request_valve(cfg)
-        sleep(cfg["interval"])
+        # wacht tot de volgende 5-min-cyclus OF tot een bump de lus wekt (snelle comfort-reactie)
+        if _bump_event.wait(timeout=cfg["interval"]):
+            _bump_event.clear()
+            dbg("CTRL", "-> bump: directe her-evaluatie")
 
 
 if __name__ == "__main__":

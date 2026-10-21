@@ -311,5 +311,76 @@ class TestWriteValve(unittest.TestCase):
         self.exec.assert_not_called()
 
 
+class TestParseRoomunitSetpoint(unittest.TestCase):
+    """roomunit.room_set_t uit een OTThing /state-payload = de echte Honeywell-wand-setpoint."""
+
+    def test_valid_bytes(self):
+        self.assertEqual(wp.parse_roomunit_setpoint(b'{"roomunit":{"room_set_t":21.5}}'), 21.5)
+
+    def test_valid_str(self):
+        self.assertEqual(wp.parse_roomunit_setpoint('{"roomunit":{"room_set_t":22}}'), 22.0)
+
+    def test_wrapped_result_data(self):
+        self.assertEqual(wp.parse_roomunit_setpoint(
+            b'{"roomunit":{"room_set_t":{"result":true,"data":20.0}}}'), 20.0)
+
+    def test_missing_roomunit_is_none(self):
+        self.assertIsNone(wp.parse_roomunit_setpoint(b'{"master":{}}'))
+
+    def test_null_setpoint_is_none(self):
+        self.assertIsNone(wp.parse_roomunit_setpoint(b'{"roomunit":{"room_set_t":null}}'))
+
+    def test_bad_json_is_none(self):
+        self.assertIsNone(wp.parse_roomunit_setpoint(b'not-json'))
+
+
+class TestIsBump(unittest.TestCase):
+    """Bump = de Honeywell OMHOOG gedraaid boven de drempel (de comfort-vraag die snelheid verdient)."""
+
+    def test_turnup_above_threshold(self):
+        self.assertTrue(wp.is_bump(22.0, 21.0, 21.5))
+
+    def test_turnup_below_threshold_no_bump(self):
+        self.assertFalse(wp.is_bump(21.0, 20.0, 21.5))      # omhoog maar onder drempel
+
+    def test_turndown_no_bump(self):
+        self.assertFalse(wp.is_bump(20.0, 22.0, 21.5))      # omlaag = nooit urgent
+
+    def test_tiny_change_no_bump(self):
+        self.assertFalse(wp.is_bump(22.02, 22.0, 21.5))     # ruis < 0.05
+
+    def test_none_prev_no_bump(self):
+        self.assertFalse(wp.is_bump(23.0, None, 21.5))      # eerste meting -> geen bump
+
+    def test_none_setp_no_bump(self):
+        self.assertFalse(wp.is_bump(None, 21.0, 21.5))
+
+
+class TestLiveSetpoint(unittest.TestCase):
+    """De seconden-verse MQTT-setpoint; None als leeg of stale (-> lus valt terug op het DB-pad)."""
+
+    def setUp(self):
+        with wp._thermo_lock:
+            wp._thermo_cache["setpoint"] = None
+            wp._thermo_cache["ts"] = None
+
+    def test_none_when_empty(self):
+        self.assertIsNone(wp.live_setpoint({}, now=datetime.now()))
+
+    def test_fresh_value(self):
+        now = datetime.now()
+        with wp._thermo_lock:
+            wp._thermo_cache["setpoint"] = 21.0
+            wp._thermo_cache["ts"] = now
+        self.assertEqual(wp.live_setpoint({}, now=now), 21.0)
+
+    def test_stale_value_is_none(self):
+        now = datetime.now()
+        with wp._thermo_lock:
+            wp._thermo_cache["setpoint"] = 21.0
+            wp._thermo_cache["ts"] = now - timedelta(seconds=120)
+        self.assertIsNone(wp.live_setpoint({}, now=now, max_age_s=90))
+
+
 if __name__ == "__main__":
     unittest.main()
