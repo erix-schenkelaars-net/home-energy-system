@@ -7,7 +7,8 @@ Reads OpenTherm gateway (otgw-thing) data from MQTT and writes to MariaDB.
 Polls every 5 minutes (clock-aligned to :00:10, :05:10, ...) by subscribing to
 the MQTT_OTTHING_TOPIC for 5 seconds and taking the most recent retained JSON payload.
 
-DB columns written: honeywell_ot_boiler_*, honeywell_ot_thermo_*, honeywell_ot_heater0_*
+DB columns written: honeywell_ot_boiler_*, honeywell_ot_thermo_*, honeywell_ot_heater0_*,
+                    otthing_roomunit_* (de fysieke Honeywell in Master-mode, slave-interface)
 
 Configuration via environment variables (see ../.env):
   MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, MQTT_OTTHING_TOPIC
@@ -144,6 +145,8 @@ def parse_payload(p):
     fs     = slave.get("flameStats")  or {}
     ss     = slave.get("status")      or {}
     ms     = _md(master.get("status")) or {}
+    ru     = p.get("roomunit")         or {}            # fysieke Honeywell (slave-interface, Master-mode)
+    rus    = _md(ru.get("status"))     or {}
 
     return {
         # --- boiler (slave) ---
@@ -183,6 +186,15 @@ def parse_payload(p):
         "honeywell_ot_heater0_override_on":        boolean(hc0.get("ovrdOn")),
         "honeywell_ot_heater0_override_flow":      boolean(hc0.get("ovrdTemp")),
         "honeywell_ot_heater0_suspended":          boolean(hc0.get("suspended")),
+
+        # --- roomunit = de FYSIEKE Honeywell-klokthermostaat (OTThing slave-interface, Master-mode).
+        #     DIT is in Master de thermostaat die de mens bedient; de master-groep hierboven is de
+        #     OTThing->WP-commandokant. Live zijn 't plain scalars, maar _md() houdt het robuust
+        #     mocht een firmware-variant ze ook {"result","data"}-wrappen.
+        "otthing_roomunit_set_t_c":    flt(_md(ru.get("room_set_t"))),   # kamer-setpoint (de mens draait eraan)
+        "otthing_roomunit_room_t_c":   flt(_md(ru.get("room_t"))),       # door de Honeywell gemeten kamertemp
+        "otthing_roomunit_ch_set_t_c": flt(_md(ru.get("ch_set_t"))),     # flow die de Honeywell zelf zou vragen (bump)
+        "otthing_roomunit_ch_enable":  boolean(rus.get("ch_enable")),    # Honeywell vraagt warmte
     }
 
 

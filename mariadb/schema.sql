@@ -188,6 +188,14 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `honeywell_ot_thermo_room_set_t_c`    float        DEFAULT NULL COMMENT 'Room setpoint °C',
   `honeywell_ot_thermo_room_t_c`        float        DEFAULT NULL COMMENT 'Room temperature °C',
   `honeywell_ot_thermo_smart_power`     varchar(20)  DEFAULT NULL,
+  -- roomunit = de FYSIEKE Honeywell-klokthermostaat, gelezen via de OTThing slave-interface in
+  -- Master-mode (enableSlave). Dit is in Master de echte thermostaat; honeywell_ot_thermo_* is
+  -- daar juist de OTThing->WP-commandokant. wp_control gebruikt set_t als comfort-dial (de mens
+  -- draait eraan) en ch_set/ch_enable om een handmatige "bump" te detecteren. (read_otthing)
+  `otthing_roomunit_set_t_c`            float        DEFAULT NULL COMMENT 'Honeywell kamer-setpoint °C (comfort-dial)',
+  `otthing_roomunit_room_t_c`           float        DEFAULT NULL COMMENT 'Honeywell gemeten kamertemp °C',
+  `otthing_roomunit_ch_set_t_c`         float        DEFAULT NULL COMMENT 'Flow die de Honeywell zelf zou vragen °C',
+  `otthing_roomunit_ch_enable`          tinyint(1)   DEFAULT NULL COMMENT 'Honeywell vraagt warmte',
   PRIMARY KEY (`id`),
 
   -- UNIQUE, not just an index: it is what makes one row per 5-minute bucket possible, so every

@@ -328,5 +328,44 @@ class TestMasterUnwrap(unittest.TestCase):
         self.assertIsNone(d["honeywell_ot_thermo_room_set_t_c"])
 
 
+class TestRoomunit(unittest.TestCase):
+    """roomunit = de FYSIEKE Honeywell-klokthermostaat (OTThing slave-interface, Master-mode).
+    In Master is dit de thermostaat die de mens bedient; de master-groep is de OTThing->WP-kant.
+    Live zijn 't plain scalars; _md() houdt het robuust mocht firmware ze wrappen."""
+
+    def _payload(self, **ru):
+        base = {"ch_set_t": 65, "room_t": 21.1, "room_set_t": 21,
+                "status": {"ch_enable": True}}
+        base.update(ru)
+        return {"slave": {}, "master": {}, "heatercircuit": [], "roomunit": base}
+
+    def test_honeywell_setpoint(self):
+        d = mod.parse_payload(self._payload())
+        self.assertEqual(d["otthing_roomunit_set_t_c"], 21.0)    # DE comfort-dial van de mens
+
+    def test_honeywell_room_temp(self):
+        d = mod.parse_payload(self._payload())
+        self.assertAlmostEqual(d["otthing_roomunit_room_t_c"], 21.1)
+
+    def test_honeywell_ch_set(self):
+        d = mod.parse_payload(self._payload())
+        self.assertAlmostEqual(d["otthing_roomunit_ch_set_t_c"], 65.0)
+
+    def test_honeywell_ch_enable(self):
+        d = mod.parse_payload(self._payload())
+        self.assertEqual(d["otthing_roomunit_ch_enable"], 1)
+
+    def test_missing_roomunit_is_none(self):
+        d = mod.parse_payload({"slave": {}, "master": {}, "heatercircuit": []})
+        self.assertIsNone(d["otthing_roomunit_set_t_c"])
+        self.assertIsNone(d["otthing_roomunit_room_t_c"])
+        self.assertIsNone(d["otthing_roomunit_ch_enable"])
+
+    def test_wrapped_roomunit_also_works(self):
+        # robuustheid: als een firmware-variant de roomunit-velden {"result","data"}-wrapt
+        d = mod.parse_payload(self._payload(room_set_t={"result": True, "data": 22.0}))
+        self.assertEqual(d["otthing_roomunit_set_t_c"], 22.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
