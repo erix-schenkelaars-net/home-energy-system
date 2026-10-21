@@ -82,6 +82,15 @@ def dbg(area, msg):
 DEFAULT_SCHEDULE = "05:00=20.0,06:00=20.5,07:00=21.0,19:00=19.0"
 
 
+def _hhmm_min(s, default=0):
+    """'HH:MM' -> minuten sinds middernacht; valt terug op `default` bij een typefout."""
+    try:
+        h, m = str(s).strip().split(":")
+        return int(h) * 60 + int(m)
+    except (ValueError, TypeError):
+        return default
+
+
 def parse_schedule(s):
     """'HH:MM=T,HH:MM=T,...' -> gesorteerde lijst [(minuten_sinds_middernacht, temp), ...].
     Ongeldige/lege entries worden overgeslagen (robuust tegen een typefout in .env)."""
@@ -131,6 +140,20 @@ def build_cfg():
         "ovr_threshold": float(os.environ.get("WP_OVERRIDE_THRESHOLD", "21.5")),
         "ovr_max":       float(os.environ.get("WP_OVERRIDE_MAX", "23.0")),
         "ovr_hold_s":    int(os.environ.get("WP_OVERRIDE_HOLD_S", "3600")),
+        # OVERLAY #1 (cold-scaled preheat) -> chSetTemp1. ceil < OTThing-flowMax (50) houdt overshoot
+        # fysiek onmogelijk; conservatieve defaults, met data te tunen (zie compute_flow_target).
+        "flow": {
+            "mild":          float(os.environ.get("WP_FLOW_MILD", "35")),        # flow bij mild_ref buiten
+            "mild_ref":      float(os.environ.get("WP_FLOW_MILD_REF", "10")),    # referentie-buitentemp
+            "slope":         float(os.environ.get("WP_FLOW_COLD_SLOPE", "0.6")), # °flow per °C kouder
+            "floor":         float(os.environ.get("WP_FLOW_FLOOR", "28")),
+            "ceil":          float(os.environ.get("WP_FLOW_CEIL", "48")),        # < flowMax 50
+            "preheat_start": _hhmm_min(os.environ.get("WP_PREHEAT_START", "05:00")),
+            "preheat_end":   _hhmm_min(os.environ.get("WP_PREHEAT_END",   "08:00")),
+            "preheat_boost": float(os.environ.get("WP_PREHEAT_BOOST", "4")),     # max extra °flow 's ochtends
+            "cold_ref":      float(os.environ.get("WP_PREHEAT_COLD_REF", "10")), # boost 0 bij/boven dit
+            "cold_span":     float(os.environ.get("WP_PREHEAT_COLD_SPAN", "12")),# koude-schaal-breedte
+        },
     }
 
 
@@ -196,6 +219,31 @@ def decide_with_override(now, thermostat_setp, state, cfg):
         mins = (until - now).total_seconds() / 60
         return state["ovr_target"], f"handmatige override {state['ovr_target']}°C (nog {mins:.0f}m)"
     return decide_setpoint(now, cfg)
+
+
+def compute_flow_target(now, outside, cfg):
+    """OVERLAY #1 — cold-scaled preheat. -> gewenste WP-aanvoertemp (chSetTemp1) als float, of None
+    als er geen betrouwbare buitentemp is (dan stuurt pi5new niet en blijft de OTThing-fallback-curve).
+
+    Doel: een MATIGE, continue aanvoer die vroeg draait i.p.v. de reactieve hoge catch-up die
+    overshoot+lockout gaf. 's Ochtends een KOUD-GESCHAALDE preheat-boost om de nacht-setback zacht
+    te herstellen. Alles gecapt < flowMax (fc['ceil']) → overshoot blijft fysiek onmogelijk.
+
+      baseline = mild + slope * (mild_ref - buiten)                     (weersafhankelijk)
+      preheat  = boost * clamp((cold_ref - buiten)/cold_span, 0, 1)     in [start, end], anders 0
+                 (kouder → meer boost, mild → 0)
+      flow     = clamp(baseline + preheat, floor, ceil)
+    """
+    if outside is None:
+        return None
+    fc = cfg["flow"]
+    base = fc["mild"] + fc["slope"] * (fc["mild_ref"] - outside)
+    boost = 0.0
+    mins = now.hour * 60 + now.minute
+    if fc["preheat_start"] <= mins < fc["preheat_end"] and fc["cold_span"] > 0:
+        cold = max(0.0, min(1.0, (fc["cold_ref"] - outside) / fc["cold_span"]))
+        boost = fc["preheat_boost"] * cold
+    return round(max(fc["floor"], min(fc["ceil"], base + boost)), 1)
 
 
 def parse_valve(payload):
@@ -516,15 +564,28 @@ def main():
                     f"-> gewenst={sp} ({reason})")
         publish_setpoint(sp, cfg)
 
-        # schone buitentemp (KNMI-forecast, huidig slot) -> outsideTemp/set, vervangt P60-inlaat
+        # schone buitentemp (KNMI-forecast, huidig slot) -> outsideTemp/set, vervangt P60-inlaat.
+        # Altijd lezen (ook voor overlay #1 hieronder); publiceren blijft gated door publish_outside.
+        ot = read_forecast_outside(cfg)
         if cfg["publish_outside"]:
-            ot = read_forecast_outside(cfg)
             if ot is not None:
                 dbg("CTRL", f"forecast-buiten (KNMI, huidig slot) = {ot} °C -> outsideTemp")
                 publish_outside(ot, cfg)
             else:
                 dbg("CTRL", "geen verse forecast-buitentemp (geen huidig slot / buiten bereik) "
                             "-> outsideTemp niet gepubliceerd")
+
+        # OVERLAY #1 (cold-scaled preheat): pi5new's gewenste WP-aanvoer. NOG DRY_RUN -> compute+log,
+        # publiceert chSetTemp1 NIET (stap 3b = actuatie met overrideFlow + watchdog). Gebruikt de
+        # forecast-buiten (de OTThing-buiten valt vaak op None in idle); val daarop terug.
+        ot_flow = ot if ot is not None else outside
+        flow_target = compute_flow_target(datetime.now(), ot_flow, cfg)
+        if flow_target is not None:
+            dbg("FLOW", f"[overlay#1] buiten={ot_flow}°C -> chSetTemp1={flow_target}°C "
+                        f"(DRY: nog niet gepubliceerd)")
+        else:
+            dbg("FLOW", "[overlay#1] geen betrouwbare buitentemp -> geen flow-target "
+                        "(OTThing-fallback-curve blijft gelden)")
 
         # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
         if cfg["valve_log"]:

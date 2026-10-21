@@ -382,5 +382,41 @@ class TestLiveSetpoint(unittest.TestCase):
         self.assertIsNone(wp.live_setpoint({}, now=now, max_age_s=90))
 
 
+class TestComputeFlowTarget(unittest.TestCase):
+    """Overlay #1: cold-scaled preheat -> chSetTemp1 (weersafhankelijk + ochtend-boost, gecapt < flowMax).
+    Defaults: mild35 @ref10, slope0.6, floor28, ceil48, preheat 05:00-08:00, boost4, cold_ref10, span12."""
+
+    def setUp(self):
+        self.cfg = wp.build_cfg()
+
+    def _dt(self, h, m=0):
+        return datetime(2026, 1, 15, h, m)
+
+    def test_none_outside_no_target(self):
+        self.assertIsNone(wp.compute_flow_target(self._dt(12), None, self.cfg))
+
+    def test_mild_midday_is_baseline(self):
+        self.assertEqual(wp.compute_flow_target(self._dt(12), 10.0, self.cfg), 35.0)   # @mild_ref
+
+    def test_colder_raises_flow(self):
+        self.assertEqual(wp.compute_flow_target(self._dt(12), 0.0, self.cfg), 41.0)    # 35 + 0.6*10
+
+    def test_capped_at_ceil(self):
+        self.assertEqual(wp.compute_flow_target(self._dt(12), -30.0, self.cfg), 48.0)  # nooit boven ceil
+
+    def test_floored_when_warm(self):
+        self.assertEqual(wp.compute_flow_target(self._dt(12), 25.0, self.cfg), 28.0)   # nooit onder floor
+
+    def test_preheat_boost_cold_morning(self):
+        # 06:00, buiten=-2 -> cold=1.0 -> boost=4; base=35+0.6*12=42.2 -> 46.2
+        self.assertAlmostEqual(wp.compute_flow_target(self._dt(6), -2.0, self.cfg), 46.2, places=1)
+
+    def test_no_boost_mild_morning(self):
+        self.assertEqual(wp.compute_flow_target(self._dt(6), 10.0, self.cfg), 35.0)    # cold=0 -> geen boost
+
+    def test_no_boost_outside_window(self):
+        self.assertEqual(wp.compute_flow_target(self._dt(12), 0.0, self.cfg), 41.0)    # middag = geen preheat
+
+
 if __name__ == "__main__":
     unittest.main()
