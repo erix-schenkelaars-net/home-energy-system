@@ -173,6 +173,7 @@ class TestParsePayload(unittest.TestCase):
                     "roomsetpoint": 21.0,
                     "returnTemp": 40.0,
                     "flowMin": 30.0,
+                    "flowsetpoint": 33.4,
                     "ovrdOn": False,
                     "ovrdTemp": False,
                     "suspended": False,
@@ -213,6 +214,10 @@ class TestParsePayload(unittest.TestCase):
     def test_heater_action(self):
         result = mod.parse_payload(self._full_payload())
         self.assertEqual(result["honeywell_ot_heater0_action"], "heating")
+
+    def test_flow_setpoint(self):
+        result = mod.parse_payload(self._full_payload())
+        self.assertAlmostEqual(result["honeywell_ot_flow_setpoint_c"], 33.4)
 
     def test_empty_payload_no_crash(self):
         result = mod.parse_payload({})

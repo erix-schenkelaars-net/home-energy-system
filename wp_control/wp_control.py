@@ -60,6 +60,7 @@ import sys
 import threading
 from datetime import datetime, timedelta
 from time import sleep
+from urllib.request import Request, urlopen
 
 import mysql.connector
 import paho.mqtt.publish as mqtt_publish
@@ -108,6 +109,37 @@ def parse_schedule(s):
     return out
 
 
+def parse_curve(s):
+    """'buiten:flow,buiten:flow,...' -> lijst [(buiten, flow), ...] AFLOPEND op buitentemp.
+    Ongeldige entries worden overgeslagen (robuust tegen een typefout in .env)."""
+    out = []
+    for part in (s or "").split(","):
+        o, sep, f = part.strip().partition(":")
+        if not sep:
+            continue
+        try:
+            out.append((float(o), float(f)))
+        except (ValueError, TypeError):
+            continue
+    out.sort(key=lambda p: p[0], reverse=True)
+    return out
+
+
+def curve_flow(outside, pts):
+    """PUUR: lineaire interpolatie van de weercurve -> gewenste aanvoer (°C), of None bij geen
+    buitentemp / lege curve. Buiten het bereik: clamp op het dichtstbijzijnde punt (geen extrapolatie)."""
+    if outside is None or not pts:
+        return None
+    if outside >= pts[0][0]:
+        return pts[0][1]
+    if outside <= pts[-1][0]:
+        return pts[-1][1]
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):      # x1 > x2 (aflopend)
+        if x2 <= outside <= x1:
+            return round(y1 + (outside - x1) * (y2 - y1) / (x2 - x1), 1)
+    return None
+
+
 def build_cfg():
     base = os.environ.get("MQTT_OTTHING_TOPIC", "otthing/CE150C/state")
     base = base[:-len("/state")] if base.endswith("/state") else base
@@ -128,6 +160,17 @@ def build_cfg():
         "schedule":  parse_schedule(os.environ.get("WP_SCHEDULE", DEFAULT_SCHEDULE)),
         "interval":  int(os.environ.get("WP_CHECK_INTERVAL", "300")),
         "sched_table": os.environ.get("WP_SCHED_TABLE", "battery_schedule"),
+        # onafhankelijke HA-buitenvoeler (user 2026-10-22) = 1e keus voor outsideTemp; KNMI = fallback.
+        # entity-id staat in .env (WP_OUTSIDE_ENTITY), niet in code — publieke repo.
+        "ha_url":     os.environ.get("HA_URL"),
+        "ha_token":   os.environ.get("HA_TOKEN"),
+        "ha_entity":  os.environ.get("WP_OUTSIDE_ENTITY", "sensor.outdoor_temperature"),
+        "ha_max_age": int(os.environ.get("WP_OUTSIDE_MAX_AGE_S", "7200")),
+        # 6-punts weercurve (user 2026-10-22) "buiten:aanvoer,..." = wat pi5new ZOU sturen (shadow,
+        # nog DRY). Zelfde curve als in de OTThing; verschil met de OTThing-target = demping + later
+        # preheat/prijs/PV. Zie [[heatpump-control-lever]].
+        "curve": parse_curve(os.environ.get("WP_FLOW_CURVE",
+                                            "20:28,10:35,0:42,-10:48,-25:50,-30:50")),
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
         "out_max":   float(os.environ.get("WP_OUTSIDE_MAX", "50")),
@@ -323,6 +366,53 @@ def read_forecast_outside(cfg):
     except Exception as e:
         dbg("DB", f"read_forecast_outside faalde: {e}")
         return None
+
+
+def parse_ha_state(text, now_epoch, max_age_s, out_min, out_max):
+    """PUUR: een HA /api/states/<entity>-JSON -> buitentemp (float, 1 decimaal), of None bij:
+    ongeldige JSON / niet-numerieke state ('unavailable'/'unknown') / buiten [out_min,out_max] /
+    ouder dan max_age_s (last_reported, anders last_updated). Crasht nooit en geeft nooit een valse
+    of bevroren buitentemp door. Dit is de kern die de test aanvalt (read_ha_outside = alleen I/O)."""
+    try:
+        d = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    try:
+        t = float(d.get("state"))
+    except (TypeError, ValueError):
+        return None                        # 'unavailable' / 'unknown' / None
+    if not (out_min <= t <= out_max):
+        return None
+    stamp = d.get("last_reported") or d.get("last_updated")
+    if stamp:
+        try:
+            if now_epoch - datetime.fromisoformat(stamp).timestamp() > max_age_s:
+                return None                # te oud -> geen bevroren waarde doorgeven
+        except (ValueError, TypeError):
+            pass                           # onparseerbare stempel -> waarde niet weggooien
+    return round(t, 1)
+
+
+def read_ha_outside(cfg):
+    """Buitentemp uit de onafhankelijke HA-sensor (cfg['ha_entity']) via de HA REST-API.
+    Best-effort -> None (dan valt de lus terug op de KNMI-forecast). De ECHTE voeler i.p.v. de
+    ochtends-onvolledige KNMI en de bedrijfs-vervuilde P60-inlaat (user 2026-10-22). stdlib urllib,
+    geen extra dependency; HA_URL/HA_TOKEN komen uit ../.env (al in de container)."""
+    url, token = cfg.get("ha_url"), cfg.get("ha_token")
+    if not url or not token:
+        return None
+    try:
+        req = Request(f"{url.rstrip('/')}/api/states/{cfg['ha_entity']}",
+                      headers={"Authorization": f"Bearer {token}"})
+        with urlopen(req, timeout=5) as r:
+            text = r.read().decode()
+    except Exception as e:
+        dbg("HA", f"read_ha_outside faalde: {e}")
+        return None
+    return parse_ha_state(text, datetime.now().timestamp(), cfg["ha_max_age"],
+                          cfg["out_min"], cfg["out_max"])
 
 
 def _mqtt_publish(topic, payload, cfg, dry_run, retain=False):
@@ -530,6 +620,42 @@ def write_valve(cfg, now=None):
         dbg("VALVE", f"write_valve faalde: {e}")
 
 
+# ── shadow-logging (wat pi5new ZOU sturen; DRY-vergelijking met de OTThing) ───────────────
+def ensure_shadow_columns(cfg):
+    """Idempotent de wp_shadow_*-kolommen in energy (MariaDB ADD COLUMN IF NOT EXISTS). Best-effort."""
+    try:
+        c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
+        cur = c.cursor()
+        cur.execute(f"ALTER TABLE {cfg['db_table']} "
+                    f"ADD COLUMN IF NOT EXISTS `wp_shadow_room_t_c` float DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_shadow_room_set_c` float DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_shadow_outside_c` float DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_shadow_flow_target_c` float DEFAULT NULL")
+        c.commit(); cur.close(); c.close()
+        dbg("SHADOW", "schema OK (wp_shadow_* aanwezig)")
+    except Exception as e:
+        dbg("SHADOW", f"ensure_shadow_columns faalde: {e}")
+
+
+def write_shadow(cfg, room, room_set, outside, flow_target, now=None):
+    """Schrijf wat pi5new ZOU sturen naar de energy-bucket (wp_shadow_*): de ingelezen kamer + setpoint
+    (= pi5new's inputs) en de curve-aanvoer-target (NIET naar de WP verstuurd). Zo vergelijken we
+    overnacht met de OTThing (honeywell_ot_flow_setpoint_c) zonder de verwarming aan te raken.
+    Schrijft alleen eigen kolommen (upsert), dus niemand overschrijft elkaars data. Best-effort."""
+    now = now or datetime.now()
+    cols = ["wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c", "wp_shadow_flow_target_c"]
+    try:
+        c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
+        cur = c.cursor()
+        cur.execute(er.upsert_sql(cols, cfg["db_table"]),
+                    (er.bucket(now), room, room_set, outside, flow_target))
+        c.commit(); cur.close(); c.close()
+        dbg("SHADOW", f"kamer={room} set={room_set} buiten={outside} -> flow_target={flow_target} "
+                      f"(DRY, niet verstuurd)")
+    except Exception as e:
+        dbg("SHADOW", f"write_shadow faalde: {e}")
+
+
 # ── hoofdlus ─────────────────────────────────────────────────────────────────────────
 def main():
     cfg = build_cfg()
@@ -550,6 +676,7 @@ def main():
     if cfg["valve_log"]:
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
+    ensure_shadow_columns(cfg)           # shadow-vergelijking met de OTThing (DRY)
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
     ovr_state = {"ovr_until": None, "ovr_target": None, "last_setp": None}
     while True:
@@ -566,10 +693,14 @@ def main():
 
         # schone buitentemp (KNMI-forecast, huidig slot) -> outsideTemp/set, vervangt P60-inlaat.
         # Altijd lezen (ook voor overlay #1 hieronder); publiceren blijft gated door publish_outside.
-        ot = read_forecast_outside(cfg)
+        ot = read_ha_outside(cfg)                    # 1e keus: onafhankelijke HA-buitenvoeler
+        ot_src = "HA-sensor"
+        if ot is None:
+            ot = read_forecast_outside(cfg)          # fallback: KNMI-forecast (huidig slot)
+            ot_src = "KNMI-fallback"
         if cfg["publish_outside"]:
             if ot is not None:
-                dbg("CTRL", f"forecast-buiten (KNMI, huidig slot) = {ot} °C -> outsideTemp")
+                dbg("CTRL", f"buitentemp ({ot_src}) = {ot} °C -> outsideTemp")
                 publish_outside(ot, cfg)
             else:
                 dbg("CTRL", "geen verse forecast-buitentemp (geen huidig slot / buiten bereik) "
@@ -586,6 +717,11 @@ def main():
         else:
             dbg("FLOW", "[overlay#1] geen betrouwbare buitentemp -> geen flow-target "
                         "(OTThing-fallback-curve blijft gelden)")
+
+        # SHADOW: wat pi5new ZOU sturen volgens de 6-punts weercurve (DRY). room/sp_now = pi5new's
+        # inputs; curve_flow(ot) = de aanvoer-target. Overnacht vergelijken met honeywell_ot_flow_setpoint_c.
+        write_shadow(cfg, room=room, room_set=sp_now, outside=ot,
+                     flow_target=curve_flow(ot, cfg["curve"]))
 
         # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
         if cfg["valve_log"]:

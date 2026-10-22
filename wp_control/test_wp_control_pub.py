@@ -5,6 +5,7 @@ Stubt mysql.connector + paho VÓÓR de import, zet neutrale env, en test tegen d
 functies (decide_setpoint / preheat_lead / build_cfg / publish_setpoint / publish_outside /
 read_forecast_outside). Geen namaak-logica in de test — dat zou voor eeuwig slagen en niets bewijzen.
 """
+import json
 import os
 import sys
 import unittest
@@ -161,6 +162,103 @@ class TestReadForecastOutside(unittest.TestCase):
     def test_no_current_slot_row_is_none(self):
         self._set_fetchone(None)                         # optimizer-gat: geen huidig slot -> None
         self.assertIsNone(wp.read_forecast_outside(wp.build_cfg()))
+
+
+class TestHaOutside(unittest.TestCase):
+    """HA-buitenvoeler = 1e keus voor outsideTemp (KNMI = fallback). parse_ha_state = de pure kern."""
+
+    def _json(self, state, stamp=None):
+        d = {"state": state}
+        if stamp is not None:
+            d["last_reported"] = stamp
+        return json.dumps(d)
+
+    def _now(self):
+        return datetime(2026, 1, 5, 12, 0).timestamp()
+
+    def test_fresh_plausible_rounds_1dec(self):
+        stamp = datetime(2026, 1, 5, 11, 55).astimezone().isoformat()
+        self.assertEqual(wp.parse_ha_state(self._json("10.07", stamp), self._now(), 7200, -40, 50), 10.1)
+
+    def test_missing_stamp_still_accepts(self):
+        self.assertEqual(wp.parse_ha_state(self._json("8.5"), self._now(), 7200, -40, 50), 8.5)
+
+    def test_unavailable_is_none(self):
+        self.assertIsNone(wp.parse_ha_state(self._json("unavailable"), self._now(), 7200, -40, 50))
+
+    def test_implausible_is_none(self):
+        self.assertIsNone(wp.parse_ha_state(self._json("999"), self._now(), 7200, -40, 50))
+
+    def test_stale_is_none(self):
+        stamp = datetime(2026, 1, 5, 9, 0).astimezone().isoformat()     # 3 u oud > 7200 s
+        self.assertIsNone(wp.parse_ha_state(self._json("10.0", stamp), self._now(), 7200, -40, 50))
+
+    def test_bad_json_is_none(self):
+        self.assertIsNone(wp.parse_ha_state("not json", self._now(), 7200, -40, 50))
+
+    def test_build_cfg_ha_defaults(self):
+        c = wp.build_cfg()
+        self.assertEqual(c["ha_entity"], "sensor.outdoor_temperature")  # generieke default (echte = .env)
+        self.assertEqual(c["ha_max_age"], 7200)
+
+    def test_read_ha_outside_no_creds_is_none(self):
+        self.assertIsNone(wp.read_ha_outside(wp.build_cfg()))           # geen HA_URL/HA_TOKEN in test-env
+
+
+class TestCurveFlow(unittest.TestCase):
+    """6-punts weercurve -> pi5new's shadow-aanvoer-target (DRY; vergelijk met de OTThing)."""
+
+    def setUp(self):
+        self.pts = wp.parse_curve("20:28,10:35,0:42,-10:48,-25:50,-30:50")
+
+    def test_parse_sorted_descending(self):
+        self.assertEqual(self.pts[0], (20.0, 28.0))
+        self.assertEqual(self.pts[-1], (-30.0, 50.0))
+
+    def test_on_a_point(self):
+        self.assertEqual(wp.curve_flow(0.0, self.pts), 42.0)
+
+    def test_interpolates(self):
+        self.assertEqual(wp.curve_flow(5.0, self.pts), 38.5)     # tussen 10:35 en 0:42
+
+    def test_clamp_warm(self):
+        self.assertEqual(wp.curve_flow(25.0, self.pts), 28.0)    # boven bereik -> warmste punt
+
+    def test_clamp_cold(self):
+        self.assertEqual(wp.curve_flow(-40.0, self.pts), 50.0)   # onder bereik -> koudste punt
+
+    def test_none_outside_is_none(self):
+        self.assertIsNone(wp.curve_flow(None, self.pts))
+
+    def test_empty_curve_is_none(self):
+        self.assertIsNone(wp.curve_flow(5.0, []))
+
+    def test_build_cfg_curve_default(self):
+        c = wp.build_cfg()
+        self.assertEqual(len(c["curve"]), 6)
+        self.assertEqual(c["curve"][0], (20.0, 28.0))
+        self.assertEqual(c["curve"][2], (0.0, 42.0))
+
+
+class TestWriteShadow(unittest.TestCase):
+    """wp_shadow_*: wat pi5new ZOU sturen; schrijft ALLEEN eigen kolommen (upsert)."""
+
+    def setUp(self):
+        self.exec = wp.mysql.connector.connect.return_value.cursor.return_value.execute
+        self.exec.reset_mock()
+
+    def test_shadow_upsert_own_columns(self):
+        now = datetime(2026, 1, 5, 10, 3, 12)
+        wp.write_shadow(wp.build_cfg(), room=21.2, room_set=21.0, outside=13.7,
+                        flow_target=32.4, now=now)
+        self.exec.assert_called_once()
+        sql, params = self.exec.call_args.args
+        for col in ("wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c",
+                    "wp_shadow_flow_target_c"):
+            self.assertIn(col, sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", sql)                 # alleen eigen kolommen
+        self.assertEqual(params[0], datetime(2026, 1, 5, 10, 0))      # bucket -> 10:00
+        self.assertEqual(params[1:], (21.2, 21.0, 13.7, 32.4))
 
 
 class TestParseValve(unittest.TestCase):

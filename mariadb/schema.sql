@@ -181,6 +181,15 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `honeywell_ot_heater0_room_setpoint_c` float       DEFAULT NULL,
   `honeywell_ot_heater0_room_t_c`       float        DEFAULT NULL,
   `honeywell_ot_heater0_suspended`      tinyint(1)   DEFAULT NULL,
+  -- OTThing-BEREKENDE + naar de WP gestuurde aanvoer-target (curve-output). In Repeater+override
+  -- vervangt dit de Honeywell-TSet richting de WP (read_otthing). Shadow-paar met wp_shadow_flow_target_c.
+  `honeywell_ot_flow_setpoint_c`        float        DEFAULT NULL COMMENT 'OTThing curve-output = WP-aanvoer-target °C (heatercircuit.flowsetpoint)',
+  -- wp_shadow_*: wat pi5new ZOU sturen, DRY (wp_control). Overnacht-vergelijking met de OTThing vóór de
+  -- chSetTemp1-sturing live gaat; room/set = pi5new's inputs, flow_target = de 6-punts weercurve.
+  `wp_shadow_room_t_c`                  float        DEFAULT NULL COMMENT 'pi5new input: gemeten kamertemp °C (= roomunit.room_t)',
+  `wp_shadow_room_set_c`                float        DEFAULT NULL COMMENT 'pi5new input: kamer-setpoint °C (= Honeywell roomunit.room_set_t)',
+  `wp_shadow_outside_c`                 float        DEFAULT NULL COMMENT 'pi5new input: buitentemp °C waarop de curve rekent (HA-sensor, KNMI-fallback)',
+  `wp_shadow_flow_target_c`             float        DEFAULT NULL COMMENT 'pi5new BEREKENDE aanvoer-target °C (6-punts curve, NIET naar de WP verstuurd)',
   `honeywell_ot_thermo_ch_enable`       tinyint(1)   DEFAULT NULL COMMENT 'CH enabled',
   `honeywell_ot_thermo_ch_set_t_c`      float        DEFAULT NULL COMMENT 'Thermostat CH setpoint °C',
   `honeywell_ot_thermo_max_rel_mod_perc` float       DEFAULT NULL,

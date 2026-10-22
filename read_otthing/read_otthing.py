@@ -186,6 +186,10 @@ def parse_payload(p):
         "honeywell_ot_heater0_override_on":        boolean(hc0.get("ovrdOn")),
         "honeywell_ot_heater0_override_flow":      boolean(hc0.get("ovrdTemp")),
         "honeywell_ot_heater0_suspended":          boolean(hc0.get("suspended")),
+        # de OTThing-BEREKENDE + naar de WP gestuurde aanvoer-target (curve-output, °C). In
+        # Repeater+override vervangt dit de Honeywell-TSet richting de WP. Shadow-vergelijking met
+        # wp_control's eigen curve-target (wp_shadow_flow_target_c). Zie [[heatpump-control-lever]].
+        "honeywell_ot_flow_setpoint_c":            flt(hc0.get("flowsetpoint")),
 
         # --- roomunit = de FYSIEKE Honeywell-klokthermostaat (OTThing slave-interface, Master-mode).
         #     DIT is in Master de thermostaat die de mens bedient; de master-groep hierboven is de
