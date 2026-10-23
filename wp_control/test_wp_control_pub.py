@@ -250,16 +250,35 @@ class TestWriteShadow(unittest.TestCase):
     def test_shadow_upsert_own_columns(self):
         now = datetime(2026, 1, 5, 10, 3, 12)
         wp.write_shadow(wp.build_cfg(), room=21.2, room_set=21.0, outside=13.7,
-                        flow_target=32.4, heat=True, now=now)
+                        flow_target=32.4, heat=True, boost=2.0, now=now)
         self.exec.assert_called_once()
         sql, params = self.exec.call_args.args
         for col in ("wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c",
-                    "wp_shadow_flow_target_c"):
+                    "wp_shadow_flow_target_c", "wp_cmd_heat", "wp_cmd_boost_c"):
             self.assertIn(col, sql)
         self.assertIn("ON DUPLICATE KEY UPDATE", sql)                 # alleen eigen kolommen
-        self.assertIn("wp_cmd_heat", sql)
         self.assertEqual(params[0], datetime(2026, 1, 5, 10, 0))      # bucket -> 10:00
-        self.assertEqual(params[1:], (21.2, 21.0, 13.7, 32.4, 1))     # heat=True -> 1
+        self.assertEqual(params[1:], (21.2, 21.0, 13.7, 32.4, 1, 2.0))  # heat=True -> 1, boost 2.0
+
+
+class TestRoomCompBoost(unittest.TestCase):
+    """P-room-compensatie: extra aanvoer bij kamer-achterstand, gecapt op boost_max; 0 op/boven setpoint."""
+
+    def test_boost_when_below(self):
+        self.assertEqual(wp.room_comp_boost(20.7, 22.5, 4.0, 10.0), 7.2)    # 4 * 1.8
+
+    def test_zero_at_setpoint(self):
+        self.assertEqual(wp.room_comp_boost(21.0, 21.0, 4.0, 10.0), 0.0)
+
+    def test_zero_above_setpoint(self):
+        self.assertEqual(wp.room_comp_boost(22.0, 21.0, 4.0, 10.0), 0.0)
+
+    def test_capped_at_max(self):
+        self.assertEqual(wp.room_comp_boost(16.0, 22.0, 4.0, 10.0), 10.0)   # 4*6=24 -> cap 10
+
+    def test_missing_data_is_zero(self):
+        self.assertEqual(wp.room_comp_boost(None, 21.0, 4.0, 10.0), 0.0)
+        self.assertEqual(wp.room_comp_boost(21.0, None, 4.0, 10.0), 0.0)
 
 
 class TestDecideHeat(unittest.TestCase):

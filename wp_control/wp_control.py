@@ -157,6 +157,19 @@ def decide_heat(room, setpoint, state, on_below=0.2, off_above=0.3):
     return bool(state["heat"])
 
 
+def room_comp_boost(room, setpoint, kp, boost_max):
+    """PUUR: P-room-compensatie -> extra aanvoer (°C) bovenop de curve. boost = clamp(kp*(setpoint -
+    kamer), 0, boost_max). Alleen positief (kamer onder setpoint); 0 als op/boven setpoint of bij
+    ontbrekende data. Zo trekt een setpoint-sprong de aanvoer omhoog i.p.v. op de curve te blijven;
+    bij nadering krimpt de boost vanzelf naar 0 (steady-state = de curve)."""
+    if room is None or setpoint is None:
+        return 0.0
+    err = setpoint - room
+    if err <= 0:
+        return 0.0
+    return round(min(kp * err, boost_max), 1)
+
+
 def build_cfg():
     base = os.environ.get("MQTT_OTTHING_TOPIC", "otthing/CE150C/state")
     base = base[:-len("/state")] if base.endswith("/state") else base
@@ -194,6 +207,11 @@ def build_cfg():
         "control_live":   os.environ.get("WP_CONTROL_LIVE", "0") not in ("0", "false", "False", ""),
         "heat_on_below":  float(os.environ.get("WP_HEAT_ON_BELOW", "0.2")),
         "heat_off_above": float(os.environ.get("WP_HEAT_OFF_ABOVE", "0.3")),
+        # room-compensatie (P): extra aanvoer bovenop de curve bij een kamer-achterstand, zodat een
+        # setpoint-sprong echt sneller opwarmt (anders blijft de aanvoer = curve). Gecapt op flow_cap.
+        "rc_kp":    float(os.environ.get("WP_ROOMCOMP_KP", "4")),
+        "rc_max":   float(os.environ.get("WP_ROOMCOMP_MAX", "10")),
+        "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
         "out_max":   float(os.environ.get("WP_OUTSIDE_MAX", "50")),
@@ -654,27 +672,28 @@ def ensure_shadow_columns(cfg):
                     f"ADD COLUMN IF NOT EXISTS `wp_shadow_room_set_c` float DEFAULT NULL, "
                     f"ADD COLUMN IF NOT EXISTS `wp_shadow_outside_c` float DEFAULT NULL, "
                     f"ADD COLUMN IF NOT EXISTS `wp_shadow_flow_target_c` float DEFAULT NULL, "
-                    f"ADD COLUMN IF NOT EXISTS `wp_cmd_heat` tinyint(1) DEFAULT NULL")
+                    f"ADD COLUMN IF NOT EXISTS `wp_cmd_heat` tinyint(1) DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_cmd_boost_c` float DEFAULT NULL")
         c.commit(); cur.close(); c.close()
-        dbg("SHADOW", "schema OK (wp_shadow_* + wp_cmd_heat aanwezig)")
+        dbg("SHADOW", "schema OK (wp_shadow_* + wp_cmd_heat + wp_cmd_boost_c aanwezig)")
     except Exception as e:
         dbg("SHADOW", f"ensure_shadow_columns faalde: {e}")
 
 
-def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, now=None):
+def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, boost=None, now=None):
     """Log naar de energy-bucket wat pi5new doet/zou-doen: de ingelezen kamer + setpoint (inputs),
-    de curve-aanvoer-target, en de aan/uit-beslissing (wp_cmd_heat). Bij control_live=0 is dit de
-    shadow (niets verstuurd); bij live is het wat we ECHT commandeerden. Schrijft alleen eigen
-    kolommen (upsert). Best-effort."""
+    de aanvoer-target (curve + room-comp), de aan/uit-beslissing (wp_cmd_heat) en de toegepaste
+    room-comp-boost (wp_cmd_boost_c, om Kp te tunen). Bij control_live=0 = shadow; bij live = wat
+    we ECHT commandeerden. Schrijft alleen eigen kolommen (upsert). Best-effort."""
     now = now or datetime.now()
     cols = ["wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c",
-            "wp_shadow_flow_target_c", "wp_cmd_heat"]
+            "wp_shadow_flow_target_c", "wp_cmd_heat", "wp_cmd_boost_c"]
     try:
         c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
         cur = c.cursor()
         cur.execute(er.upsert_sql(cols, cfg["db_table"]),
                     (er.bucket(now), room, room_set, outside, flow_target,
-                     None if heat is None else int(heat)))
+                     None if heat is None else int(heat), boost))
         c.commit(); cur.close(); c.close()
     except Exception as e:
         dbg("SHADOW", f"write_shadow faalde: {e}")
@@ -713,7 +732,7 @@ def main():
                 f"(cap {cfg['ovr_max']}°C) voor {cfg['ovr_hold_s']//60}m, dan nominaal")
     dbg("CONF", f"pi5new-REGELING = {'LIVE — STUURT DE WP (chMode1/chSetTemp1)!' if cfg['control_live'] else 'DROOG (logt alleen)'}"
                 f" | heat als kamer < setpoint-{cfg['heat_on_below']}, uit als kamer >= setpoint+{cfg['heat_off_above']}"
-                f" | curve {len(cfg['curve'])}pt (cap {cfg['curve'][-1][1] if cfg['curve'] else '?'}°C)")
+                f" | curve {len(cfg['curve'])}pt + room-comp P (Kp={cfg['rc_kp']}, max +{cfg['rc_max']}°C), cap {cfg['flow_cap']}°C")
     if cfg["valve_log"]:
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
@@ -763,12 +782,15 @@ def main():
         # pi5new-REGELING: beslis aan/uit (hysterese rond het Honeywell-setpoint sp_now) + de curve-
         # aanvoer op de HA-buitentemp, stuur de WP (chMode1/chSetTemp1), en log wat we doen.
         # control_live=0 -> alleen loggen (shadow). room/sp_now komen uit de roomunit (de Honeywell).
-        flow = curve_flow(ot, cfg["curve"])
+        base = curve_flow(ot, cfg["curve"])
+        boost = room_comp_boost(room, sp_now, cfg["rc_kp"], cfg["rc_max"])
+        flow = None if base is None else round(min(base + boost, cfg["flow_cap"]), 1)
         heat = decide_heat(room, sp_now, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
         command_wp(cfg, heat, flow)
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
-                    f"setpoint={sp_now} buiten={ot} -> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
-        write_shadow(cfg, room=room, room_set=sp_now, outside=ot, flow_target=flow, heat=heat)
+                    f"setpoint={sp_now} buiten={ot} -> curve={base}+boost={boost} -> "
+                    f"{'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
+        write_shadow(cfg, room=room, room_set=sp_now, outside=ot, flow_target=flow, heat=heat, boost=boost)
 
         # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
         if cfg["valve_log"]:

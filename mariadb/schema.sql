@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `wp_shadow_outside_c`                 float        DEFAULT NULL COMMENT 'pi5new input: buitentemp °C waarop de curve rekent (HA-sensor, KNMI-fallback)',
   `wp_shadow_flow_target_c`             float        DEFAULT NULL COMMENT 'pi5new BEREKENDE aanvoer-target °C (6-punts curve; bij control_live=1 ook verstuurd via chSetTemp1)',
   `wp_cmd_heat`                         tinyint(1)   DEFAULT NULL COMMENT 'pi5new aan/uit-besluit: 1=heat gecommandeerd (chMode1=heat), 0=off (chMode1=off)',
+  `wp_cmd_boost_c`                      float        DEFAULT NULL COMMENT 'pi5new room-comp P-boost °C bovenop de curve (Kp*(setpoint-kamer), gecapt op WP_ROOMCOMP_MAX)',
   `honeywell_ot_thermo_ch_enable`       tinyint(1)   DEFAULT NULL COMMENT 'CH enabled',
   `honeywell_ot_thermo_ch_set_t_c`      float        DEFAULT NULL COMMENT 'Thermostat CH setpoint °C',
   `honeywell_ot_thermo_max_rel_mod_perc` float       DEFAULT NULL,
