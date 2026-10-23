@@ -14,6 +14,10 @@ services:
       # (niet in automations.yaml/configuration.yaml; OTThing stond op OT-slave, nu op MQTT gezet),
       # dus wp_control is de enige bron. roomSetpoint blijft droog via WP_DRY_RUN.
       WP_OUTSIDE_DRY_RUN: "0"
+      # pi5new REGELT de WP LIVE (2026-10-23): beslist aan/uit (hysterese rond Honeywell-setpoint) +
+      # stuurt de aanvoer via chMode1/chSetTemp1. Vereist overrideChFlow1=ON op de OTThing. Terug naar
+      # shadow = "0". roomSetpoint (WP_DRY_RUN) blijft droog/ongebruikt in Repeater.
+      WP_CONTROL_LIVE: "1"
     volumes:
       - .:/app
       - ../common:/app/common:ro

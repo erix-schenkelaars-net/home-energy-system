@@ -140,6 +140,23 @@ def curve_flow(outside, pts):
     return None
 
 
+def decide_heat(room, setpoint, state, on_below=0.2, off_above=0.3):
+    """PUUR + stateful: beslist WP aan/uit met hysterese rond het Honeywell-setpoint (= de wens van
+    de vrouw). Heat als kamer <= setpoint-on_below; stop als kamer >= setpoint+off_above; daartussen
+    de vorige stand aanhouden (geen snel pendelen). Bij ontbrekende data: vorige stand (een
+    transiënte leesfout mag niet flippen), default UIT. `state` = {heat: bool} dat tussen cycli
+    bewaard blijft. DIT lost de forced-heating van 10-22-avond op: kamer ruim boven setpoint -> uit."""
+    if room is None or setpoint is None:
+        return bool(state.get("heat", False))
+    if room <= setpoint - on_below:
+        state["heat"] = True
+    elif room >= setpoint + off_above:
+        state["heat"] = False
+    elif "heat" not in state:
+        state["heat"] = room < setpoint
+    return bool(state["heat"])
+
+
 def build_cfg():
     base = os.environ.get("MQTT_OTTHING_TOPIC", "otthing/CE150C/state")
     base = base[:-len("/state")] if base.endswith("/state") else base
@@ -171,6 +188,12 @@ def build_cfg():
         # preheat/prijs/PV. Zie [[heatpump-control-lever]].
         "curve": parse_curve(os.environ.get("WP_FLOW_CURVE",
                                             "20:28,10:35,0:42,-10:48,-25:50,-30:50")),
+        # pi5new-REGELING: wij beslissen aan/uit + aanvoer en sturen de WP (chMode1/chSetTemp1).
+        # control_live=0 -> alleen loggen (shadow); 1 -> echt sturen. Hysterese rond het Honeywell-
+        # setpoint voorkomt pendelen. overrideChFlow1 moet AAN staan zodat chSetTemp1 wint.
+        "control_live":   os.environ.get("WP_CONTROL_LIVE", "0") not in ("0", "false", "False", ""),
+        "heat_on_below":  float(os.environ.get("WP_HEAT_ON_BELOW", "0.2")),
+        "heat_off_above": float(os.environ.get("WP_HEAT_OFF_ABOVE", "0.3")),
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
         "out_max":   float(os.environ.get("WP_OUTSIDE_MAX", "50")),
@@ -630,30 +653,45 @@ def ensure_shadow_columns(cfg):
                     f"ADD COLUMN IF NOT EXISTS `wp_shadow_room_t_c` float DEFAULT NULL, "
                     f"ADD COLUMN IF NOT EXISTS `wp_shadow_room_set_c` float DEFAULT NULL, "
                     f"ADD COLUMN IF NOT EXISTS `wp_shadow_outside_c` float DEFAULT NULL, "
-                    f"ADD COLUMN IF NOT EXISTS `wp_shadow_flow_target_c` float DEFAULT NULL")
+                    f"ADD COLUMN IF NOT EXISTS `wp_shadow_flow_target_c` float DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_cmd_heat` tinyint(1) DEFAULT NULL")
         c.commit(); cur.close(); c.close()
-        dbg("SHADOW", "schema OK (wp_shadow_* aanwezig)")
+        dbg("SHADOW", "schema OK (wp_shadow_* + wp_cmd_heat aanwezig)")
     except Exception as e:
         dbg("SHADOW", f"ensure_shadow_columns faalde: {e}")
 
 
-def write_shadow(cfg, room, room_set, outside, flow_target, now=None):
-    """Schrijf wat pi5new ZOU sturen naar de energy-bucket (wp_shadow_*): de ingelezen kamer + setpoint
-    (= pi5new's inputs) en de curve-aanvoer-target (NIET naar de WP verstuurd). Zo vergelijken we
-    overnacht met de OTThing (honeywell_ot_flow_setpoint_c) zonder de verwarming aan te raken.
-    Schrijft alleen eigen kolommen (upsert), dus niemand overschrijft elkaars data. Best-effort."""
+def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, now=None):
+    """Log naar de energy-bucket wat pi5new doet/zou-doen: de ingelezen kamer + setpoint (inputs),
+    de curve-aanvoer-target, en de aan/uit-beslissing (wp_cmd_heat). Bij control_live=0 is dit de
+    shadow (niets verstuurd); bij live is het wat we ECHT commandeerden. Schrijft alleen eigen
+    kolommen (upsert). Best-effort."""
     now = now or datetime.now()
-    cols = ["wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c", "wp_shadow_flow_target_c"]
+    cols = ["wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c",
+            "wp_shadow_flow_target_c", "wp_cmd_heat"]
     try:
         c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
         cur = c.cursor()
         cur.execute(er.upsert_sql(cols, cfg["db_table"]),
-                    (er.bucket(now), room, room_set, outside, flow_target))
+                    (er.bucket(now), room, room_set, outside, flow_target,
+                     None if heat is None else int(heat)))
         c.commit(); cur.close(); c.close()
-        dbg("SHADOW", f"kamer={room} set={room_set} buiten={outside} -> flow_target={flow_target} "
-                      f"(DRY, niet verstuurd)")
     except Exception as e:
         dbg("SHADOW", f"write_shadow faalde: {e}")
+
+
+def command_wp(cfg, heat, flow):
+    """LIVE WP-aansturing door pi5new. heat -> chMode1=heat + chSetTemp1=<flow> (de WP volgt dat,
+    want overrideChFlow1 staat AAN); uit -> chMode1=off (WP-target -> 0 = veilige default, WP uit).
+    Gated door cfg['control_live'] (0 = alleen loggen). retain=True: de OTThing houdt de stand tussen
+    cycli. Best-effort via _mqtt_publish."""
+    ch = cfg["channel"]
+    dry = not cfg["control_live"]
+    if heat and flow is not None:
+        _mqtt_publish(f"{cfg['base_topic']}/chMode{ch}/set", "heat", cfg, dry, retain=True)
+        _mqtt_publish(f"{cfg['base_topic']}/chSetTemp{ch}/set", str(flow), cfg, dry, retain=True)
+    else:
+        _mqtt_publish(f"{cfg['base_topic']}/chMode{ch}/set", "off", cfg, dry, retain=True)
 
 
 # ── hoofdlus ─────────────────────────────────────────────────────────────────────────
@@ -673,12 +711,16 @@ def main():
                    if cfg["valve_log"] else ""))
     dbg("CONF", f"handmatige override: thermostaat > {cfg['ovr_threshold']}°C → honoreer "
                 f"(cap {cfg['ovr_max']}°C) voor {cfg['ovr_hold_s']//60}m, dan nominaal")
+    dbg("CONF", f"pi5new-REGELING = {'LIVE — STUURT DE WP (chMode1/chSetTemp1)!' if cfg['control_live'] else 'DROOG (logt alleen)'}"
+                f" | heat als kamer < setpoint-{cfg['heat_on_below']}, uit als kamer >= setpoint+{cfg['heat_off_above']}"
+                f" | curve {len(cfg['curve'])}pt (cap {cfg['curve'][-1][1] if cfg['curve'] else '?'}°C)")
     if cfg["valve_log"]:
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
     ensure_shadow_columns(cfg)           # shadow-vergelijking met de OTThing (DRY)
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
     ovr_state = {"ovr_until": None, "ovr_target": None, "last_setp": None}
+    heat_state = {}                      # stateful hysterese voor de aan/uit-beslissing
     while True:
         if cfg["valve_log"]:
             write_valve(cfg)              # schrijf de verse (door reports + vorige /get) gecachete stand
@@ -718,10 +760,15 @@ def main():
             dbg("FLOW", "[overlay#1] geen betrouwbare buitentemp -> geen flow-target "
                         "(OTThing-fallback-curve blijft gelden)")
 
-        # SHADOW: wat pi5new ZOU sturen volgens de 6-punts weercurve (DRY). room/sp_now = pi5new's
-        # inputs; curve_flow(ot) = de aanvoer-target. Overnacht vergelijken met honeywell_ot_flow_setpoint_c.
-        write_shadow(cfg, room=room, room_set=sp_now, outside=ot,
-                     flow_target=curve_flow(ot, cfg["curve"]))
+        # pi5new-REGELING: beslis aan/uit (hysterese rond het Honeywell-setpoint sp_now) + de curve-
+        # aanvoer op de HA-buitentemp, stuur de WP (chMode1/chSetTemp1), en log wat we doen.
+        # control_live=0 -> alleen loggen (shadow). room/sp_now komen uit de roomunit (de Honeywell).
+        flow = curve_flow(ot, cfg["curve"])
+        heat = decide_heat(room, sp_now, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
+        command_wp(cfg, heat, flow)
+        dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
+                    f"setpoint={sp_now} buiten={ot} -> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
+        write_shadow(cfg, room=room, room_set=sp_now, outside=ot, flow_target=flow, heat=heat)
 
         # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
         if cfg["valve_log"]:

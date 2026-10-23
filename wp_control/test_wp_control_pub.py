@@ -250,15 +250,68 @@ class TestWriteShadow(unittest.TestCase):
     def test_shadow_upsert_own_columns(self):
         now = datetime(2026, 1, 5, 10, 3, 12)
         wp.write_shadow(wp.build_cfg(), room=21.2, room_set=21.0, outside=13.7,
-                        flow_target=32.4, now=now)
+                        flow_target=32.4, heat=True, now=now)
         self.exec.assert_called_once()
         sql, params = self.exec.call_args.args
         for col in ("wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c",
                     "wp_shadow_flow_target_c"):
             self.assertIn(col, sql)
         self.assertIn("ON DUPLICATE KEY UPDATE", sql)                 # alleen eigen kolommen
+        self.assertIn("wp_cmd_heat", sql)
         self.assertEqual(params[0], datetime(2026, 1, 5, 10, 0))      # bucket -> 10:00
-        self.assertEqual(params[1:], (21.2, 21.0, 13.7, 32.4))
+        self.assertEqual(params[1:], (21.2, 21.0, 13.7, 32.4, 1))     # heat=True -> 1
+
+
+class TestDecideHeat(unittest.TestCase):
+    """Aan/uit-hysterese rond het Honeywell-setpoint (on_below=0.2, off_above=0.3)."""
+
+    def test_heat_when_below(self):
+        self.assertTrue(wp.decide_heat(20.5, 21.0, {}))               # 20.5 <= 21.0-0.2
+
+    def test_off_when_above(self):
+        self.assertFalse(wp.decide_heat(21.4, 21.0, {"heat": True}))  # 21.4 >= 21.0+0.3
+
+    def test_evening_setback_turns_off(self):                        # de 10-22-avond-bug
+        self.assertFalse(wp.decide_heat(21.0, 19.0, {"heat": True}))  # kamer 21 >> setpoint 19 -> UIT
+
+    def test_deadband_keeps_previous(self):
+        self.assertTrue(wp.decide_heat(21.1, 21.0, {"heat": True}))   # binnen band -> vorige (aan)
+        self.assertFalse(wp.decide_heat(21.1, 21.0, {"heat": False})) # binnen band -> vorige (uit)
+
+    def test_missing_data_keeps_previous(self):
+        self.assertTrue(wp.decide_heat(None, 21.0, {"heat": True}))
+        self.assertFalse(wp.decide_heat(21.0, None, {}))             # geen vorige -> default UIT
+
+    def test_first_cycle_in_band_uses_setpoint(self):
+        self.assertTrue(wp.decide_heat(20.95, 21.0, {}))            # <setpoint, band, 1e keer -> aan
+        self.assertFalse(wp.decide_heat(21.05, 21.0, {}))           # >setpoint, band, 1e keer -> uit
+
+
+class TestCommandWp(unittest.TestCase):
+    """LIVE WP-commando: heat -> chMode1=heat + chSetTemp1; uit -> chMode1=off. DRY => niets."""
+
+    def test_dry_run_no_publish(self):
+        wp.mqtt_publish.single.reset_mock()
+        c = wp.build_cfg(); c["control_live"] = False
+        wp.command_wp(c, heat=True, flow=32.4)
+        wp.mqtt_publish.single.assert_not_called()
+
+    def test_live_heat_publishes_mode_and_flow(self):
+        wp.mqtt_publish.single.reset_mock()
+        c = wp.build_cfg(); c["control_live"] = True
+        wp.command_wp(c, heat=True, flow=32.4)
+        topics = [call.args[0] for call in wp.mqtt_publish.single.call_args_list]
+        self.assertIn("otthing/CE150C/chMode1/set", topics)
+        self.assertIn("otthing/CE150C/chSetTemp1/set", topics)
+
+    def test_live_off_publishes_mode_off_only(self):
+        wp.mqtt_publish.single.reset_mock()
+        c = wp.build_cfg(); c["control_live"] = True
+        wp.command_wp(c, heat=False, flow=32.4)
+        self.assertEqual(wp.mqtt_publish.single.call_count, 1)
+        args = wp.mqtt_publish.single.call_args.args
+        self.assertEqual(args[0], "otthing/CE150C/chMode1/set")
+        self.assertEqual(wp.mqtt_publish.single.call_args.kwargs["payload"], "off")
 
 
 class TestParseValve(unittest.TestCase):
