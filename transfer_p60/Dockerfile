@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.13.15-slim
 
 # /app like every other service: `WORKDIR .` resolved to / and put the script outside the
 # ../common:/app/common mount, so `from common import ...` could not resolve.

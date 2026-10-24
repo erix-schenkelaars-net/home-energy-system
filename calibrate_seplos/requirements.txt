@@ -1,3 +1,5 @@
-python-dotenv==1.0.1
+# Full pip freeze of the running image (2026-10-24), incl. transitive deps.
+# Bump deliberately, one service at a time, then test + rebuild.
 mysql-connector-python==9.5.0
 pyserial==3.5
+python-dotenv==1.0.1
