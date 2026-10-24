@@ -779,18 +779,21 @@ def main():
             dbg("FLOW", "[overlay#1] geen betrouwbare buitentemp -> geen flow-target "
                         "(OTThing-fallback-curve blijft gelden)")
 
-        # pi5new-REGELING: beslis aan/uit (hysterese rond het Honeywell-setpoint sp_now) + de curve-
+        # pi5new-REGELING: beslis aan/uit (hysterese rond het gemanagede setpoint sp) + de curve-
         # aanvoer op de HA-buitentemp, stuur de WP (chMode1/chSetTemp1), en log wat we doen.
-        # control_live=0 -> alleen loggen (shadow). room/sp_now komen uit de roomunit (de Honeywell).
+        # control_live=0 -> alleen loggen (shadow). room komt uit de roomunit (de Honeywell).
+        # BELANGRIJK: regel op de GEMANAGEDE setpoint `sp` (schema + handmatige-override met 1-uurs
+        # cap), NIET op de rauwe Honeywell-stand `sp_now`. Anders blijft een verlopen bump (vrouw liet
+        # de dial op 23 staan) de WP naar 23 stoken terwijl `gewenst` al terug op 21 (schema) is.
         base = curve_flow(ot, cfg["curve"])
-        boost = room_comp_boost(room, sp_now, cfg["rc_kp"], cfg["rc_max"])
+        boost = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"])
         flow = None if base is None else round(min(base + boost, cfg["flow_cap"]), 1)
-        heat = decide_heat(room, sp_now, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
+        heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
         command_wp(cfg, heat, flow)
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
-                    f"setpoint={sp_now} buiten={ot} -> curve={base}+boost={boost} -> "
+                    f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost} -> "
                     f"{'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
-        write_shadow(cfg, room=room, room_set=sp_now, outside=ot, flow_target=flow, heat=heat, boost=boost)
+        write_shadow(cfg, room=room, room_set=sp, outside=ot, flow_target=flow, heat=heat, boost=boost)
 
         # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
         if cfg["valve_log"]:
