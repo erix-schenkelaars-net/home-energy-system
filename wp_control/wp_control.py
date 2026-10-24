@@ -815,17 +815,9 @@ def main():
                 dbg("CTRL", "geen verse forecast-buitentemp (geen huidig slot / buiten bereik) "
                             "-> outsideTemp niet gepubliceerd")
 
-        # OVERLAY #1 (cold-scaled preheat): pi5new's gewenste WP-aanvoer. NOG DRY_RUN -> compute+log,
-        # publiceert chSetTemp1 NIET (stap 3b = actuatie met overrideFlow + watchdog). Gebruikt de
-        # forecast-buiten (de OTThing-buiten valt vaak op None in idle); val daarop terug.
-        ot_flow = ot if ot is not None else outside
-        flow_target = compute_flow_target(datetime.now(), ot_flow, cfg)
-        if flow_target is not None:
-            dbg("FLOW", f"[overlay#1] buiten={ot_flow}°C -> chSetTemp1={flow_target}°C "
-                        f"(DRY: nog niet gepubliceerd)")
-        else:
-            dbg("FLOW", "[overlay#1] geen betrouwbare buitentemp -> geen flow-target "
-                        "(OTThing-fallback-curve blijft gelden)")
+        # (OVERLAY #1 cold-scaled preheat `compute_flow_target` bestaat nog als functie voor de latere
+        #  preheat-overlay bovenop de curve, maar wordt niet meer per cyclus gelogd — [REGEL] hieronder
+        #  logt de echte aanvoer. Zie [[wp-control-fase1]] voor de fase-2-overlay-stack.)
 
         # pi5new-REGELING: beslis aan/uit (hysterese rond het gemanagede setpoint sp) + de curve-
         # aanvoer op de HA-buitentemp, stuur de WP (chMode1/chSetTemp1), en log wat we doen.
