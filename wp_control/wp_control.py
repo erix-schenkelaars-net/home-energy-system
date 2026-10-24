@@ -170,6 +170,40 @@ def room_comp_boost(room, setpoint, kp, boost_max):
     return round(min(kp * err, boost_max), 1)
 
 
+def room_comp_pi(room, setpoint, state, cfg, headroom=None):
+    """PUUR + stateful: room-compensatie als GEDEMPTE PI -> extra aanvoer (°C) bovenop de curve.
+
+    P (= room_comp_boost) reageert direct op het kamer-tekort; I bouwt het hardnekkige restant weg
+    zodat de kamer ECHT naar het setpoint klimt i.p.v. er net onder te blijven hangen (P-droop).
+
+    'Gedempt' = twee remmen tegen doorschieten/windup (de wens van de user): (1) closeness-leak —
+    naarmate de kamer het setpoint nadert bloedt de integrator af, het sterkst ÓP het setpoint
+    (closeness ramp over rc_damp_band); (2) anti-windup — zolang de boost tegen zijn plafond zit
+    (rc_max óf de ruimte `headroom` tot flow_cap) groeit I niet verder. Overshoot (kamer boven
+    setpoint, err<0) telt de integrator altijd weer af. i is begrensd op [0, rc_i_max] -> kan niet
+    wegdrijven.
+
+    state['i'] = de integrator (°C aanvoer), bewaard tussen cycli (reset bij procesherstart).
+    headroom = flow_cap - curve-base (None -> alleen rc_max begrenst). Geeft (boost, i) terug."""
+    i = float(state.get("i", 0.0))
+    if room is None or setpoint is None:
+        return 0.0, round(i, 3)                       # transiënte leesfout: houd I vast, geen boost
+    err = setpoint - room
+    p = room_comp_boost(room, setpoint, cfg["rc_kp"], cfg["rc_max"])   # P-term, 0..rc_max
+    # effectief boost-plafond: door rc_max én door de fysieke ruimte tot de aanvoer-cap
+    ceil = cfg["rc_max"] if headroom is None else max(0.0, min(cfg["rc_max"], headroom))
+    # integreren: afbouwen (err<0) mag altijd; opbouwen alleen als we nog niet tegen het plafond zitten
+    if err < 0 or (p + i) < ceil:
+        i += cfg["rc_ki"] * err
+    # demping: closeness 0 (ver van setpoint) .. 1 (óp setpoint) -> hoe dichterbij, hoe harder de leak
+    closeness = max(0.0, min(1.0, 1.0 - abs(err) / cfg["rc_damp_band"]))
+    i -= i * cfg["rc_damp_leak"] * closeness
+    i = max(0.0, min(i, cfg["rc_i_max"]))
+    state["i"] = round(i, 3)
+    boost = max(0.0, min(p + i, ceil))
+    return round(boost, 1), state["i"]
+
+
 def build_cfg():
     base = os.environ.get("MQTT_OTTHING_TOPIC", "otthing/CE150C/state")
     base = base[:-len("/state")] if base.endswith("/state") else base
@@ -211,6 +245,15 @@ def build_cfg():
         # setpoint-sprong echt sneller opwarmt (anders blijft de aanvoer = curve). Gecapt op flow_cap.
         "rc_kp":    float(os.environ.get("WP_ROOMCOMP_KP", "4")),
         "rc_max":   float(os.environ.get("WP_ROOMCOMP_MAX", "10")),
+        # gedempte I bovenop de P: ruimt de rest-droop op zodat de kamer ECHT naar het setpoint klimt
+        # i.p.v. er net onder te blijven hangen. rc_ki = integratiesnelheid (°aanvoer per cyclus per
+        # °C kamer-tekort); rc_i_max = harde begrenzing op de integrator; demping = de integrator
+        # bloedt af naarmate de kamer het setpoint nadert (rc_damp_leak, ramp over rc_damp_band °C) én
+        # bevriest zolang de aanvoer tegen zijn plafond zit (anti-windup). Zie room_comp_pi.
+        "rc_ki":        float(os.environ.get("WP_ROOMCOMP_KI", "0.3")),
+        "rc_i_max":     float(os.environ.get("WP_ROOMCOMP_I_MAX", "8")),
+        "rc_damp_band": float(os.environ.get("WP_ROOMCOMP_DAMP_BAND", "1.5")),
+        "rc_damp_leak": float(os.environ.get("WP_ROOMCOMP_DAMP_LEAK", "0.2")),
         "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
@@ -673,27 +716,29 @@ def ensure_shadow_columns(cfg):
                     f"ADD COLUMN IF NOT EXISTS `wp_shadow_outside_c` float DEFAULT NULL, "
                     f"ADD COLUMN IF NOT EXISTS `wp_shadow_flow_target_c` float DEFAULT NULL, "
                     f"ADD COLUMN IF NOT EXISTS `wp_cmd_heat` tinyint(1) DEFAULT NULL, "
-                    f"ADD COLUMN IF NOT EXISTS `wp_cmd_boost_c` float DEFAULT NULL")
+                    f"ADD COLUMN IF NOT EXISTS `wp_cmd_boost_c` float DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_cmd_i_c` float DEFAULT NULL")
         c.commit(); cur.close(); c.close()
-        dbg("SHADOW", "schema OK (wp_shadow_* + wp_cmd_heat + wp_cmd_boost_c aanwezig)")
+        dbg("SHADOW", "schema OK (wp_shadow_* + wp_cmd_heat + wp_cmd_boost_c + wp_cmd_i_c aanwezig)")
     except Exception as e:
         dbg("SHADOW", f"ensure_shadow_columns faalde: {e}")
 
 
-def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, boost=None, now=None):
+def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, boost=None, i_term=None, now=None):
     """Log naar de energy-bucket wat pi5new doet/zou-doen: de ingelezen kamer + setpoint (inputs),
-    de aanvoer-target (curve + room-comp), de aan/uit-beslissing (wp_cmd_heat) en de toegepaste
-    room-comp-boost (wp_cmd_boost_c, om Kp te tunen). Bij control_live=0 = shadow; bij live = wat
-    we ECHT commandeerden. Schrijft alleen eigen kolommen (upsert). Best-effort."""
+    de aanvoer-target (curve + room-comp), de aan/uit-beslissing (wp_cmd_heat), de toegepaste
+    room-comp-boost (wp_cmd_boost_c = P+I samen) en de integrator-stand apart (wp_cmd_i_c), om
+    Kp/Ki te tunen. Bij control_live=0 = shadow; bij live = wat we ECHT commandeerden. Schrijft
+    alleen eigen kolommen (upsert). Best-effort."""
     now = now or datetime.now()
     cols = ["wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c",
-            "wp_shadow_flow_target_c", "wp_cmd_heat", "wp_cmd_boost_c"]
+            "wp_shadow_flow_target_c", "wp_cmd_heat", "wp_cmd_boost_c", "wp_cmd_i_c"]
     try:
         c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
         cur = c.cursor()
         cur.execute(er.upsert_sql(cols, cfg["db_table"]),
                     (er.bucket(now), room, room_set, outside, flow_target,
-                     None if heat is None else int(heat), boost))
+                     None if heat is None else int(heat), boost, i_term))
         c.commit(); cur.close(); c.close()
     except Exception as e:
         dbg("SHADOW", f"write_shadow faalde: {e}")
@@ -732,7 +777,9 @@ def main():
                 f"(cap {cfg['ovr_max']}°C) voor {cfg['ovr_hold_s']//60}m, dan nominaal")
     dbg("CONF", f"pi5new-REGELING = {'LIVE — STUURT DE WP (chMode1/chSetTemp1)!' if cfg['control_live'] else 'DROOG (logt alleen)'}"
                 f" | heat als kamer < setpoint-{cfg['heat_on_below']}, uit als kamer >= setpoint+{cfg['heat_off_above']}"
-                f" | curve {len(cfg['curve'])}pt + room-comp P (Kp={cfg['rc_kp']}, max +{cfg['rc_max']}°C), cap {cfg['flow_cap']}°C")
+                f" | curve {len(cfg['curve'])}pt + room-comp PI (Kp={cfg['rc_kp']}, Ki={cfg['rc_ki']}, "
+                f"gedempt: leak {cfg['rc_damp_leak']}/band {cfg['rc_damp_band']}°C, I-max {cfg['rc_i_max']}, "
+                f"boost-max +{cfg['rc_max']}°C), cap {cfg['flow_cap']}°C")
     if cfg["valve_log"]:
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
@@ -740,6 +787,7 @@ def main():
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
     ovr_state = {"ovr_until": None, "ovr_target": None, "last_setp": None}
     heat_state = {}                      # stateful hysterese voor de aan/uit-beslissing
+    i_state = {"i": 0.0}                 # gedempte-I integrator voor de room-comp (reset bij herstart)
     while True:
         if cfg["valve_log"]:
             write_valve(cfg)              # schrijf de verse (door reports + vorige /get) gecachete stand
@@ -786,14 +834,16 @@ def main():
         # cap), NIET op de rauwe Honeywell-stand `sp_now`. Anders blijft een verlopen bump (vrouw liet
         # de dial op 23 staan) de WP naar 23 stoken terwijl `gewenst` al terug op 21 (schema) is.
         base = curve_flow(ot, cfg["curve"])
-        boost = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"])
+        headroom = None if base is None else (cfg["flow_cap"] - base)   # ruimte tot de cap = anti-windup
+        boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom)
         flow = None if base is None else round(min(base + boost, cfg["flow_cap"]), 1)
         heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
         command_wp(cfg, heat, flow)
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
-                    f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost} -> "
-                    f"{'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
-        write_shadow(cfg, room=room, room_set=sp, outside=ot, flow_target=flow, heat=heat, boost=boost)
+                    f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost}"
+                    f"(P+I, I={i_term}) -> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
+        write_shadow(cfg, room=room, room_set=sp, outside=ot, flow_target=flow,
+                     heat=heat, boost=boost, i_term=i_term)
 
         # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
         if cfg["valve_log"]:

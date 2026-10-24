@@ -250,15 +250,15 @@ class TestWriteShadow(unittest.TestCase):
     def test_shadow_upsert_own_columns(self):
         now = datetime(2026, 1, 5, 10, 3, 12)
         wp.write_shadow(wp.build_cfg(), room=21.2, room_set=21.0, outside=13.7,
-                        flow_target=32.4, heat=True, boost=2.0, now=now)
+                        flow_target=32.4, heat=True, boost=2.0, i_term=0.5, now=now)
         self.exec.assert_called_once()
         sql, params = self.exec.call_args.args
         for col in ("wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c",
-                    "wp_shadow_flow_target_c", "wp_cmd_heat", "wp_cmd_boost_c"):
+                    "wp_shadow_flow_target_c", "wp_cmd_heat", "wp_cmd_boost_c", "wp_cmd_i_c"):
             self.assertIn(col, sql)
         self.assertIn("ON DUPLICATE KEY UPDATE", sql)                 # alleen eigen kolommen
         self.assertEqual(params[0], datetime(2026, 1, 5, 10, 0))      # bucket -> 10:00
-        self.assertEqual(params[1:], (21.2, 21.0, 13.7, 32.4, 1, 2.0))  # heat=True -> 1, boost 2.0
+        self.assertEqual(params[1:], (21.2, 21.0, 13.7, 32.4, 1, 2.0, 0.5))  # heat=True->1, boost, I
 
 
 class TestRoomCompBoost(unittest.TestCase):
@@ -279,6 +279,69 @@ class TestRoomCompBoost(unittest.TestCase):
     def test_missing_data_is_zero(self):
         self.assertEqual(wp.room_comp_boost(None, 21.0, 4.0, 10.0), 0.0)
         self.assertEqual(wp.room_comp_boost(21.0, None, 4.0, 10.0), 0.0)
+
+
+class TestRoomCompPi(unittest.TestCase):
+    """Gedempte PI-room-compensatie: P reageert direct, I ruimt de rest-droop op (kamer klimt naar
+    het setpoint), en demping (closeness-leak + anti-windup) voorkomt doorschieten/windup."""
+
+    def _cfg(self):
+        return {"rc_kp": 4.0, "rc_max": 10.0, "rc_ki": 0.3, "rc_i_max": 8.0,
+                "rc_damp_band": 1.5, "rc_damp_leak": 0.2}
+
+    def test_first_cycle_p_plus_small_i(self):
+        st = {"i": 0.0}
+        boost, i = wp.room_comp_pi(20.0, 21.0, st, self._cfg())   # err=1: P=4, I=0.3-leak
+        self.assertEqual(i, 0.28)                                 # 0.3*(1-0.2*0.3333)
+        self.assertEqual(boost, 4.3)                              # P 4.0 + I 0.28
+        self.assertEqual(st["i"], 0.28)                           # state bewaard
+
+    def test_integrator_builds_over_cycles(self):
+        st, cfg = {"i": 0.0}, self._cfg()
+        seq = [wp.room_comp_pi(20.0, 21.0, st, cfg)[1] for _ in range(3)]  # kamer blijft 1°C onder
+        self.assertEqual(seq, sorted(seq))                        # I groeit cyclus na cyclus
+        self.assertLess(seq[-1], cfg["rc_i_max"])                 # nog niet tegen de bodem/cap
+
+    def test_damps_near_setpoint(self):
+        st = {"i": 2.0}
+        boost, i = wp.room_comp_pi(21.0, 21.0, st, self._cfg())   # ÓP setpoint: closeness=1 -> volle leak
+        self.assertEqual(i, 1.6)                                  # 2.0 - 2.0*0.2*1.0
+        self.assertEqual(boost, 1.6)                              # P=0, alleen de (afbloedende) I
+
+    def test_overshoot_bleeds_integrator(self):
+        st = {"i": 3.0}
+        _, i = wp.room_comp_pi(22.0, 21.0, st, self._cfg())       # kamer boven setpoint, err=-1
+        self.assertLess(i, 3.0)                                   # negatieve err telt I af
+        self.assertEqual(i, 2.52)                                 # (3.0-0.3) - rest*leak*0.3333
+
+    def test_antiwindup_at_boost_max(self):
+        st = {"i": 3.0}
+        boost, i = wp.room_comp_pi(15.0, 22.0, st, self._cfg())   # P al op cap (10), groot tekort
+        self.assertEqual(i, 3.0)                                  # bevroren: geen opbouw bij saturatie
+        self.assertEqual(boost, 10.0)                             # gecapt op rc_max
+
+    def test_antiwindup_at_flow_cap_headroom(self):
+        st = {"i": 0.0}
+        boost, i = wp.room_comp_pi(18.0, 22.0, st, self._cfg(), headroom=2.0)
+        self.assertEqual(boost, 2.0)                              # gecapt op de ruimte tot flow_cap
+        self.assertEqual(i, 0.0)                                  # geen windup achter de cap
+
+    def test_integrator_hard_clamped_to_i_max(self):
+        st = {"i": 100.0}
+        _, i = wp.room_comp_pi(18.0, 22.0, st, self._cfg())
+        self.assertEqual(i, 8.0)                                  # harde begrenzing rc_i_max
+
+    def test_missing_data_holds_integrator_no_boost(self):
+        st = {"i": 1.5}
+        boost, i = wp.room_comp_pi(None, 21.0, st, self._cfg())
+        self.assertEqual(boost, 0.0)
+        self.assertEqual(i, 1.5)                                  # vastgehouden bij leesfout
+        self.assertEqual(st["i"], 1.5)
+
+    def test_build_cfg_pi_defaults(self):
+        cfg = wp.build_cfg()
+        self.assertEqual((cfg["rc_ki"], cfg["rc_i_max"], cfg["rc_damp_band"], cfg["rc_damp_leak"]),
+                         (0.3, 8.0, 1.5, 0.2))
 
 
 class TestDecideHeat(unittest.TestCase):
