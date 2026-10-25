@@ -92,7 +92,8 @@ utility grid — allowing immediate verification of the optimisation strategy.
 - Home Assistant integration and MQTT messaging
 - MariaDB time-series database
 - BMW EV integration (CarData)
-- Solar thermal and OpenTherm boiler monitoring
+- Heat pump control over OpenTherm (weather curve, room compensation, schedule)
+- Solar thermal and OpenTherm monitoring
 - Battery lifetime protection and automatic PV curtailment
 - Rolling 48-hour optimisation
 - Safety guards that operate independently of the optimiser
@@ -130,7 +131,7 @@ utility grid — allowing immediate verification of the optimisation strategy.
 
 ## Software components
 
-Nine services plus MariaDB, each an independent Docker container.
+Ten services plus MariaDB, each an independent Docker container.
 
 | Service | Description |
 |---------|-------------|
@@ -143,6 +144,7 @@ Nine services plus MariaDB, each an independent Docker container.
 | `read_resol` | Solar thermal monitor (VBus) |
 | `read_otthing` | OpenTherm gateway reader |
 | `transfer_p60` | Weheat P60 heat pump integration |
+| `wp_control` | Heat pump controller — on/off and flow temperature via OpenTherm |
 | `MariaDB` | Central time-series database |
 
 ---
@@ -188,7 +190,7 @@ The reference installation:
 | BMW 225XE | 7.7 kWh, 2.3 kW AC charge via smart plug |
 | Weheat Sparrow P60 heat pump (cloud) | Main space-heating load |
 | Resol solar controller (ethernet) | Solar thermal (DHW + wood gasifier) |
-| OTThing OpenTherm gateway (wifi) | Honeywell Sparrow60 boiler |
+| OTThing OpenTherm gateway (wifi) | Sits between the Honeywell thermostat and the heat pump; `wp_control` drives the heat pump through it |
 
 Three opto-coupled RS485-to-USB converters connect the inverter and BMS. The software adapts
 easily to similar installations.
@@ -243,7 +245,8 @@ Each container has its own detailed README.
 | DSMR interface | [read_p1/README.md](read_p1/README.md) |
 | BMW CarData | [read_bmw/README.md](read_bmw/README.md) |
 | KNMI radiation nowcast | [read_knmi/README.md](read_knmi/README.md) |
-| Heat pump | [transfer_p60/README.md](transfer_p60/README.md) |
+| Heat pump data | [transfer_p60/README.md](transfer_p60/README.md) |
+| Heat pump control | [wp_control/README.md](wp_control/README.md) |
 | Solar thermal | [read_resol/README.md](read_resol/README.md) |
 | Boiler | [read_otthing/README.md](read_otthing/README.md) |
 | Database schema | [mariadb/README.md](mariadb/README.md) |
