@@ -157,17 +157,15 @@ def decide_heat(room, setpoint, state, on_below=0.2, off_above=0.3):
     return bool(state["heat"])
 
 
-def room_comp_boost(room, setpoint, kp, boost_max):
+def room_comp_boost(room, setpoint, kp, boost_max, neg_max=0.0):
     """PUUR: P-room-compensatie -> extra aanvoer (°C) bovenop de curve. boost = clamp(kp*(setpoint -
-    kamer), 0, boost_max). Alleen positief (kamer onder setpoint); 0 als op/boven setpoint of bij
-    ontbrekende data. Zo trekt een setpoint-sprong de aanvoer omhoog i.p.v. op de curve te blijven;
-    bij nadering krimpt de boost vanzelf naar 0 (steady-state = de curve)."""
+    kamer), -neg_max, boost_max); 0 bij ontbrekende data. Zo trekt een setpoint-sprong de aanvoer
+    omhoog i.p.v. op de curve te blijven; bij nadering krimpt de boost vanzelf naar 0 (steady-state =
+    de curve). Met neg_max > 0 zakt de aanvoer ONDER de curve zodra de kamer boven het setpoint zit
+    (user 2026-10-24: laag doordraaien i.p.v. uit); neg_max=0 = alleen positief (oude gedrag)."""
     if room is None or setpoint is None:
         return 0.0
-    err = setpoint - room
-    if err <= 0:
-        return 0.0
-    return round(min(kp * err, boost_max), 1)
+    return round(max(-neg_max, min(kp * (setpoint - room), boost_max)), 1) + 0.0   # +0.0: geen -0.0
 
 
 def room_comp_pi(room, setpoint, state, cfg, headroom=None):
@@ -189,7 +187,8 @@ def room_comp_pi(room, setpoint, state, cfg, headroom=None):
     if room is None or setpoint is None:
         return 0.0, round(i, 3)                       # transiënte leesfout: houd I vast, geen boost
     err = setpoint - room
-    p = room_comp_boost(room, setpoint, cfg["rc_kp"], cfg["rc_max"])   # P-term, 0..rc_max
+    neg = cfg.get("rc_neg_max", 0.0)
+    p = room_comp_boost(room, setpoint, cfg["rc_kp"], cfg["rc_max"], neg)   # P-term, -neg..rc_max
     # effectief boost-plafond: door rc_max én door de fysieke ruimte tot de aanvoer-cap
     ceil = cfg["rc_max"] if headroom is None else max(0.0, min(cfg["rc_max"], headroom))
     # integreren: afbouwen (err<0) mag altijd; opbouwen alleen als we nog niet tegen het plafond zitten
@@ -200,8 +199,17 @@ def room_comp_pi(room, setpoint, state, cfg, headroom=None):
     i -= i * cfg["rc_damp_leak"] * closeness
     i = max(0.0, min(i, cfg["rc_i_max"]))
     state["i"] = round(i, 3)
-    boost = max(0.0, min(p + i, ceil))
-    return round(boost, 1), state["i"]
+    boost = max(-neg, min(p + i, ceil))
+    return round(boost, 1) + 0.0, state["i"]
+
+
+def regulated_flow(base, boost, cfg):
+    """PUUR: curve + room-comp -> aanvoer-target (°C), begrensd op [flow_min, flow_cap]. De bodem
+    houdt de WP bij een negatieve boost (kamer boven setpoint) op een lage maar zinnige aanvoer i.p.v.
+    eronder te duiken; None als er geen curve-basis is (geen buitentemp)."""
+    if base is None:
+        return None
+    return round(max(cfg["flow_min"], min(base + boost, cfg["flow_cap"])), 1)
 
 
 def build_cfg():
@@ -240,7 +248,9 @@ def build_cfg():
         # setpoint voorkomt pendelen. overrideChFlow1 moet AAN staan zodat chSetTemp1 wint.
         "control_live":   os.environ.get("WP_CONTROL_LIVE", "0") not in ("0", "false", "False", ""),
         "heat_on_below":  float(os.environ.get("WP_HEAT_ON_BELOW", "0.2")),
-        "heat_off_above": float(os.environ.get("WP_HEAT_OFF_ABOVE", "0.3")),
+        # uit-grens ruim (0.8, user 2026-10-24): rond het setpoint moduleert de WP LAAG door (negatieve
+        # room-comp tot flow_min) i.p.v. een uur uit; een avond-setback (bv. 22->19) zit er ver boven -> uit.
+        "heat_off_above": float(os.environ.get("WP_HEAT_OFF_ABOVE", "0.8")),
         # room-compensatie (P): extra aanvoer bovenop de curve bij een kamer-achterstand, zodat een
         # setpoint-sprong echt sneller opwarmt (anders blijft de aanvoer = curve). Gecapt op flow_cap.
         "rc_kp":    float(os.environ.get("WP_ROOMCOMP_KP", "4")),
@@ -254,6 +264,10 @@ def build_cfg():
         "rc_i_max":     float(os.environ.get("WP_ROOMCOMP_I_MAX", "8")),
         "rc_damp_band": float(os.environ.get("WP_ROOMCOMP_DAMP_BAND", "1.5")),
         "rc_damp_leak": float(os.environ.get("WP_ROOMCOMP_DAMP_LEAK", "0.2")),
+        # negatieve room-comp: kamer boven setpoint -> aanvoer tot rc_neg_max °C ONDER de curve, nooit
+        # onder flow_min. Zo draait de WP laag door i.p.v. aan/uit te pendelen.
+        "rc_neg_max":   float(os.environ.get("WP_ROOMCOMP_NEG_MAX", "8")),
+        "flow_min": float(os.environ.get("WP_FLOW_MIN", "28")),
         "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
@@ -779,7 +793,7 @@ def main():
                 f" | heat als kamer < setpoint-{cfg['heat_on_below']}, uit als kamer >= setpoint+{cfg['heat_off_above']}"
                 f" | curve {len(cfg['curve'])}pt + room-comp PI (Kp={cfg['rc_kp']}, Ki={cfg['rc_ki']}, "
                 f"gedempt: leak {cfg['rc_damp_leak']}/band {cfg['rc_damp_band']}°C, I-max {cfg['rc_i_max']}, "
-                f"boost-max +{cfg['rc_max']}°C), cap {cfg['flow_cap']}°C")
+                f"boost -{cfg['rc_neg_max']}..+{cfg['rc_max']}°C), aanvoer {cfg['flow_min']}..{cfg['flow_cap']}°C")
     if cfg["valve_log"]:
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
@@ -828,7 +842,7 @@ def main():
         base = curve_flow(ot, cfg["curve"])
         headroom = None if base is None else (cfg["flow_cap"] - base)   # ruimte tot de cap = anti-windup
         boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom)
-        flow = None if base is None else round(min(base + boost, cfg["flow_cap"]), 1)
+        flow = regulated_flow(base, boost, cfg)
         heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
         command_wp(cfg, heat, flow)
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "

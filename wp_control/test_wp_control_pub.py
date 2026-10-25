@@ -280,6 +280,12 @@ class TestRoomCompBoost(unittest.TestCase):
         self.assertEqual(wp.room_comp_boost(None, 21.0, 4.0, 10.0), 0.0)
         self.assertEqual(wp.room_comp_boost(21.0, None, 4.0, 10.0), 0.0)
 
+    def test_negative_above_setpoint_when_allowed(self):
+        self.assertEqual(wp.room_comp_boost(21.5, 21.0, 4.0, 10.0, 8.0), -2.0)   # 4 * -0.5
+
+    def test_negative_capped_at_neg_max(self):
+        self.assertEqual(wp.room_comp_boost(24.0, 21.0, 4.0, 10.0, 8.0), -8.0)   # 4*-3=-12 -> -8
+
 
 class TestRoomCompPi(unittest.TestCase):
     """Gedempte PI-room-compensatie: P reageert direct, I ruimt de rest-droop op (kamer klimt naar
@@ -343,6 +349,39 @@ class TestRoomCompPi(unittest.TestCase):
         self.assertEqual((cfg["rc_ki"], cfg["rc_i_max"], cfg["rc_damp_band"], cfg["rc_damp_leak"]),
                          (0.3, 8.0, 1.5, 0.2))
 
+    def test_above_setpoint_boost_goes_negative(self):
+        st, cfg = {"i": 0.0}, dict(self._cfg(), rc_neg_max=8.0)
+        boost, i = wp.room_comp_pi(21.5, 21.0, st, cfg)           # kamer 0,5 boven: P=-2, I blijft 0
+        self.assertEqual((boost, i), (-2.0, 0.0))
+
+    def test_leftover_integrator_softens_negative_p(self):
+        st, cfg = {"i": 1.0}, dict(self._cfg(), rc_neg_max=8.0)
+        boost, i = wp.room_comp_pi(21.5, 21.0, st, cfg)           # I=(1-0.15)-leak, P=-2
+        self.assertEqual(i, 0.737)                                # 0.85 - 0.85*0.2*0.667
+        self.assertEqual(boost, -1.3)                             # P -2 + I 0.737
+
+
+class TestRegulatedFlow(unittest.TestCase):
+    """curve + boost, begrensd op [flow_min, flow_cap]: laag doordraaien i.p.v. onder de bodem."""
+
+    CFG = {"flow_min": 28.0, "flow_cap": 50.0}
+
+    def test_negative_boost_lowers_flow(self):
+        self.assertEqual(wp.regulated_flow(36.0, -3.2, self.CFG), 32.8)
+
+    def test_floor_at_flow_min(self):
+        self.assertEqual(wp.regulated_flow(30.0, -8.0, self.CFG), 28.0)
+
+    def test_cap_at_flow_cap(self):
+        self.assertEqual(wp.regulated_flow(45.0, 10.0, self.CFG), 50.0)
+
+    def test_no_base_is_none(self):
+        self.assertIsNone(wp.regulated_flow(None, 2.0, self.CFG))
+
+    def test_build_cfg_defaults(self):
+        cfg = wp.build_cfg()
+        self.assertEqual((cfg["flow_min"], cfg["rc_neg_max"], cfg["heat_off_above"]), (28.0, 8.0, 0.8))
+
 
 class TestDecideHeat(unittest.TestCase):
     """Aan/uit-hysterese rond het Honeywell-setpoint (on_below=0.2, off_above=0.3)."""
@@ -355,6 +394,12 @@ class TestDecideHeat(unittest.TestCase):
 
     def test_evening_setback_turns_off(self):                        # de 10-22-avond-bug
         self.assertFalse(wp.decide_heat(21.0, 19.0, {"heat": True}))  # kamer 21 >> setpoint 19 -> UIT
+
+    def test_wide_off_band_keeps_running_then_setback_still_off(self):
+        # live-config 0.8: kamer 21.4 bij setpoint 21 draait LAAG door; 22->19-setback = ruim erboven -> uit
+        self.assertTrue(wp.decide_heat(21.4, 21.0, {"heat": True}, 0.2, 0.8))
+        self.assertFalse(wp.decide_heat(21.8, 21.0, {"heat": True}, 0.2, 0.8))
+        self.assertFalse(wp.decide_heat(22.0, 19.0, {"heat": True}, 0.2, 0.8))
 
     def test_deadband_keeps_previous(self):
         self.assertTrue(wp.decide_heat(21.1, 21.0, {"heat": True}))   # binnen band -> vorige (aan)
