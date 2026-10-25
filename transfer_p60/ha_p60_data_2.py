@@ -114,6 +114,19 @@ def format_number_string(value):
     return num_str[:6]
 
 
+# Weheat meldt bij het inschakelen kortstondig onzinnige COP's (tot 268 gezien): het
+# vermogen-in loopt nog op terwijl er al warmte uit het water komt. Boven COP_MAX is het geen
+# meting -> NULL, niet afkappen (een afgekapte 6 is net zo onecht en trekt gemiddeldes omhoog).
+COP_MAX = 6.0
+
+
+def format_cop(value):
+    s = format_number_string(value)
+    if s is None or float(s) > COP_MAX:
+        return None
+    return s
+
+
 # ---------------------------
 # MQTT CALLBACK
 # ---------------------------
@@ -170,7 +183,7 @@ def execute_cycle():
             "sparrow_water_inlet_temp_c": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_water_inlet_temperature")),
             "sparrow_water_outlet_temp_c": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_water_outlet_temperature")),
             "sparrow_outside_temp_c": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_outside_temperature")),
-            "sparrow_cop": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_cop")),
+            "sparrow_cop": format_cop(last_p60_data.get("sensor.sparrow_p60_heat_pump_cop")),
             "sparrow_input_power_w": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_input_power")),
             "sparrow_output_power_w": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_output_power")),
             "sparrow_electricity_kwh": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_electricity_used")),

@@ -98,6 +98,24 @@ class TestFormatNumberString(unittest.TestCase):
         self.assertIsNotNone(result)
 
 
+class TestFormatCop(unittest.TestCase):
+    """Opstart-pieken van de Weheat-COP (>6) zijn geen meting -> NULL, niet afgekapt."""
+
+    def test_normal_cop_passes(self):
+        self.assertEqual(mod.format_cop("4.2"), mod.format_number_string("4.2"))
+
+    def test_exactly_max_passes(self):
+        self.assertIsNotNone(mod.format_cop(6))
+
+    def test_startup_spike_is_null(self):
+        self.assertIsNone(mod.format_cop("268.5"))
+        self.assertIsNone(mod.format_cop("6.1"))
+
+    def test_missing_or_garbage_is_null(self):
+        self.assertIsNone(mod.format_cop(None))
+        self.assertIsNone(mod.format_cop("unavailable"))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # B.  on_message() — MQTT callback stores payload in global
 # ══════════════════════════════════════════════════════════════════════════════
