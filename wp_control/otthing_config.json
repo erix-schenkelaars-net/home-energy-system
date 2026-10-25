@@ -1,0 +1,168 @@
+{
+  "aux": [
+    {
+      "digitalRole": 0,
+      "mode": 4
+    },
+    {
+      "digitalRole": 0,
+      "mode": 0
+    }
+  ],
+  "boiler": {
+    "chOffTemp": 19,
+    "coolOn": false,
+    "dhwBlocking": true,
+    "dhwCtrlSource": 2,
+    "dhwOn": false,
+    "dhwSchedule": {
+      "enabled": false,
+      "entries": []
+    },
+    "dhwTemperature": 30,
+    "maxModulation": 91,
+    "otc": false,
+    "overrideDhw": false,
+    "summerMode": false
+  },
+  "bypass": false,
+  "enableSlave": true,
+  "haPrefix": "homeassistant",
+  "heating": [
+    {
+      "chOn": true,
+      "curveMode": 1,
+      "enableHyst": true,
+      "exponent": 1.3,
+      "flow": 35,
+      "flowMax": 50,
+      "flowMin": 11,
+      "gradient": 1,
+      "hysteresis": 0.5,
+      "marker": [],
+      "minSuspend": false,
+      "offset": 0,
+      "outsideSuspend": {
+        "type": 1
+      },
+      "overrideFlow": true,
+      "overrideOn": false,
+      "points": [
+        {
+          "flow": 28,
+          "outside": 20
+        },
+        {
+          "flow": 35,
+          "outside": 10
+        },
+        {
+          "flow": 42,
+          "outside": 0
+        },
+        {
+          "flow": 48,
+          "outside": -10
+        },
+        {
+          "flow": 50,
+          "outside": -25
+        },
+        {
+          "flow": 50,
+          "outside": -30
+        }
+      ],
+      "returnLimit": {
+        "deltaT": 0,
+        "source": 1
+      },
+      "roomComp": {
+        "boost": 3,
+        "enabled": false,
+        "i": 0.5,
+        "p": 1
+      },
+      "roomsetpoint": {
+        "source": 0,
+        "temp": 21.1
+      },
+      "roomtemp": {
+        "source": 1
+      },
+      "schedule": {
+        "enabled": false,
+        "entries": []
+      },
+      "suspOffset": 1
+    },
+    {
+      "chOn": false,
+      "curveMode": 0,
+      "enableHyst": false,
+      "exponent": 1.3,
+      "flow": 30,
+      "flowMax": 40,
+      "flowMin": 10,
+      "gradient": 1,
+      "hysteresis": 0.5,
+      "marker": [],
+      "minSuspend": false,
+      "offset": 0,
+      "overrideFlow": false,
+      "returnLimit": {
+        "deltaT": 0,
+        "source": 1
+      },
+      "roomComp": {
+        "boost": 1,
+        "enabled": false,
+        "i": 0,
+        "p": 1
+      },
+      "roomsetpoint": {
+        "source": 0,
+        "temp": 21
+      },
+      "roomtemp": {
+        "source": 1
+      },
+      "suspOffset": 0
+    }
+  ],
+  "hostname": "otthing",
+  "masterMemberId": 8,
+  "mqtt": {
+    "host": "<redacted>",
+    "keepAlive": 15,
+    "pass": "<redacted>",
+    "port": 1883,
+    "tls": false,
+    "user": "<redacted>"
+  },
+  "noDhwSet": true,
+  "otMode": 2,
+  "outsideTemp": {
+    "interval": 300,
+    "lat": "<redacted>",
+    "lon": "<redacted>",
+    "source": 0
+  },
+  "slaveApp": 0,
+  "timezone": 3600,
+  "ui": {
+    "pinnedHeroFields": [
+      "slave.flow_t",
+      "slave.rel_mod",
+      "slave.outside_t",
+      "master.room_t.data"
+    ]
+  },
+  "vent": {
+    "autoBypass": false,
+    "freeVentEnable": false,
+    "openBypass": false,
+    "setpoint": 3,
+    "ventEnable": false
+  }
+}

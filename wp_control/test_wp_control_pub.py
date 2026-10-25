@@ -718,3 +718,26 @@ class TestComputeFlowTarget(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+class TestOtthingConfigRedact(unittest.TestCase):
+    """De OTThing-config gaat de publieke repo in: geen geheimen, hosts of coördinaten."""
+
+    def test_secrets_redacted_at_any_depth(self):
+        import otthing_config as oc
+        raw = {"mqtt": {"host": "10.0.0.9", "user": "u", "pass": "s3cret", "port": 1883},
+               "outsideTemp": {"lat": 52.1, "lon": 5.1, "source": 0},
+               "heating": [{"flowMax": 50, "roomsetpoint": {"source": 0}}]}
+        out = oc.redact(raw)
+        self.assertEqual(out["mqtt"], {"host": oc.REDACTED, "user": oc.REDACTED,
+                                       "pass": oc.REDACTED, "port": 1883})
+        self.assertEqual(out["outsideTemp"]["lat"], oc.REDACTED)
+        self.assertEqual(out["outsideTemp"]["source"], 0)
+        self.assertEqual(out["heating"][0], raw["heating"][0])
+
+    def test_committed_snapshot_has_no_secrets(self):
+        import otthing_config as oc
+        if not os.path.exists(oc.OUT):
+            self.skipTest("nog geen snapshot")
+        with open(oc.OUT) as f:
+            snap = json.load(f)
+        self.assertEqual(oc.redact(snap), snap)
