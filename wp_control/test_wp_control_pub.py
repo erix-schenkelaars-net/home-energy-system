@@ -741,3 +741,187 @@ class TestOtthingConfigRedact(unittest.TestCase):
         with open(oc.OUT) as f:
             snap = json.load(f)
         self.assertEqual(oc.redact(snap), snap)
+
+
+class TestHaTelemetry(unittest.TestCase):
+    """Dashboard-telemetrie: curve-basis, +P, +P+I en de echte target, plus HA-discovery."""
+
+    def test_state_splits_base_p_i(self):
+        s = wp.ha_state(sp=21.5, room=21.2, outside=13.2, base=32.8, p=1.2, i=0.3, flow=34.3, heat=True)
+        self.assertEqual((s["flow_base"], s["flow_p"], s["flow_pi"], s["flow_target"]),
+                         (32.8, 34.0, 34.3, 34.3))
+        self.assertEqual(s["heat"], 1)
+
+    def test_state_has_nominal_and_bump_left(self):
+        s = wp.ha_state(23.0, 21.9, 13.0, 33.1, 1.0, 0.4, 34.5, True, sp_nominal=21.5, bump_left=58)
+        self.assertEqual((s["setpoint"], s["setpoint_nominal"], s["bump_left"]), (23.0, 21.5, 58))
+
+    def test_bump_minutes_left(self):
+        now = datetime(2026, 10, 25, 16, 7, 12)
+        self.assertEqual(wp.bump_minutes_left({"ovr_until": None}, now), 0)
+        self.assertEqual(wp.bump_minutes_left({"ovr_until": now - timedelta(seconds=1)}, now), 0)
+        self.assertEqual(wp.bump_minutes_left({"ovr_until": now + timedelta(minutes=57, seconds=6)}, now), 58)
+
+    def test_discovery_duration_sensor_is_not_temperature(self):
+        conf = json.loads(dict(wp.ha_discovery_msgs())["homeassistant/sensor/wp_control/bump_left/config"])
+        self.assertEqual((conf["unit_of_measurement"], conf["device_class"]), ("min", "duration"))
+
+    def test_state_without_curve_base(self):
+        s = wp.ha_state(sp=21.5, room=None, outside=None, base=None, p=0.0, i=0.0, flow=None, heat=False)
+        self.assertIsNone(s["flow_p"])
+        self.assertIsNone(s["flow_pi"])
+        self.assertEqual(s["heat"], 0)
+
+    def test_discovery_one_sensor_per_key(self):
+        msgs = dict(wp.ha_discovery_msgs())
+        conf = json.loads(msgs["homeassistant/sensor/wp_control/setpoint/config"])
+        self.assertEqual(conf["unique_id"], "wp_control_setpoint")
+        self.assertEqual(conf["state_topic"], wp.HA_STATE_TOPIC)
+        self.assertEqual(conf["value_template"], "{{ value_json.setpoint }}")
+        self.assertNotIn("unit_of_measurement", json.loads(msgs["homeassistant/sensor/wp_control/heat/config"]))
+
+    def test_publish_ignores_dry_run(self):
+        # telemetrie, geen sturing: ook bij dry_run/control_live=0 publiceren
+        wp.mqtt_publish.single.reset_mock()
+        c = wp.build_cfg(); c["control_live"] = False
+        wp.publish_ha(c, {"setpoint": 21.5}, with_discovery=True)
+        topics = [call.args[0] for call in wp.mqtt_publish.single.call_args_list]
+        self.assertEqual(topics[-1], wp.HA_STATE_TOPIC)
+        self.assertEqual(len(topics), len(wp.HA_SENSORS) + 1)
+
+
+class TestBumpBetweenCycles(unittest.TestCase):
+    """2026-10-25 15:54: Honeywell 23 -> 18 -> 23 tussen twee cycli. De listener zag de bump, maar
+    decide_with_override vergeleek met de vorige cyclus (23) en startte niets."""
+
+    def _msg(self, setp):
+        m = MagicMock(); m.payload = json.dumps({"roomunit": {"room_set_t": setp}}).encode()
+        return m
+
+    def setUp(self):
+        wp._thermo_cache.update(setpoint=None, ts=None, bump_from=None)
+        wp._bump_event.clear()
+
+    def test_listener_remembers_where_the_bump_came_from(self):
+        for v in (23.0, 18.0, 23.0):
+            wp._on_thermo_msg(None, {"thr": 21.5}, self._msg(v))
+        self.assertTrue(wp._bump_event.is_set())
+        self.assertEqual(wp.take_bump_from(), 18.0)
+        self.assertIsNone(wp.take_bump_from())          # eenmalig
+
+    def test_dip_between_cycles_arms_the_override(self):
+        c = cfg(); now = datetime(2026, 10, 25, 15, 55)
+        st = {"ovr_until": None, "ovr_target": None, "last_setp": 23.0}   # vorige cyclus zag 23
+        for v in (18.0, 23.0):
+            wp._on_thermo_msg(None, {"thr": 21.5}, self._msg(v))
+        st["last_setp"] = wp.take_bump_from()            # zoals main() het doet
+        sp, why = wp.decide_with_override(now, 23.0, st, c)
+        self.assertEqual(sp, 23.0)
+        self.assertIn("override", why)
+
+
+class TestRuntimeState(unittest.TestCase):
+    """Een herstart van wp_control verandert het gedrag niet: bump, aan/uit-stand en I-term komen terug."""
+
+    def setUp(self):
+        import tempfile
+        self.path = os.path.join(tempfile.mkdtemp(), "state.json")
+        self.now = datetime(2026, 10, 25, 15, 45)
+
+    def _save(self, until=None, target=None, heat=True, i=1.2, at=None):
+        wp.save_state({"ovr_until": until, "ovr_target": target}, {"heat": heat}, {"i": i},
+                      at or self.now, self.path)
+
+    def test_roundtrip(self):
+        until = self.now + timedelta(minutes=30)
+        self._save(until, 23.0)
+        ovr, heat, i = wp.load_state(self.now + timedelta(minutes=1), self.path)
+        self.assertEqual(ovr, {"ovr_until": until, "ovr_target": 23.0})
+        self.assertEqual(heat, {"heat": True})
+        self.assertEqual(i, {"i": 1.2})
+
+    def test_expired_bump_is_dropped(self):
+        self._save(self.now + timedelta(minutes=5), 23.0)
+        ovr, _, _ = wp.load_state(self.now + timedelta(minutes=6), self.path)
+        self.assertEqual(ovr, {})
+
+    def test_stale_heat_and_i_are_dropped_but_bump_kept(self):
+        until = self.now + timedelta(minutes=50)
+        self._save(until, 23.0)
+        ovr, heat, i = wp.load_state(self.now + timedelta(minutes=20), self.path)
+        self.assertEqual(ovr["ovr_until"], until)
+        self.assertEqual((heat, i), ({}, {}))
+
+    def test_missing_or_garbage_file(self):
+        self.assertEqual(wp.load_state(self.now, self.path), ({}, {}, {}))
+        with open(self.path, "w") as f:
+            f.write("{kapot")
+        self.assertEqual(wp.load_state(self.now, self.path), ({}, {}, {}))
+
+    def test_restored_heat_keeps_wide_off_band(self):
+        # kamer 21,8 bij setpoint 21,5: vers gestart -> UIT; met de herstelde stand 'aan' draait hij
+        # door tot setpoint + 0,8 (zoals zonder herstart)
+        self._save(heat=True)
+        _, heat, _ = wp.load_state(self.now, self.path)
+        self.assertFalse(wp.decide_heat(21.8, 21.5, {}, 0.2, 0.8))
+        self.assertTrue(wp.decide_heat(21.8, 21.5, heat, 0.2, 0.8))
+
+    def test_restored_bump_survives_first_cycle_but_turndown_cancels(self):
+        self._save(self.now + timedelta(minutes=30), 23.0)
+        ovr, _, _ = wp.load_state(self.now, self.path)
+        st = {"ovr_until": None, "ovr_target": None, "last_setp": None}; st.update(ovr)
+        sp, _ = wp.decide_with_override(self.now, 23.0, st, cfg())     # knop nog op 23
+        self.assertEqual(sp, 23.0)
+        sp, _ = wp.decide_with_override(self.now, 20.0, st, cfg())     # teruggedraaid
+        self.assertNotEqual(sp, 23.0)
+
+    def test_none_reading_keeps_reference_for_next_bump(self):
+        # listener even stil (None) -> daarna 21 -> 23 moet nog steeds als bump tellen
+        st = {"ovr_until": None, "ovr_target": None, "last_setp": 21.0}
+        wp.decide_with_override(self.now, None, st, cfg())
+        sp, _ = wp.decide_with_override(self.now, 23.0, st, cfg())
+        self.assertEqual(sp, 23.0)
+
+
+class TestOutsideFallback(unittest.TestCase):
+    """Geen buitentemp -> geen aanvoer -> chMode1=off -> WP 60 min stil. Daarom een vaste aanname."""
+
+    def test_measurement_wins(self):
+        self.assertEqual(wp.outside_for_curve(3.2, wp.build_cfg()), 3.2)
+
+    def test_missing_uses_fallback_and_gives_a_flow(self):
+        c = wp.build_cfg()
+        ot = wp.outside_for_curve(None, c)
+        self.assertEqual(ot, 15.0)
+        self.assertIsNotNone(wp.curve_flow(ot, c["curve"]))
+
+
+class TestFlowDropLimit(unittest.TestCase):
+    """10-24 15:45: bump-einde zette het doel in 20 min van 43,4 naar 35,5 bij retour 42 -> WP stopte."""
+
+    def test_rise_is_immediate(self):
+        st = {"flow": 35.0}
+        self.assertEqual(wp.limit_flow_drop(40.0, st, 1.0), 40.0)
+
+    def test_drop_is_limited_per_cycle(self):
+        st = {"flow": 43.4}
+        seen = [wp.limit_flow_drop(35.5, st, 1.0) for _ in range(3)]
+        self.assertEqual(seen, [42.4, 41.4, 40.4])
+
+    def test_small_drop_passes(self):
+        st = {"flow": 36.0}
+        self.assertEqual(wp.limit_flow_drop(35.5, st, 1.0), 35.5)
+
+    def test_no_previous_or_no_flow(self):
+        st = {}
+        self.assertEqual(wp.limit_flow_drop(33.0, st, 1.0), 33.0)
+        self.assertIsNone(wp.limit_flow_drop(None, st, 1.0))
+        self.assertEqual(wp.limit_flow_drop(30.0, st, 1.0), 30.0)    # na None: geen rem
+
+    def test_last_flow_survives_restart(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "s.json"); now = datetime(2026, 10, 25, 17, 0)
+        wp.save_state({"ovr_until": None}, {"heat": True, "flow": 39.5}, {"i": 1.0}, now, path)
+        _, heat, _ = wp.load_state(now, path)
+        self.assertEqual(heat, {"heat": True, "flow": 39.5})
+

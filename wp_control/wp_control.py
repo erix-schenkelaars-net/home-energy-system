@@ -1,57 +1,14 @@
 """
 wp_control.py — warmtepomp-aansturing (Weheat P60 via de OTThing) op pi5new.
 
-EERSTE VOORSTEL / fase 1. Stuurt UITSLUITEND de begrensde `roomSetpoint`-knop van de
-OTThing (in AUTO), nooit de rauwe flow-/on-overrides — die latchen eeuwig en omzeilen de
-suspend/clip-veiligheid (zie de heatpump-control-lever-memory). Een blijven-hangende
-roomSetpoint kan niet oververhitten: de OTThing-suspend grijpt in zodra de kamer op temp is.
+Elke cyclus: setpoint (schema + Honeywell-bump) -> aan/uit (hysterese) -> aanvoer (weercurve +
+gedempte PI room-compensatie) -> retained MQTT naar de OTThing (chMode1, chSetTemp1, roomSetpoint1,
+overrideChOn1, roomMode1, outsideTemp). pi5new bezit de CH-enable; de Honeywell is alleen nog de
+bump-knop. Daarnaast: logging naar energy (wp_shadow_*/wp_cmd_*, buffer_valve_*) en telemetrie
+naar HA (wp_control/state).
 
-Wat het doet (fase 1):
-  * nacht-setback + koude-geschaalde OCHTEND-VOORVERWARMING. Dat is de grootste comfort-hefboom:
-    de kamer warm hebben vóór de dag-sprong, zodat de WP geen harde koude-recovery hoeft (waar hij
-    z'n compressor-plafond raakt). Nachtelijke setback verlaagt bovendien aanvoer + draaiuren.
-  * GEEN prijs/PV-sturing en GEEN flow-curve — dat is de OTThing z'n eigen stooklijn (fase 2 =
-    roomSetpoint schuiven op prijs/PV via de buffer).
-  * publiceert een SCHONE buitentemp naar outsideTemp/set: de huidig-slot forecast_temp_c uit
-    battery_schedule (KNMI HARMONIE AROME / Open-Meteo, unit-onafhankelijk). Dit VERVANGT de HA-
-    automation die nu de P60-luchtinlaat publiceert (die inlaat is ±3-4 °C vervuild rond
-    heating/defrost). LET OP: zet die HA-publisher uit, anders vechten twee bronnen om het topic.
-
-Veiligheid:
-  * WP_DRY_RUN=1 (default): berekent + logt wat het ZOU publiceren, publiceert NIETS. Zo valideren
-    we eerst tegen de werkelijkheid voordat het de verwarming aanraakt.
-  * comfort-bodem: nooit onder WP_COMFORT_FLOOR.
-  * best-effort: een DB- of MQTT-fout mag de lus nooit breken.
-
-ENV (met veilige defaults; .env hoeft niet aangepast om in DRY_RUN te draaien):
-  DB_HOST/DB_USER/DB_PASSWORD/DB_NAME/DB_TABLE     — nieuwste energy-rij (kamer/buiten)
-  MQTT_BROKER/MQTT_PORT/MQTT_USERNAME/MQTT_PASSWORD — broker (192.168.178.251)
-  MQTT_OTTHING_TOPIC                                — bv. otthing/CE150C/state -> basis otthing/CE150C
-  WP_DRY_RUN            (default 1)   roomSetpoint: 1=alleen loggen, 0=echt publiceren
-  WP_CHANNEL           (default 1)   OTThing-verwarmingscircuit (1 = P60)
-  WP_SCHEDULE          (default "05:00=20.0,06:00=20.5,07:00=21.0,19:00=19.0")  dag/nacht-breekpunten
-                                     "HH:MM=temp,...". Elk breekpunt geldt tot het volgende; vóór het
-                                     eerste wrapt het naar het laatste (vorige dag). Getrapte ochtend-
-                                     recovery = zacht voor de WP (hoge COP). Geen comfort-bodem/cold-
-                                     scaled preheat meer: het schema is expliciet (fallback = de fysieke
-                                     thermostaat + OTThing-suspend).
-  WP_CHECK_INTERVAL    (default 300)  seconden
-  WP_PUBLISH_OUTSIDE   (default 1)    schone forecast-buitentemp -> outsideTemp/set publiceren
-  WP_OUTSIDE_DRY_RUN   (default = WP_DRY_RUN)  APARTE dry-run voor de buitentemp; zo kun je de
-                                     buitentemp LIVE zetten (0) terwijl roomSetpoint droog blijft
-  WP_SCHED_TABLE       (default battery_schedule)  bron van forecast_temp_c (huidig slot)
-  WP_OUTSIDE_MIN/MAX   (default -40/50)  plausibiliteits-clip tegen een default/garbage-waarde
-
-Retour-buffer-klep-LOGGING (fase 1 = ALLEEN loggen, nog GEEN besturing):
-  De 3-weg retour-buffer-klep hangt sinds 2026-10-15 aan een Zigbee-plug (Third Reality) i.p.v. de
-  Resol (het oude Resol-R6-kanaal is defect). Deze service is de sole writer van de echte klepstand in
-  energy.buffer_valve_state (1=ON=via buffer, 0=direct) + energy.buffer_valve_power_w (~1,8 W bekrachtigd
-  = bevestiging dat de klep écht schakelde). We LEZEN alleen (een achtergrond-abonnement op de plug +
-  een read-only /get-prik per cyclus voor een verse meting); het COMMANDEREN van de klep komt in fase 2.
-  WP_VALVE_LOG         (default 1)   0 = klep-logging uit
-  WP_VALVE_TOPIC       (default zigbee2mqtt/230V smart switch 5 3-way retour-buffer-valve)
-  WP_VALVE_STALE_S     (default 660) ouder dan dit (s) sinds de laatste plug-melding -> eerlijke NULL
-                                     (plug stil/offline) i.p.v. een bevroren waarde doorschrijven
+Werking, vereiste OTThing-instellingen en ALLE knoppen (WP_*) met hun standaard: zie README.md.
+Best-effort: een DB- of MQTT-fout mag de lus nooit breken.
 """
 
 import json
@@ -123,6 +80,16 @@ def parse_curve(s):
             continue
     out.sort(key=lambda p: p[0], reverse=True)
     return out
+
+
+def outside_for_curve(outside, cfg):
+    """PUUR: de buitentemp voor de curve. Zonder meting (HA-voeler en KNMI allebei weg) een vaste
+    aanname i.p.v. geen aanvoer — zonder aanvoer zou de WP uitgaan en daarna 60 min stilstaan.
+    De room-compensatie corrigeert een te lage aanname. Wordt NIET naar de OTThing gepubliceerd."""
+    if outside is not None:
+        return outside
+    dbg("CTRL", f"geen buitentemp -> curve rekent met aanname {cfg['outside_fallback']} °C")
+    return cfg["outside_fallback"]
 
 
 def curve_flow(outside, pts):
@@ -212,6 +179,18 @@ def regulated_flow(base, boost, cfg):
     return round(max(cfg["flow_min"], min(base + boost, cfg["flow_cap"])), 1)
 
 
+def limit_flow_drop(flow, state, max_drop):
+    """Aanvoerdoel mag per cyclus hooguit `max_drop` °C dalen (stijgen mag direct). Een plotse daling
+    — bv. het einde van een bump, of de P-term die wegvalt — zet het doel onder het retourwater: de
+    WP schiet er op z'n minimum overheen, stopt, en staat dan 60 min stil (10-24 15:45: 43 -> 35 in
+    20 min, retour 42). state['flow'] = het vorige doel; None (WP uit) = geen rem."""
+    last = state.get("flow")
+    if flow is not None and last is not None and flow < last - max_drop:
+        flow = round(last - max_drop, 1)
+    state["flow"] = flow
+    return flow
+
+
 def build_cfg():
     base = os.environ.get("MQTT_OTTHING_TOPIC", "otthing/CE150C/state")
     base = base[:-len("/state")] if base.endswith("/state") else base
@@ -269,9 +248,12 @@ def build_cfg():
         "rc_neg_max":   float(os.environ.get("WP_ROOMCOMP_NEG_MAX", "8")),
         "flow_min": float(os.environ.get("WP_FLOW_MIN", "28")),
         "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
+        "flow_max_drop": float(os.environ.get("WP_FLOW_MAX_DROP", "1.0")),  # °C per cyclus omlaag
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
         "out_max":   float(os.environ.get("WP_OUTSIDE_MAX", "50")),
+        # aanname als er geen buitentemp is (beter een gematigde aanvoer dan de WP uit + 60 min)
+        "outside_fallback": float(os.environ.get("WP_OUTSIDE_FALLBACK", "15")),
         "valve_log": os.environ.get("WP_VALVE_LOG", "1") not in ("0", "false", "False", ""),
         "valve_topic": os.environ.get("WP_VALVE_TOPIC",
                                       "zigbee2mqtt/230V smart switch 5 3-way retour-buffer-valve"),
@@ -325,6 +307,48 @@ def decide_setpoint(now, cfg):
     return schedule_setpoint(now, cfg["schedule"])
 
 
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_state.json")
+STATE_MAX_AGE_S = 900   # aan/uit-stand en I-term ouder dan dit zijn niet meer representatief
+
+
+def save_state(ovr_state, heat_state, i_state, now, path=STATE_FILE):
+    """Bewaar wat een herstart anders kwijtraakt: een lopend bump-venster, de aan/uit-stand van de
+    hysterese en de I-term. Best-effort."""
+    until = ovr_state.get("ovr_until")
+    d = {"saved": now.isoformat(timespec="seconds"),
+         "ovr_until": until.isoformat(timespec="seconds") if until else None,
+         "ovr_target": ovr_state.get("ovr_target") if until else None,
+         "heat": heat_state.get("heat"), "flow": heat_state.get("flow"), "i": i_state.get("i")}
+    try:
+        with open(path, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        dbg("CTRL", f"runtime-state bewaren faalde: {e}")
+
+
+def load_state(now, path=STATE_FILE, max_age_s=STATE_MAX_AGE_S):
+    """(ovr, heat, i) uit het bewaarde bestand, elk {} als er niets bruikbaars is. Het bump-venster
+    geldt tot z'n eigen eindtijd; aan/uit en I alleen als het bestand jonger is dan max_age_s.
+    Draait de knop intussen terug onder de drempel, dan breekt decide_with_override de bump af."""
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        saved = datetime.fromisoformat(d["saved"])
+    except Exception:
+        return {}, {}, {}
+    ovr = {}
+    if d.get("ovr_until"):
+        until = datetime.fromisoformat(d["ovr_until"])
+        if until > now:
+            ovr = {"ovr_until": until, "ovr_target": float(d["ovr_target"])}
+    fresh = 0 <= (now - saved).total_seconds() <= max_age_s
+    heat = {"heat": bool(d["heat"])} if fresh and d.get("heat") is not None else {}
+    if heat and d.get("flow") is not None:
+        heat["flow"] = float(d["flow"])
+    i = {"i": float(d["i"])} if fresh and d.get("i") is not None else {}
+    return ovr, heat, i
+
+
 def decide_with_override(now, thermostat_setp, state, cfg):
     """PUUR: wrapt decide_setpoint met de handmatige-override-regel.
 
@@ -353,7 +377,8 @@ def decide_with_override(now, thermostat_setp, state, cfg):
         # (een None-lezing wist het venster NIET: een transiënte read-fout mag een boost niet afbreken.)
         state["ovr_until"] = None
         state["ovr_target"] = None
-    state["last_setp"] = thermostat_setp
+    if thermostat_setp is not None:      # een gemiste lezing wist het referentiepunt niet
+        state["last_setp"] = thermostat_setp
 
     until = state.get("ovr_until")
     if until is not None and now < until:
@@ -619,7 +644,7 @@ def request_valve(cfg):
 # (iemand draait de wandthermostaat omhoog). Daarom een APARTE achtergrond-MQTT-client op
 # <base>/state (update elke 1-2 s): die houdt de Honeywell-setpoint seconden-vers en wekt de
 # hoofdlus bij een draai-omhoog, zodat de WP binnen seconden reageert i.p.v. na ~5-10 min.
-_thermo_cache = {"setpoint": None, "ts": None}
+_thermo_cache = {"setpoint": None, "ts": None, "bump_from": None}
 _thermo_lock  = threading.Lock()
 _bump_event   = threading.Event()
 
@@ -660,7 +685,16 @@ def _on_thermo_msg(client, userdata, msg):
         _thermo_cache["ts"] = datetime.now()
     if is_bump(setp, prev, thr):
         dbg("CTRL", f"BUMP via MQTT: {prev} -> {setp}°C (wek de lus voor directe reactie)")
+        with _thermo_lock:
+            _thermo_cache["bump_from"] = prev      # de lus ziet de dip zelf niet (tussen twee cycli)
         _bump_event.set()
+
+
+def take_bump_from():
+    """De stand vóór de laatste door de listener geziene bump (en wis hem), of None."""
+    with _thermo_lock:
+        prev, _thermo_cache["bump_from"] = _thermo_cache["bump_from"], None
+    return prev
 
 
 def start_thermo_listener(cfg):
@@ -758,6 +792,71 @@ def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, boost=Non
         dbg("SHADOW", f"write_shadow faalde: {e}")
 
 
+HA_STATE_TOPIC = "wp_control/state"
+# (sleutel, naam, eenheid). HA leidt de entity-id af van device + naam (sensor.wp_control_setpoint_pi5,
+# sensor.wp_control_aanvoer_curve_p_i, ...) — een naam wijzigen verandert dus niets aan een bestaande id.
+HA_SENSORS = [
+    ("setpoint", "Setpoint (pi5)", "°C"),
+    ("setpoint_nominal", "Setpoint nominaal", "°C"),
+    ("bump_left", "Bump resterend", "min"),
+    ("room", "Kamer", "°C"),
+    ("outside", "Buiten (regeling)", "°C"),
+    ("flow_base", "Aanvoer curve", "°C"),
+    ("flow_p", "Aanvoer curve+P", "°C"),
+    ("flow_pi", "Aanvoer curve+P+I", "°C"),
+    ("flow_target", "Aanvoer target", "°C"),
+    ("p", "Room-comp P", "°C"),
+    ("i", "Room-comp I", "°C"),
+    ("heat", "Warmtevraag (pi5)", None),
+]
+
+
+def ha_discovery_msgs():
+    """PUUR: (topic, payload) per HA-sensor; alle lezen uit één retained JSON op HA_STATE_TOPIC."""
+    msgs = []
+    for key, name, unit in HA_SENSORS:
+        conf = {"name": name, "unique_id": f"wp_control_{key}",
+                "state_topic": HA_STATE_TOPIC, "value_template": f"{{{{ value_json.{key} }}}}",
+                "device": {"identifiers": ["wp_control"], "name": "wp_control"}}
+        if unit:
+            conf.update(unit_of_measurement=unit, state_class="measurement",
+                        device_class="temperature" if unit == "°C" else "duration")
+        msgs.append((f"homeassistant/sensor/wp_control/{key}/config", json.dumps(conf)))
+    return msgs
+
+
+def bump_minutes_left(ovr_state, now):
+    """PUUR: hele minuten dat de lopende bump nog geldt (naar boven afgerond), 0 zonder bump."""
+    until = ovr_state.get("ovr_until")
+    if until is None or until <= now:
+        return 0
+    return int(-(-(until - now).total_seconds() // 60))
+
+
+def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_left=0):
+    """PUUR: de regel-tussenstappen voor het HA-dashboard. flow_p/flow_pi = curve + P (+ I), vóór de
+    begrenzing op [flow_min, flow_cap]; flow_target is wat er echt naar de WP gaat. sp_nominal = wat
+    het schema nu zou geven (zonder bump)."""
+    def r(x):
+        return None if x is None else round(x, 1)
+    has_base = base is not None
+    return {"setpoint": r(sp), "setpoint_nominal": r(sp_nominal), "bump_left": bump_left,
+            "room": r(room), "outside": r(outside),
+            "flow_base": r(base),
+            "flow_p": r(base + p) if has_base else None,
+            "flow_pi": r(base + p + i) if has_base else None,
+            "flow_target": r(flow), "p": r(p), "i": r(i), "heat": int(bool(heat))}
+
+
+def publish_ha(cfg, state, with_discovery=False):
+    """Telemetrie naar HA (geen sturing -> niet gated door dry-run). retain: HA heeft na een herstart
+    meteen de laatste waarden."""
+    if with_discovery:
+        for topic, payload in ha_discovery_msgs():
+            _mqtt_publish(topic, payload, cfg, False, retain=True)
+    _mqtt_publish(HA_STATE_TOPIC, json.dumps(state), cfg, False, retain=True)
+
+
 def command_wp(cfg, heat, flow, sp=None):
     """LIVE WP-aansturing door pi5new. heat -> chMode1=heat + chSetTemp1=<flow> (de WP volgt dat,
     want overrideChFlow1 staat AAN); uit -> chMode1=off (WP-target -> 0 = veilige default, WP uit).
@@ -811,9 +910,20 @@ def main():
         start_valve_listener(cfg)
     ensure_shadow_columns(cfg)           # shadow-vergelijking met de OTThing (DRY)
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
+    # wacht kort op een verse Honeywell-stand: de DB-rij kan nog de stand van vóór een draai bevatten
+    for _ in range(15):
+        if live_setpoint(cfg) is not None:
+            break
+        sleep(1)
     ovr_state = {"ovr_until": None, "ovr_target": None, "last_setp": None}
     heat_state = {}                      # stateful hysterese voor de aan/uit-beslissing
-    i_state = {"i": 0.0}                 # gedempte-I integrator voor de room-comp (reset bij herstart)
+    i_state = {"i": 0.0}                 # gedempte-I integrator voor de room-comp
+    r_ovr, r_heat, r_i = load_state(datetime.now())   # een herstart verandert het gedrag niet
+    ovr_state.update(r_ovr); heat_state.update(r_heat); i_state.update(r_i)
+    dbg("CTRL", f"runtime-state hersteld: bump={ovr_state['ovr_target']}"
+                + (f" tot {ovr_state['ovr_until']:%H:%M}" if ovr_state["ovr_until"] else "")
+                + f" heat={heat_state.get('heat')} I={i_state['i']}")
+    ha_announced = False                 # HA-discovery één keer per proces-start
     while True:
         if cfg["valve_log"]:
             write_valve(cfg)              # schrijf de verse (door reports + vorige /get) gecachete stand
@@ -821,7 +931,11 @@ def main():
         sp_live = live_setpoint(cfg)                 # seconden-verse Honeywell-setpoint (MQTT)
         sp_now = sp_live if sp_live is not None else sp_db
         src = "MQTT-live" if sp_live is not None else "DB-5min"
-        sp, reason = decide_with_override(datetime.now(), sp_now, ovr_state, cfg)
+        bump_from = take_bump_from()
+        if bump_from is not None:
+            ovr_state["last_setp"] = bump_from       # zodat een snelle dip+omhoog als bump telt
+        # alleen een live-stand mag een bump starten of beëindigen; de DB-rij loopt tot 5 min achter
+        sp, reason = decide_with_override(datetime.now(), sp_live, ovr_state, cfg)
         dbg("CTRL", f"kamer={room} buiten={outside} thermostaat_vraag={sp_now}({src}) "
                     f"-> gewenst={sp} ({reason})")
         if not cfg["control_live"]:
@@ -841,6 +955,7 @@ def main():
             else:
                 dbg("CTRL", "geen verse forecast-buitentemp (geen huidig slot / buiten bereik) "
                             "-> outsideTemp niet gepubliceerd")
+        ot = outside_for_curve(ot, cfg)
 
         # (OVERLAY #1 cold-scaled preheat `compute_flow_target` bestaat nog als functie voor de latere
         #  preheat-overlay bovenop de curve, maar wordt niet meer per cyclus gelogd — [REGEL] hieronder
@@ -855,9 +970,22 @@ def main():
         base = curve_flow(ot, cfg["curve"])
         headroom = None if base is None else (cfg["flow_cap"] - base)   # ruimte tot de cap = anti-windup
         boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom)
-        flow = regulated_flow(base, boost, cfg)
         heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
+        flow_raw = regulated_flow(base, boost, cfg)
+        if heat:
+            flow = limit_flow_drop(flow_raw, heat_state, cfg["flow_max_drop"])
+        else:
+            flow, heat_state["flow"] = flow_raw, None   # na een stop begint de rem opnieuw
+        if flow != flow_raw:
+            dbg("CTRL", f"aanvoer-rem: {flow_raw} -> {flow}°C (max -{cfg['flow_max_drop']}°C/cyclus)")
         command_wp(cfg, heat, flow, sp)
+        save_state(ovr_state, heat_state, i_state, datetime.now())
+        p_term = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"], cfg["rc_neg_max"])
+        now = datetime.now()
+        publish_ha(cfg, ha_state(sp, room, ot, base, p_term, i_term, flow, heat,
+                                 decide_setpoint(now, cfg)[0], bump_minutes_left(ovr_state, now)),
+                   not ha_announced)
+        ha_announced = True
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
                     f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost}"
                     f"(P+I, I={i_term}) -> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")

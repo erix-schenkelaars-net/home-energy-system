@@ -39,3 +39,6 @@ energy-agent/
 battery_optimizer/sph5k.conf
 tools/*.csv
 tools/*.png
+
+# wp_control: runtime-state (bump, aan/uit, I-term) die een herstart overleeft
+wp_control/runtime_state.json
