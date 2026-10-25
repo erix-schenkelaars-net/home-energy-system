@@ -925,3 +925,14 @@ class TestFlowDropLimit(unittest.TestCase):
         _, heat, _ = wp.load_state(now, path)
         self.assertEqual(heat, {"heat": True, "flow": 39.5})
 
+
+class TestDefaultSchedule(unittest.TestCase):
+    def test_half_hourly_morning_ramp(self):
+        sched = wp.parse_schedule(wp.DEFAULT_SCHEDULE)
+        temps = [t for _, t in sched]
+        self.assertEqual(temps, [19.5, 20.0, 20.5, 21.0, 21.5, 19.0])
+        sp, _ = wp.decide_setpoint(datetime(2026, 10, 26, 12, 0), {"schedule": sched})
+        self.assertEqual(sp, 21.5)
+        sp, _ = wp.decide_setpoint(datetime(2026, 10, 26, 3, 0), {"schedule": sched})
+        self.assertEqual(sp, 19.0)
+

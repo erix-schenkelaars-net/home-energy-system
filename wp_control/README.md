@@ -92,7 +92,7 @@ them).
 
 | variable | default | meaning |
 |---|---|---|
-| `WP_SCHEDULE` | `05:00=20.0,06:00=20.5,07:00=21.0,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next. **Set in `.env`** (per house) |
+| `WP_SCHEDULE` | `04:30=19.5,05:00=20.0,05:30=20.5,06:00=21.0,06:30=21.5,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). Night 19 °C; from 04:30 +0.5 °C every half hour up to 21.5 °C, a gradual morning warm-up that keeps the flow temperature low |
 | `WP_OVERRIDE_THRESHOLD` | `21.5` | Honeywell above this = bump |
 | `WP_OVERRIDE_MAX` | `23.0` | upper limit of a bump |
 | `WP_OVERRIDE_HOLD_S` | `3600` | how long a bump lasts |
