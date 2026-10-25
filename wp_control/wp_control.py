@@ -758,13 +758,23 @@ def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, boost=Non
         dbg("SHADOW", f"write_shadow faalde: {e}")
 
 
-def command_wp(cfg, heat, flow):
+def command_wp(cfg, heat, flow, sp=None):
     """LIVE WP-aansturing door pi5new. heat -> chMode1=heat + chSetTemp1=<flow> (de WP volgt dat,
     want overrideChFlow1 staat AAN); uit -> chMode1=off (WP-target -> 0 = veilige default, WP uit).
     Gated door cfg['control_live'] (0 = alleen loggen). retain=True: de OTThing houdt de stand tussen
-    cycli. Best-effort via _mqtt_publish."""
+    cycli. Best-effort via _mqtt_publish.
+
+    Elke cyclus claimt pi5new ook de CH-enable (2026-10-25, bewezen op de bus): overrideChOn1=ON laat
+    de OTThing het enable-bit van de Honeywell vervangen door z'n eigen getChOn() (= chMode≠off);
+    roomMode1=heat omdat roomMode=off getChOn() altijd false maakt. `sp` -> roomSetpoint1: de OTThing
+    room-suspend (setpoint+1,5) rekent dan met ONS setpoint (bron = MQTT in de OTThing-config), niet
+    met de Honeywell-knop — en blijft zo een vangnet als wp_control uitvalt."""
     ch = cfg["channel"]
     dry = not cfg["control_live"]
+    _mqtt_publish(f"{cfg['base_topic']}/roomMode{ch}/set", "heat", cfg, dry, retain=True)
+    _mqtt_publish(f"{cfg['base_topic']}/overrideChOn{ch}/set", "ON", cfg, dry, retain=True)
+    if sp is not None:
+        _mqtt_publish(f"{cfg['base_topic']}/roomSetpoint{ch}/set", str(sp), cfg, dry, retain=True)
     if heat and flow is not None:
         _mqtt_publish(f"{cfg['base_topic']}/chMode{ch}/set", "heat", cfg, dry, retain=True)
         _mqtt_publish(f"{cfg['base_topic']}/chSetTemp{ch}/set", str(flow), cfg, dry, retain=True)
@@ -776,12 +786,14 @@ def command_wp(cfg, heat, flow):
 def main():
     cfg = build_cfg()
     sched_txt = ",".join(f"{mm//60:02d}:{mm%60:02d}->{t}" for mm, t in cfg["schedule"]) or "(leeg)"
-    dbg("CONF", f"wp_control start — DRY_RUN={cfg['dry_run']} kanaal={cfg['channel']} "
+    # roomSetpoint gaat live mee met command_wp zodra de regeling live is; WP_DRY_RUN telt dan niet meer
+    sp_live = cfg["control_live"] or not cfg["dry_run"]
+    dbg("CONF", f"wp_control start — kanaal={cfg['channel']} "
                 f"schema=[{sched_txt}] interval={cfg['interval']}s "
-                f"setpoint[{'DRY' if cfg['dry_run'] else 'LIVE'}]->{cfg['base_topic']}/roomSetpoint{cfg['channel']}/set "
+                f"setpoint[{'LIVE' if sp_live else 'DRY'}]->{cfg['base_topic']}/roomSetpoint{cfg['channel']}/set "
                 f"buiten[{'uit' if not cfg['publish_outside'] else ('DRY' if cfg['outside_dry_run'] else 'LIVE')}]"
                 f"->{cfg['base_topic']}/outsideTemp/set")
-    dbg("CONF", f"roomSetpoint = {'DROOG (logt alleen)' if cfg['dry_run'] else 'LIVE — publiceert!'} | "
+    dbg("CONF", f"roomSetpoint = {'LIVE — publiceert!' if sp_live else 'DROOG (logt alleen)'} | "
                 f"buitentemp = {'DROOG' if cfg['outside_dry_run'] else 'LIVE — publiceert!'}"
                 + ("" if cfg["outside_dry_run"] else "  (zorg dat de HA-P60-inlaat-publisher UIT staat!)"))
     dbg("CONF", f"klep-logging {'AAN' if cfg['valve_log'] else 'UIT'}"
@@ -812,7 +824,8 @@ def main():
         sp, reason = decide_with_override(datetime.now(), sp_now, ovr_state, cfg)
         dbg("CTRL", f"kamer={room} buiten={outside} thermostaat_vraag={sp_now}({src}) "
                     f"-> gewenst={sp} ({reason})")
-        publish_setpoint(sp, cfg)
+        if not cfg["control_live"]:
+            publish_setpoint(sp, cfg)        # live gaat het setpoint mee met command_wp (retained)
 
         # schone buitentemp (KNMI-forecast, huidig slot) -> outsideTemp/set, vervangt P60-inlaat.
         # Altijd lezen (ook voor overlay #1 hieronder); publiceren blijft gated door publish_outside.
@@ -844,7 +857,7 @@ def main():
         boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom)
         flow = regulated_flow(base, boost, cfg)
         heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
-        command_wp(cfg, heat, flow)
+        command_wp(cfg, heat, flow, sp)
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
                     f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost}"
                     f"(P+I, I={i_term}) -> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")

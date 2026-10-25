@@ -431,14 +431,33 @@ class TestCommandWp(unittest.TestCase):
         self.assertIn("otthing/CE150C/chMode1/set", topics)
         self.assertIn("otthing/CE150C/chSetTemp1/set", topics)
 
-    def test_live_off_publishes_mode_off_only(self):
+    def test_live_off_publishes_mode_off_and_no_flow(self):
         wp.mqtt_publish.single.reset_mock()
         c = wp.build_cfg(); c["control_live"] = True
         wp.command_wp(c, heat=False, flow=32.4)
-        self.assertEqual(wp.mqtt_publish.single.call_count, 1)
-        args = wp.mqtt_publish.single.call_args.args
-        self.assertEqual(args[0], "otthing/CE150C/chMode1/set")
-        self.assertEqual(wp.mqtt_publish.single.call_args.kwargs["payload"], "off")
+        sent = {call.args[0]: call.kwargs["payload"] for call in wp.mqtt_publish.single.call_args_list}
+        self.assertEqual(sent["otthing/CE150C/chMode1/set"], "off")
+        self.assertNotIn("otthing/CE150C/chSetTemp1/set", sent)
+
+    def test_live_claims_ch_enable_from_honeywell(self):
+        # overrideChOn1=ON + roomMode1=heat: de OTThing vervangt het Honeywell-enable-bit door chMode;
+        # roomMode=off zou het bit altijd UIT dwingen. Retained, zodat het een reconnect overleeft.
+        for heat in (True, False):
+            wp.mqtt_publish.single.reset_mock()
+            c = wp.build_cfg(); c["control_live"] = True
+            wp.command_wp(c, heat=heat, flow=32.4, sp=22.0)
+            calls = {call.args[0]: call.kwargs for call in wp.mqtt_publish.single.call_args_list}
+            self.assertEqual(calls["otthing/CE150C/overrideChOn1/set"]["payload"], "ON")
+            self.assertEqual(calls["otthing/CE150C/roomMode1/set"]["payload"], "heat")
+            self.assertEqual(calls["otthing/CE150C/roomSetpoint1/set"]["payload"], "22.0")
+            self.assertTrue(all(kw["retain"] for kw in calls.values()))
+
+    def test_live_without_setpoint_skips_room_setpoint(self):
+        wp.mqtt_publish.single.reset_mock()
+        c = wp.build_cfg(); c["control_live"] = True
+        wp.command_wp(c, heat=True, flow=32.4)
+        topics = [call.args[0] for call in wp.mqtt_publish.single.call_args_list]
+        self.assertNotIn("otthing/CE150C/roomSetpoint1/set", topics)
 
 
 class TestParseValve(unittest.TestCase):
@@ -698,3 +717,4 @@ class TestComputeFlowTarget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
