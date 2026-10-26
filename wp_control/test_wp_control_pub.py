@@ -347,7 +347,22 @@ class TestRoomCompPi(unittest.TestCase):
     def test_build_cfg_pi_defaults(self):
         cfg = wp.build_cfg()
         self.assertEqual((cfg["rc_ki"], cfg["rc_i_max"], cfg["rc_damp_band"], cfg["rc_damp_leak"]),
-                         (0.3, 8.0, 1.5, 0.2))
+                         (0.5, 8.0, 0.2, 0.2))
+
+    def test_defaults_clear_a_persistent_droop(self):
+        # 2026-10-26: kamer bleef 0,4 °C onder het setpoint en I zakte (2,45 -> 0,67). Met de
+        # standaarden moet I bij zo'n vast tekort blijven groeien i.p.v. een plafond te vinden.
+        cfg = wp.build_cfg()
+        st = {"i": 0.67}
+        seen = [wp.room_comp_pi(21.1, 21.5, st, cfg)[1] for _ in range(6)]
+        self.assertTrue(all(b > a for a, b in zip(seen, seen[1:])))
+        self.assertGreater(seen[-1], 1.5)
+
+    def test_defaults_still_bleed_at_setpoint(self):
+        cfg = wp.build_cfg()
+        st = {"i": 3.0}
+        wp.room_comp_pi(21.5, 21.5, st, cfg)
+        self.assertLess(st["i"], 3.0)
 
     def test_above_setpoint_boost_goes_negative(self):
         st, cfg = {"i": 0.0}, dict(self._cfg(), rc_neg_max=8.0)

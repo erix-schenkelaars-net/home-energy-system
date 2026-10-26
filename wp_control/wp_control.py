@@ -241,9 +241,13 @@ def build_cfg():
         # °C kamer-tekort); rc_i_max = harde begrenzing op de integrator; demping = de integrator
         # bloedt af naarmate de kamer het setpoint nadert (rc_damp_leak, ramp over rc_damp_band °C) én
         # bevriest zolang de aanvoer tegen zijn plafond zit (anti-windup). Zie room_comp_pi.
-        "rc_ki":        float(os.environ.get("WP_ROOMCOMP_KI", "0.3")),
+        # 2026-10-26: Ki 0.3 -> 0.5 en band 1.5 -> 0.2. Bij een vast tekort e stabiliseert I op
+        # Ki·e / (leak·(1 - e/band)); met de oude waarden bleef dat ~0.8 °C en hing de kamer de hele
+        # ochtend 0.4 °C onder het setpoint (I liep leeg terwijl het tekort bleef). Nu lekt I pas
+        # binnen 0.2 °C van het setpoint en groeit hij daarbuiten vrij.
+        "rc_ki":        float(os.environ.get("WP_ROOMCOMP_KI", "0.5")),
         "rc_i_max":     float(os.environ.get("WP_ROOMCOMP_I_MAX", "8")),
-        "rc_damp_band": float(os.environ.get("WP_ROOMCOMP_DAMP_BAND", "1.5")),
+        "rc_damp_band": float(os.environ.get("WP_ROOMCOMP_DAMP_BAND", "0.2")),
         "rc_damp_leak": float(os.environ.get("WP_ROOMCOMP_DAMP_LEAK", "0.2")),
         # negatieve room-comp: kamer boven setpoint -> aanvoer tot rc_neg_max °C ONDER de curve, nooit
         # onder flow_min. Zo draait de WP laag door i.p.v. aan/uit te pendelen.

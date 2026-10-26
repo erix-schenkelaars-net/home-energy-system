@@ -115,9 +115,9 @@ them).
 | `WP_ROOMCOMP_KP` | `4` | P: °C of flow per °C the room is short |
 | `WP_ROOMCOMP_MAX` | `10` | maximum positive compensation |
 | `WP_ROOMCOMP_NEG_MAX` | `8` | maximum negative compensation (room above setpoint) |
-| `WP_ROOMCOMP_KI` | `0.3` | I: build-up per cycle per °C short |
+| `WP_ROOMCOMP_KI` | `0.5` | I: build-up per cycle per °C short |
 | `WP_ROOMCOMP_I_MAX` | `8` | integrator ceiling |
-| `WP_ROOMCOMP_DAMP_BAND` | `1.5` | within this distance of the setpoint the integrator bleeds off |
+| `WP_ROOMCOMP_DAMP_BAND` | `0.2` | within this distance of the setpoint the integrator bleeds off. Too wide and the bleed cancels the integrator: at 1.5 °C the room hung 0.4 °C below the setpoint all morning |
 | `WP_ROOMCOMP_DAMP_LEAK` | `0.2` | how fast it bleeds off (strongest at the setpoint) |
 
 ### Outside temperature
