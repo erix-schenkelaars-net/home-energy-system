@@ -122,7 +122,7 @@ them).
 
 | variable | default | meaning |
 |---|---|---|
-| `WP_SCHEDULE` | `03:30=21.0,04:30=21.5,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). Night 19 °C; the warm-up starts at 03:30 in the cheap night hours so the house is warm before the 07–09 price peak (the old 04:30–06:30 ramp only started heating at 05:30 and ran through the peak) |
+| `WP_SCHEDULE` | `02:30=20.0,03:00=20.5,03:30=21.0,04:00=21.5,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). Night 19 °C; +0.5 °C every half hour from 02:30, in the cheap night hours, so the house is warm before the 07–09 price peak. On a mild night the first steps sit below the room and the heat pump starts around 03:00–03:30; on a cold night they are real 0.5 °C steps, so the flow never jumps (the old 04:30–06:30 ramp only started heating at 05:30 and ran through the peak) |
 | `WP_OVERRIDE_THRESHOLD` | `21.5` | Honeywell above this = bump |
 | `WP_OVERRIDE_MAX` | `23.0` | upper limit of a bump |
 | `WP_OVERRIDE_HOLD_S` | `3600` | how long a bump lasts |

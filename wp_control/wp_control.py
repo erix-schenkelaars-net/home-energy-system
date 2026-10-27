@@ -37,11 +37,12 @@ def dbg(area, msg):
 # (zacht voor de WP → hoge COP) gewoon een paar punten. Nacht = de laagste blokken; geen comfort-bodem
 # (in bed), en geen cold-scaled voorverwarming meer — het schema is expliciet (fallback-thermostaat +
 # OTThing-suspend blijven het echte veiligheidsvangnet).
-# 's nachts 19, om 03:30 naar 21,0 en om 04:30 naar 21,5. De oude ramp (04:30..06:30) stookte pas
-# vanaf 05:30 (de eerste stappen lagen onder de kamer) en liep door de ochtendpiek: 10-27 was het
-# pas om 09:55 21,5. Nu is het warm vóór 07:00 en valt het opwarmen in de goedkope nachturen; de
-# kleine stap (P ~2-3 °C aanvoer) houdt de WP laag en op hoge COP.
-DEFAULT_SCHEDULE = "03:30=21.0,04:30=21.5,19:00=19.0"
+# 's nachts 19, vanaf 02:30 elk half uur +0,5 naar 21,5 om 04:00. De oude ramp (04:30..06:30)
+# stookte pas vanaf 05:30 (de eerste stappen lagen onder de kamer) en liep door de ochtendpiek:
+# 10-27 was het pas om 09:55 21,5. Op een zachte nacht (kamer ~20,4) doen de eerste stappen niets
+# en start de WP rond 03:00-03:30, in de goedkope nachturen; op een koude nacht zijn het echte
+# stappen van 0,5 °C, zodat de aanvoer nooit hard springt (user: geen sprong).
+DEFAULT_SCHEDULE = "02:30=20.0,03:00=20.5,03:30=21.0,04:00=21.5,19:00=19.0"
 
 
 def _hhmm_min(s, default=0):
