@@ -1015,6 +1015,7 @@ def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, boost=Non
 
 
 HA_STATE_TOPIC = "wp_control/state"
+HA_PLAN_TOPIC  = "wp_control/plan"
 # (sleutel, naam, eenheid). HA leidt de entity-id af van device + naam (sensor.wp_control_setpoint_pi5,
 # sensor.wp_control_aanvoer_curve_p_i, ...) — een naam wijzigen verandert dus niets aan een bestaande id.
 HA_SENSORS = [
@@ -1045,7 +1046,29 @@ def ha_discovery_msgs():
             conf.update(unit_of_measurement=unit, state_class="measurement",
                         device_class="temperature" if unit == "°C" else "duration")
         msgs.append((f"homeassistant/sensor/wp_control/{key}/config", json.dumps(conf)))
+    # het dagplan: state = het geplande setpoint nu, attributen = de hele dag per kwartier
+    plan = {"name": "Dagplan setpoint", "unique_id": "wp_control_day_plan",
+            "state_topic": HA_PLAN_TOPIC, "value_template": "{{ value_json.now }}",
+            "json_attributes_topic": HA_PLAN_TOPIC,
+            "json_attributes_template": "{{ {'times': value_json.times, "
+                                        "'setpoints': value_json.setpoints} | tojson }}",
+            "unit_of_measurement": "°C", "device_class": "temperature",
+            "device": {"identifiers": ["wp_control"], "name": "wp_control"}}
+    msgs.append(("homeassistant/sensor/wp_control/day_plan/config", json.dumps(plan)))
     return msgs
+
+
+def day_plan(now, cfg, price_win):
+    """PUUR: het setpoint dat de software vandaag per kwartier wil (schema + prijsvenster, zonder
+    bump of verlaging), voor de dag-grafiek in HA. -> payload-dict met times (lokaal ISO), setpoints
+    en now (het plan voor het lopende kwartier)."""
+    base = datetime(now.year, now.month, now.day)
+    times, sps = [], []
+    for k in range(96):
+        t = base + timedelta(minutes=15 * k)
+        times.append(t.isoformat(timespec="minutes"))
+        sps.append(price_overlay(t, *decide_setpoint(t, cfg), price_win, cfg)[0])
+    return {"now": sps[(now.hour * 60 + now.minute) // 15], "times": times, "setpoints": sps}
 
 
 def bump_minutes_left(ovr_state, now, key="ovr_until"):
@@ -1060,7 +1083,7 @@ def bump_minutes_left(ovr_state, now, key="ovr_until"):
 def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_left=0, lower_left=0):
     """PUUR: de regel-tussenstappen voor het HA-dashboard. flow_p/flow_pi = curve + P (+ I), vóór de
     begrenzing op [flow_min, flow_cap]; flow_target is wat er echt naar de WP gaat. sp_nominal = wat
-    het schema nu zou geven (zonder bump)."""
+    de software nu wil zonder bump of verlaging (schema + prijsvenster)."""
     def r(x):
         return None if x is None else round(x, 1)
     has_base = base is not None
@@ -1073,13 +1096,15 @@ def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_le
             "flow_target": r(flow), "p": r(p), "i": r(i), "heat": int(bool(heat))}
 
 
-def publish_ha(cfg, state, with_discovery=False):
+def publish_ha(cfg, state, with_discovery=False, plan=None):
     """Telemetrie naar HA (geen sturing -> niet gated door dry-run). retain: HA heeft na een herstart
     meteen de laatste waarden."""
     if with_discovery:
         for topic, payload in ha_discovery_msgs():
             _mqtt_publish(topic, payload, cfg, False, retain=True)
     _mqtt_publish(HA_STATE_TOPIC, json.dumps(state), cfg, False, retain=True)
+    if plan is not None:
+        _mqtt_publish(HA_PLAN_TOPIC, json.dumps(plan), cfg, False, retain=True)
 
 
 def command_wp(cfg, heat, flow, sp=None):
@@ -1223,10 +1248,11 @@ def main():
         save_state(ovr_state, heat_state, i_state, datetime.now())
         p_term = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"], cfg["rc_neg_max"])
         now = datetime.now()
+        plan = day_plan(now, cfg, price_win)
         publish_ha(cfg, ha_state(sp, room, ot, base, p_term, i_term, flow, heat,
-                                 decide_setpoint(now, cfg)[0], bump_minutes_left(ovr_state, now),
+                                 plan["now"], bump_minutes_left(ovr_state, now),
                                  bump_minutes_left(ovr_state, now, "und_until")),
-                   not ha_announced)
+                   not ha_announced, plan)
         ha_announced = True
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
                     f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost}"

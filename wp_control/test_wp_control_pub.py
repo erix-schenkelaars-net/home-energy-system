@@ -695,6 +695,28 @@ class TestTurnDown(unittest.TestCase):
         self.assertIn("homeassistant/sensor/wp_control/lower_left/config", dict(wp.ha_discovery_msgs()))
 
 
+class TestDayPlan(unittest.TestCase):
+    """Het dagplan voor de HA-grafiek: schema + prijsvenster per kwartier, zonder bump/verlaging."""
+
+    def test_whole_day_with_price_window(self):
+        c = dict(wp.build_cfg(), schedule=wp.parse_schedule(wp.DEFAULT_SCHEDULE))
+        day = datetime(2026, 10, 28)
+        win, _ = wp.price_windows(_prices(day), day, c)
+        plan = wp.day_plan(day.replace(hour=13, minute=10), c, win)
+        self.assertEqual(len(plan["times"]), 96)
+        self.assertEqual(plan["times"][0], "2026-10-28T00:00")
+        at = dict(zip(plan["times"], plan["setpoints"]))
+        self.assertEqual([at["2026-10-28T03:00"], at["2026-10-28T03:30"], at["2026-10-28T11:45"],
+                          at["2026-10-28T12:00"], at["2026-10-28T15:00"], at["2026-10-28T19:00"]],
+                         [19.0, 21.0, 21.5, 22.0, 21.0, 19.0])
+        self.assertEqual(plan["now"], 22.0)                # 13:10 valt in het oplaadblok
+
+    def test_discovery_has_plan_sensor_with_attributes(self):
+        conf = json.loads(dict(wp.ha_discovery_msgs())["homeassistant/sensor/wp_control/day_plan/config"])
+        self.assertEqual(conf["state_topic"], "wp_control/plan")
+        self.assertIn("setpoints", conf["json_attributes_template"])
+
+
 class TestDecideWithOverride(unittest.TestCase):
     # nominaal valt nu op het schema terug: 12:00 -> 21.0, 02:00 -> 19.0 (reden bevat "schema")
     def _cfg(self, **over):
@@ -996,7 +1018,11 @@ class TestHaTelemetry(unittest.TestCase):
         wp.publish_ha(c, {"setpoint": 21.5}, with_discovery=True)
         topics = [call.args[0] for call in wp.mqtt_publish.single.call_args_list]
         self.assertEqual(topics[-1], wp.HA_STATE_TOPIC)
-        self.assertEqual(len(topics), len(wp.HA_SENSORS) + 1)
+        self.assertEqual(len(topics), len(wp.HA_SENSORS) + 2)    # + dagplan-discovery
+        wp.mqtt_publish.single.reset_mock()
+        wp.publish_ha(c, {"setpoint": 21.5}, plan={"now": 21.5, "times": [], "setpoints": []})
+        topics = [call.args[0] for call in wp.mqtt_publish.single.call_args_list]
+        self.assertEqual(topics, [wp.HA_STATE_TOPIC, wp.HA_PLAN_TOPIC])
 
 
 class TestBumpBetweenCycles(unittest.TestCase):
