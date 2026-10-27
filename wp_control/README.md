@@ -20,8 +20,18 @@ Each cycle:
 1. **Setpoint** = the schedule (`WP_SCHEDULE`), unless someone turns the Honeywell above
    `WP_OVERRIDE_THRESHOLD`: that setting then applies (capped at `WP_OVERRIDE_MAX`) for
    `WP_OVERRIDE_HOLD_S` (a "bump"). Turning the knob back ends the bump at once. Turning it lower
-   has no other effect. Only a live MQTT reading of the knob starts or ends a bump; the database
-   row lags by up to 5 minutes.
+   has no other effect on a bump. Turning the knob **down** below what the software wants at that
+   moment (schedule and price overlay) applies that setting, absolute and at least
+   `WP_UNDERRIDE_MIN`, for `WP_UNDERRIDE_HOLD_S`. A new turn-down restarts the hour, any turn up
+   ends it (above the threshold it becomes a bump), and it never makes it warmer than the schedule.
+   Only a live MQTT reading of the knob starts or ends a bump; the database
+   row lags by up to 5 minutes. Outside a bump the **price overlay** adjusts the schedule: in
+   the cheapest `WP_PRICE_CHEAP_HOURS` block between `WP_PRICE_CHEAP_FROM` and `WP_PRICE_CHEAP_TO`
+   the setpoint goes to `WP_PRICE_CHEAP_SP` (store heat in the house), and from the end of that
+   block until `WP_PRICE_COAST_TO` it drops to `WP_PRICE_COAST_SP`, so the heat pump coasts
+   through the evening peak. Prices are the quarter-hour prices in `battery_schedule` (latest
+   optimizer run per slot). It only applies when the dearest `WP_PRICE_PEAK_HOURS` of the coast
+   are at least `WP_PRICE_MIN_SPREAD` dearer than the cheap block, and never raises a night setback.
 2. **On/off** (`decide_heat`): on below setpoint − `WP_HEAT_ON_BELOW`, off from setpoint +
    `WP_HEAT_OFF_ABOVE`; in between the previous state holds.
 3. **Flow target** = weather curve (`WP_FLOW_CURVE`, on the outside temperature) + room
@@ -56,6 +66,26 @@ Kept in [otthing_config.json](otthing_config.json), a redacted snapshot. Refresh
 `overrideChOn1=ON` makes the OTThing replace the Honeywell's CH-enable bit with its own decision
 (`chMode1`). With `roomMode1=off` that decision is always "off", which is why wp_control sets
 `roomMode1=heat`.
+
+### Honeywell clock program
+
+The Honeywell keeps its own clock program (05:00 20.0, 06:00 20.5, 07:00 21.0, 19:00 19.0) and its
+display shows that, not the pi5 setpoint. wp_control cannot tell a programmed step from a hand on
+the knob, so the program must contain **only one decrease in 24 hours**: 19:00 → 19.0. That one
+equals our own evening setback, so it is never "lower than the software wants" and does not count
+as a turn-down. A second programmed decrease is not supported: it would be taken as a manual
+turn-down. The morning steps up end a running turn-down, like any turn up.
+
+### OT event log
+
+To tell cause from effect when the heat pump stops, wp_control compares every OTThing `state`
+message (one per 5 s) with the previous one and logs a `[OTEV]` line whenever a stop-relevant field
+changes, with the full snapshot attached: compressor (`flame`, `ch_mode`, `slave_status`), what the
+Honeywell asks (`ru_maxmod`, `ru_ch_en`, a jump in `ru_ch_set`) and what the OTThing forwards
+(`m_maxmod`, `m_ch_en`). In Repeater mode the OTThing passes max relative modulation (OT ID 14)
+through unchanged; its own `maxModulation` setting only applies in Master modes. Log only, no DB.
+
+`grep OTEV logs/debug_YYYY-MM-DD.log`
 
 ### State across restarts
 
@@ -92,10 +122,18 @@ them).
 
 | variable | default | meaning |
 |---|---|---|
-| `WP_SCHEDULE` | `04:30=19.5,05:00=20.0,05:30=20.5,06:00=21.0,06:30=21.5,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). Night 19 °C; from 04:30 +0.5 °C every half hour up to 21.5 °C, a gradual morning warm-up that keeps the flow temperature low |
+| `WP_SCHEDULE` | `03:30=21.0,04:30=21.5,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). Night 19 °C; the warm-up starts at 03:30 in the cheap night hours so the house is warm before the 07–09 price peak (the old 04:30–06:30 ramp only started heating at 05:30 and ran through the peak) |
 | `WP_OVERRIDE_THRESHOLD` | `21.5` | Honeywell above this = bump |
 | `WP_OVERRIDE_MAX` | `23.0` | upper limit of a bump |
 | `WP_OVERRIDE_HOLD_S` | `3600` | how long a bump lasts |
+| `WP_UNDERRIDE_MIN` | `19.0` | lowest setpoint a turn-down can ask for |
+| `WP_UNDERRIDE_HOLD_S` | `3600` | how long a turn-down lasts |
+| `WP_PRICE_OVERLAY` | `1` | price overlay on (`0` = schedule only) |
+| `WP_PRICE_CHEAP_SP` / `WP_PRICE_COAST_SP` | `22.0` / `21.0` | setpoint while storing heat / while coasting (agreed comfort band) |
+| `WP_PRICE_CHEAP_HOURS` | `3` | length of the cheap block |
+| `WP_PRICE_CHEAP_FROM` / `WP_PRICE_CHEAP_TO` | `10:00` / `17:00` | the cheap block lies within this range |
+| `WP_PRICE_COAST_TO` | `19:00` | coasting ends here (the evening setback takes over) |
+| `WP_PRICE_PEAK_HOURS` / `WP_PRICE_MIN_SPREAD` | `2` / `0.05` | the dearest block of this length in the coast must be at least this much (€/kWh) dearer than the cheap block |
 
 ### On/off
 
@@ -116,9 +154,9 @@ them).
 | `WP_ROOMCOMP_MAX` | `10` | maximum positive compensation |
 | `WP_ROOMCOMP_NEG_MAX` | `8` | maximum negative compensation (room above setpoint) |
 | `WP_ROOMCOMP_KI` | `0.5` | I: build-up per cycle per °C short |
-| `WP_ROOMCOMP_I_MAX` | `8` | integrator ceiling |
-| `WP_ROOMCOMP_DAMP_BAND` | `0.2` | within this distance of the setpoint the integrator bleeds off. Too wide and the bleed cancels the integrator: at 1.5 °C the room hung 0.4 °C below the setpoint all morning |
-| `WP_ROOMCOMP_DAMP_LEAK` | `0.2` | how fast it bleeds off (strongest at the setpoint) |
+| `WP_ROOMCOMP_I_MAX` | `8` | integrator ceiling. The integrator also stops growing while the compressor stands still (`honeywell_ot_boiler_flame=0`): after a stop the pump stays off for 60 min whatever we ask, so a deficit then says nothing about the curve |
+| `WP_ROOMCOMP_DAMP_BAND` | `0.2` | the integrator bleeds off only when the room overshoots, reaching the full bleed at setpoint + this. At and below the setpoint it holds: there it carries what the curve lacks (a bleed at the setpoint emptied it in an hour and made the room swing) |
+| `WP_ROOMCOMP_DAMP_LEAK` | `0.2` | fraction of the integrator bled per cycle at full overshoot |
 
 ### Outside temperature
 

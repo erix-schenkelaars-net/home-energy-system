@@ -37,9 +37,11 @@ def dbg(area, msg):
 # (zacht voor de WP → hoge COP) gewoon een paar punten. Nacht = de laagste blokken; geen comfort-bodem
 # (in bed), en geen cold-scaled voorverwarming meer — het schema is expliciet (fallback-thermostaat +
 # OTThing-suspend blijven het echte veiligheidsvangnet).
-# 's nachts 19, vanaf 04:30 elk half uur +0,5 naar 21,5: een geleidelijke ochtend-opwarming houdt de
-# WP op lage aanvoer en hoge COP i.p.v. één harde sprong (en elke stop kost 60 min stilstand).
-DEFAULT_SCHEDULE = "04:30=19.5,05:00=20.0,05:30=20.5,06:00=21.0,06:30=21.5,19:00=19.0"
+# 's nachts 19, om 03:30 naar 21,0 en om 04:30 naar 21,5. De oude ramp (04:30..06:30) stookte pas
+# vanaf 05:30 (de eerste stappen lagen onder de kamer) en liep door de ochtendpiek: 10-27 was het
+# pas om 09:55 21,5. Nu is het warm vóór 07:00 en valt het opwarmen in de goedkope nachturen; de
+# kleine stap (P ~2-3 °C aanvoer) houdt de WP laag en op hoge COP.
+DEFAULT_SCHEDULE = "03:30=21.0,04:30=21.5,19:00=19.0"
 
 
 def _hhmm_min(s, default=0):
@@ -137,18 +139,26 @@ def room_comp_boost(room, setpoint, kp, boost_max, neg_max=0.0):
     return round(max(-neg_max, min(kp * (setpoint - room), boost_max)), 1) + 0.0   # +0.0: geen -0.0
 
 
-def room_comp_pi(room, setpoint, state, cfg, headroom=None):
+def room_comp_pi(room, setpoint, state, cfg, headroom=None, running=True):
     """PUUR + stateful: room-compensatie als GEDEMPTE PI -> extra aanvoer (°C) bovenop de curve.
 
     P (= room_comp_boost) reageert direct op het kamer-tekort; I bouwt het hardnekkige restant weg
     zodat de kamer ECHT naar het setpoint klimt i.p.v. er net onder te blijven hangen (P-droop).
 
-    'Gedempt' = twee remmen tegen doorschieten/windup (de wens van de user): (1) closeness-leak —
-    naarmate de kamer het setpoint nadert bloedt de integrator af, het sterkst ÓP het setpoint
-    (closeness ramp over rc_damp_band); (2) anti-windup — zolang de boost tegen zijn plafond zit
-    (rc_max óf de ruimte `headroom` tot flow_cap) groeit I niet verder. Overshoot (kamer boven
-    setpoint, err<0) telt de integrator altijd weer af. i is begrensd op [0, rc_i_max] -> kan niet
-    wegdrijven.
+    'Gedempt' = twee remmen tegen doorschieten/windup (de wens van de user): (1) overshoot-leak —
+    alleen BOVEN het setpoint bloedt de integrator extra af, oplopend tot de volle rc_damp_leak bij
+    setpoint + rc_damp_band; (2) anti-windup — zolang de boost tegen zijn plafond zit (rc_max óf de
+    ruimte `headroom` tot flow_cap) groeit I niet verder. Daarnaast telt een negatieve fout (kamer
+    boven setpoint) I gewoon af. i is begrensd op [0, rc_i_max] -> kan niet wegdrijven.
+
+    Óp en onder het setpoint lekt I NIET (2026-10-26): I draagt dan precies de aanvoer die de
+    curve tekortkomt. Het oude lek (sterkst óp het setpoint) gooide die weg zodra de kamer er was:
+    I 4,7 -> 1,0 in 55 min terwijl de kamer 21,5 hield, doel onder het retourwater -> stop-risico.
+
+    running=False (compressor staat stil) = ook geen opbouw: de WP kan de extra aanvoer dan niet
+    leveren (stop + 60 min verplichte stilstand), dus het tekort is geen signaal dat de curve te
+    laag is. 10-27 07:55-08:55 liep I zo 7,2 -> 8,0 (cap) tijdens de stilstand; de herstart op
+    42 °C met volle I + zon gaf daarna 21,9 en de volgende stop. Afbouwen mag wel gewoon.
 
     state['i'] = de integrator (°C aanvoer), bewaard tussen cycli (reset bij procesherstart).
     headroom = flow_cap - curve-base (None -> alleen rc_max begrenst). Geeft (boost, i) terug."""
@@ -160,12 +170,13 @@ def room_comp_pi(room, setpoint, state, cfg, headroom=None):
     p = room_comp_boost(room, setpoint, cfg["rc_kp"], cfg["rc_max"], neg)   # P-term, -neg..rc_max
     # effectief boost-plafond: door rc_max én door de fysieke ruimte tot de aanvoer-cap
     ceil = cfg["rc_max"] if headroom is None else max(0.0, min(cfg["rc_max"], headroom))
-    # integreren: afbouwen (err<0) mag altijd; opbouwen alleen als we nog niet tegen het plafond zitten
-    if err < 0 or (p + i) < ceil:
+    # integreren: afbouwen (err<0) mag altijd; opbouwen alleen als de WP draait en we nog niet
+    # tegen het plafond zitten
+    if err < 0 or (running and (p + i) < ceil):
         i += cfg["rc_ki"] * err
-    # demping: closeness 0 (ver van setpoint) .. 1 (óp setpoint) -> hoe dichterbij, hoe harder de leak
-    closeness = max(0.0, min(1.0, 1.0 - abs(err) / cfg["rc_damp_band"]))
-    i -= i * cfg["rc_damp_leak"] * closeness
+    # demping alleen bij doorschieten: 0 óp het setpoint .. volle leak bij setpoint + damp_band
+    overshoot = max(0.0, min(1.0, -err / cfg["rc_damp_band"]))
+    i -= i * cfg["rc_damp_leak"] * overshoot
     i = max(0.0, min(i, cfg["rc_i_max"]))
     state["i"] = round(i, 3)
     boost = max(-neg, min(p + i, ceil))
@@ -241,10 +252,9 @@ def build_cfg():
         # °C kamer-tekort); rc_i_max = harde begrenzing op de integrator; demping = de integrator
         # bloedt af naarmate de kamer het setpoint nadert (rc_damp_leak, ramp over rc_damp_band °C) én
         # bevriest zolang de aanvoer tegen zijn plafond zit (anti-windup). Zie room_comp_pi.
-        # 2026-10-26: Ki 0.3 -> 0.5 en band 1.5 -> 0.2. Bij een vast tekort e stabiliseert I op
-        # Ki·e / (leak·(1 - e/band)); met de oude waarden bleef dat ~0.8 °C en hing de kamer de hele
-        # ochtend 0.4 °C onder het setpoint (I liep leeg terwijl het tekort bleef). Nu lekt I pas
-        # binnen 0.2 °C van het setpoint en groeit hij daarbuiten vrij.
+        # 2026-10-26: Ki 0.3 -> 0.5. De demping lekte eerst rond het setpoint (I plafonneerde op ~0.8,
+        # kamer bleef 0.4 °C te laag), daarna sterkst óp het setpoint (I liep weg zodra de kamer er
+        # was). Nu lekt I alleen bij doorschieten: vol bij setpoint + band (0.2 °C).
         "rc_ki":        float(os.environ.get("WP_ROOMCOMP_KI", "0.5")),
         "rc_i_max":     float(os.environ.get("WP_ROOMCOMP_I_MAX", "8")),
         "rc_damp_band": float(os.environ.get("WP_ROOMCOMP_DAMP_BAND", "0.2")),
@@ -266,9 +276,23 @@ def build_cfg():
         "valve_stale_s": int(os.environ.get("WP_VALVE_STALE_S", "660")),
         # handmatige-override: kamerthermostaat staat (door user) op max ovr_threshold in alle periodes;
         # vraagt hij meer -> iemand draaide eraan -> honoreer (gecapt op ovr_max) voor ovr_hold_s, dan nominaal
+        # prijs-overlay (2026-10-27): het huis opladen in het goedkoopste middagblok en de avondpiek
+        # stil uitrollen; comfortband afgesproken met de bewoners (22 opladen, 21 uitrollen).
+        "price_overlay":     os.environ.get("WP_PRICE_OVERLAY", "1") == "1",
+        "price_cheap_sp":    float(os.environ.get("WP_PRICE_CHEAP_SP", "22.0")),
+        "price_coast_sp":    float(os.environ.get("WP_PRICE_COAST_SP", "21.0")),
+        "price_cheap_hours": float(os.environ.get("WP_PRICE_CHEAP_HOURS", "3")),
+        "price_cheap_from":  os.environ.get("WP_PRICE_CHEAP_FROM", "10:00"),
+        "price_cheap_to":    os.environ.get("WP_PRICE_CHEAP_TO", "17:00"),
+        "price_coast_to":    os.environ.get("WP_PRICE_COAST_TO", "19:00"),
+        "price_peak_hours":  float(os.environ.get("WP_PRICE_PEAK_HOURS", "2")),
+        "price_min_spread":  float(os.environ.get("WP_PRICE_MIN_SPREAD", "0.05")),
         "ovr_threshold": float(os.environ.get("WP_OVERRIDE_THRESHOLD", "21.5")),
         "ovr_max":       float(os.environ.get("WP_OVERRIDE_MAX", "23.0")),
         "ovr_hold_s":    int(os.environ.get("WP_OVERRIDE_HOLD_S", "3600")),
+        # verlaging: knop omlaag onder wat de software wil -> die stand (min und_min) voor und_hold_s
+        "und_min":       float(os.environ.get("WP_UNDERRIDE_MIN", "19.0")),
+        "und_hold_s":    int(os.environ.get("WP_UNDERRIDE_HOLD_S", "3600")),
         # OVERLAY #1 (cold-scaled preheat) -> chSetTemp1. ceil < OTThing-flowMax (50) houdt overshoot
         # fysiek onmogelijk; conservatieve defaults, met data te tunen (zie compute_flow_target).
         "flow": {
@@ -313,17 +337,81 @@ def decide_setpoint(now, cfg):
     return schedule_setpoint(now, cfg["schedule"])
 
 
+def price_windows(prices, day, cfg):
+    """PUUR: kies voor `day` het blok om het huis met goedkope stroom op te laden en de uitrol daarna.
+
+    prices = {kwartier-slot_dt: €/kWh}. Opladen = het goedkoopste aaneengesloten blok van
+    price_cheap_hours dat binnen [price_cheap_from, price_cheap_to] valt; uitrollen = van het einde
+    daarvan tot price_coast_to (de avond-setback). Het huis is de accu: ~25 kWh warmte per °C, en
+    het zakt nu ~0,1 °C/uur, dus een halve graad extra draagt de WP stil door de avondpiek.
+    Alleen als het duurste price_peak_hours-blok in de uitrol minstens price_min_spread duurder is
+    dan het opladen; anders kost het extra stoken (hogere aanvoer, meer verlies) meer dan het
+    oplevert. Ontbrekende slots tellen niet mee. -> (venster-dict of None, reden)."""
+    q = timedelta(minutes=15)
+    base = datetime(day.year, day.month, day.day)
+    at = lambda hhmm: base + timedelta(minutes=_hhmm_min(hhmm))
+    n_cheap = int(round(cfg["price_cheap_hours"] * 4))
+    n_peak = int(round(cfg["price_peak_hours"] * 4))
+
+    def mean(start, n):
+        vals = [prices.get(start + k * q) for k in range(n)]
+        return None if any(v is None for v in vals) else sum(vals) / n
+
+    cheap = None
+    s, last = at(cfg["price_cheap_from"]), at(cfg["price_cheap_to"]) - n_cheap * q
+    while s <= last:
+        m = mean(s, n_cheap)
+        if m is not None and (cheap is None or m < cheap[1]):
+            cheap = (s, m)
+        s += q
+    if cheap is None:
+        return None, "geen prijzen voor het oplaadvenster"
+    cheap_start, cheap_eur = cheap
+    cheap_end, coast_end = cheap_start + n_cheap * q, at(cfg["price_coast_to"])
+    peak, s = None, cheap_end
+    while s + n_peak * q <= coast_end:
+        m = mean(s, n_peak)
+        if m is not None and (peak is None or m > peak):
+            peak = m
+        s += q
+    if peak is None:
+        return None, "geen prijzen voor de uitrol"
+    if peak - cheap_eur < cfg["price_min_spread"]:
+        return None, f"spreiding te klein (opladen €{cheap_eur:.3f}, piek €{peak:.3f})"
+    win = {"cheap_start": cheap_start, "cheap_end": cheap_end, "coast_end": coast_end,
+           "cheap_eur": round(cheap_eur, 3), "peak_eur": round(peak, 3)}
+    return win, (f"opladen {cheap_start:%H:%M}-{cheap_end:%H:%M} (€{cheap_eur:.3f}) -> "
+                 f"{cfg['price_cheap_sp']}, uitrol tot {coast_end:%H:%M} (piek €{peak:.3f}) -> "
+                 f"{cfg['price_coast_sp']}")
+
+
+def price_overlay(now, nominal, reason, win, cfg):
+    """PUUR: het nominale schema-setpoint bijgesteld op het prijsvenster. Alleen in de comfort-
+    periode (nominaal >= het uitrol-setpoint): een nachtverlaging wordt nooit opgehoogd."""
+    if not win or nominal < cfg["price_coast_sp"]:
+        return nominal, reason
+    if win["cheap_start"] <= now < win["cheap_end"] and cfg["price_cheap_sp"] > nominal:
+        return cfg["price_cheap_sp"], (f"prijs-opladen {cfg['price_cheap_sp']}°C tot "
+                                       f"{win['cheap_end']:%H:%M} (i.p.v. {reason})")
+    if win["cheap_end"] <= now < win["coast_end"] and cfg["price_coast_sp"] < nominal:
+        return cfg["price_coast_sp"], (f"prijs-uitrol {cfg['price_coast_sp']}°C tot "
+                                       f"{win['coast_end']:%H:%M} (i.p.v. {reason})")
+    return nominal, reason
+
+
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_state.json")
 STATE_MAX_AGE_S = 900   # aan/uit-stand en I-term ouder dan dit zijn niet meer representatief
 
 
 def save_state(ovr_state, heat_state, i_state, now, path=STATE_FILE):
-    """Bewaar wat een herstart anders kwijtraakt: een lopend bump-venster, de aan/uit-stand van de
+    """Bewaar wat een herstart anders kwijtraakt: een lopend bump- of verlagingsvenster, de aan/uit-stand van de
     hysterese en de I-term. Best-effort."""
-    until = ovr_state.get("ovr_until")
+    until, und = ovr_state.get("ovr_until"), ovr_state.get("und_until")
     d = {"saved": now.isoformat(timespec="seconds"),
          "ovr_until": until.isoformat(timespec="seconds") if until else None,
          "ovr_target": ovr_state.get("ovr_target") if until else None,
+         "und_until": und.isoformat(timespec="seconds") if und else None,
+         "und_target": ovr_state.get("und_target") if und else None,
          "heat": heat_state.get("heat"), "flow": heat_state.get("flow"), "i": i_state.get("i")}
     try:
         with open(path, "w") as f:
@@ -347,6 +435,10 @@ def load_state(now, path=STATE_FILE, max_age_s=STATE_MAX_AGE_S):
         until = datetime.fromisoformat(d["ovr_until"])
         if until > now:
             ovr = {"ovr_until": until, "ovr_target": float(d["ovr_target"])}
+    if d.get("und_until"):
+        und = datetime.fromisoformat(d["und_until"])
+        if und > now:
+            ovr.update(und_until=und, und_target=float(d["und_target"]))
     fresh = 0 <= (now - saved).total_seconds() <= max_age_s
     heat = {"heat": bool(d["heat"])} if fresh and d.get("heat") is not None else {}
     if heat and d.get("flow") is not None:
@@ -355,7 +447,7 @@ def load_state(now, path=STATE_FILE, max_age_s=STATE_MAX_AGE_S):
     return ovr, heat, i
 
 
-def decide_with_override(now, thermostat_setp, state, cfg):
+def decide_with_override(now, thermostat_setp, state, cfg, price_win=None):
     """PUUR: wrapt decide_setpoint met de handmatige-override-regel.
 
     `thermostat_setp` = de door de FYSIEKE Honeywell gevraagde room-setpoint
@@ -368,10 +460,27 @@ def decide_with_override(now, thermostat_setp, state, cfg):
     Een NIEUWE/gewijzigde verhoging (≠ vorige meting) herstart het venster. **Draait de knop terug
     naar ≤ drempel, dan eindigt de boost METEEN** (venster wissen) — niet het uur volmaken.
 
-    `state` = mutabele dict {ovr_until: datetime|None, ovr_target: float|None, last_setp: float|None}
-    die tussen cycli bewaard blijft. Returnt (sp, reason)."""
+    Verlaging (user 2026-10-27): draait iemand de knop OMLAAG tot onder wat de software nu wil
+    (schema + prijsvenster), dan geldt die stand — absoluut, met bodem `und_min` — voor `und_hold_s`.
+    Een nieuwe verlaging herstart het venster, elke draai omhoog beëindigt het (boven de drempel
+    wordt het een bump). Het venster maakt het nooit warmer dan het schema op dat moment.
+    Het Honeywell-klokprogramma zet maar één verlaging per 24 uur: 19:00 -> 19, gelijk aan onze
+    eigen avondverlaging, dus die valt niet onder "lager dan de software wil" en telt niet. Een
+    tweede geprogrammeerde verlaging in de Honeywell is NIET ondersteund: die zou als handmatige
+    draai gelden.
+
+    `state` = mutabele dict {ovr_until, ovr_target, und_until, und_target, last_setp} die tussen
+    cycli bewaard blijft. Bump en verlaging gaan vóór het prijsvenster (price_win, zie
+    price_overlay). Returnt (sp, reason)."""
     thr, mx, hold = cfg["ovr_threshold"], cfg["ovr_max"], cfg["ovr_hold_s"]
     prev = state.get("last_setp")
+    nominal, nominal_why = price_overlay(now, *decide_setpoint(now, cfg), price_win, cfg)
+    moved = thermostat_setp is not None and prev is not None and abs(thermostat_setp - prev) > 0.05
+    if moved and thermostat_setp > prev:
+        state["und_until"] = state["und_target"] = None      # omhoog draaien = klaar met koeler
+    elif moved and thermostat_setp < nominal:
+        state["und_until"] = now + timedelta(seconds=cfg["und_hold_s"])
+        state["und_target"] = round(max(thermostat_setp, cfg["und_min"]), 1)
     # een (nieuwe) handmatige verhoging = boven de drempel én veranderd t.o.v. de vorige meting.
     # `prev is not None` voorkomt dat een herstart-mét-knop-al-omhoog meteen een venster opent.
     if (thermostat_setp is not None and thermostat_setp > thr
@@ -390,7 +499,12 @@ def decide_with_override(now, thermostat_setp, state, cfg):
     if until is not None and now < until:
         mins = (until - now).total_seconds() / 60
         return state["ovr_target"], f"handmatige override {state['ovr_target']}°C (nog {mins:.0f}m)"
-    return decide_setpoint(now, cfg)
+    und = state.get("und_until")
+    if und is not None and now < und and state["und_target"] < nominal:
+        mins = (und - now).total_seconds() / 60
+        return state["und_target"], (f"handmatige verlaging {state['und_target']}°C "
+                                     f"(nog {mins:.0f}m, i.p.v. {nominal_why})")
+    return nominal, nominal_why
 
 
 def compute_flow_target(now, outside, cfg):
@@ -441,7 +555,7 @@ def parse_valve(payload):
 
 # ── I/O ────────────────────────────────────────────────────────────────────────────────
 def read_latest(cfg):
-    """Nieuwste kamer/buiten uit de energy-tabel. Best-effort -> (None, None) bij een fout.
+    """Nieuwste kamer/buiten uit de energy-tabel. Best-effort -> allemaal None bij een fout.
 
     Bron = de OTThing-velden, NIET de sparrow-velden. In MASTER-mode is de FYSIEKE Honeywell de
     `roomunit`-groep (otthing_roomunit_*); honeywell_ot_thermo_* is daar juist de OTThing->WP-kant
@@ -451,6 +565,8 @@ def read_latest(cfg):
         (bron=MQTT/HA; de OTThing duwt deze zelf naar de P60 over OT).
       * kamer   = otthing_roomunit_room_t_c -> de door de Honeywell gemeten kamertemp.
       * setpoint= otthing_roomunit_set_t_c  -> de ECHTE wand-setpoint (de knop/comfort-dial).
+      * flame   = honeywell_ot_boiler_flame -> draait de compressor (in Repeater is de 'boiler' de WP);
+        None = onbekend.
     NB: de snelle bump-detectie loopt straks via de MQTT-listener; dit DB-pad is de rustige 5-min-bron.
     """
     try:
@@ -458,18 +574,18 @@ def read_latest(cfg):
         cur = c.cursor()
         cur.execute(
             f"SELECT otthing_roomunit_room_t_c, honeywell_ot_boiler_outside_t_c, "
-            f"otthing_roomunit_set_t_c "
+            f"otthing_roomunit_set_t_c, honeywell_ot_boiler_flame "
             f"FROM {cfg['db_table']} WHERE otthing_roomunit_set_t_c IS NOT NULL "
             f"ORDER BY ts DESC LIMIT 1")
         row = cur.fetchone()
         cur.close(); c.close()
         if not row:
-            return None, None, None
+            return None, None, None, None
         f = lambda x: None if x is None else float(x)
-        return f(row[0]), f(row[1]), f(row[2])
+        return f(row[0]), f(row[1]), f(row[2]), None if row[3] is None else int(row[3])
     except Exception as e:
         dbg("DB", f"read_latest faalde: {e}")
-        return None, None, None
+        return None, None, None, None
 
 
 def read_forecast_outside(cfg):
@@ -495,6 +611,28 @@ def read_forecast_outside(cfg):
     except Exception as e:
         dbg("DB", f"read_forecast_outside faalde: {e}")
         return None
+
+
+def read_day_prices(cfg, day):
+    """Kwartierprijzen (€/kWh incl. btw) voor `day` uit battery_schedule -> {slot_dt: prijs}. De
+    optimizer bewaart elke run, dus ook de al verstreken slots van vandaag staan erin. Per slot de
+    NIEUWSTE run: vóór de day-ahead-publicatie (~13:00) vult de optimizer morgen met de prijzen van
+    vandaag als plaatsvervanger, en die mogen niet meetellen. Best-effort -> {} (geen overlay)."""
+    try:
+        start = datetime(day.year, day.month, day.day)
+        c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
+        cur = c.cursor()
+        t = cfg["sched_table"]
+        cur.execute(f"SELECT b.slot_dt, b.price_eur_kwh FROM {t} b JOIN "
+                    f"(SELECT slot_dt, MAX(created_at) mc FROM {t} WHERE slot_dt >= %s AND slot_dt < %s "
+                    f"GROUP BY slot_dt) m ON b.slot_dt = m.slot_dt AND b.created_at = m.mc",
+                    (start, start + timedelta(days=1)))
+        rows = cur.fetchall()
+        cur.close(); c.close()
+        return {r[0]: float(r[1]) for r in rows if r[1] is not None}
+    except Exception as e:
+        dbg("DB", f"read_day_prices faalde: {e}")
+        return {}
 
 
 def parse_ha_state(text, now_epoch, max_age_s, out_min, out_max):
@@ -679,8 +817,86 @@ def is_bump(setp, prev, thr):
             and setp > prev + 0.05 and setp > thr)
 
 
+# ── OT-gebeurtenislog: wat valt er eerst om bij een WP-stop? ─────────────────────────────
+# De 5-min DB-rij kan oorzaak en gevolg niet scheiden (10-27 07:55: compressor uit én Honeywell
+# max_rel_mod 100 -> 0 in dezelfde rij). De OTThing publiceert zijn volledige state elke 5 s; per
+# bericht vergelijken we de velden die een stop kunnen veroorzaken of verraden en loggen één regel
+# per verandering, met de hele momentopname erbij. ru_* = wat de Honeywell vraagt, m_* = wat de
+# OTThing (Repeater) naar de WP doorstuurt, de rest = wat de WP terugmeldt. Alleen loggen.
+OT_EVENT_KEYS = ("flame", "ch_mode", "fault", "slave_status", "m_maxmod", "m_ch_en",
+                 "ru_maxmod", "ru_ch_en", "action", "suspended")
+OT_CHSET_JUMP = 3.0      # ru_ch_set kruipt per graad; alleen een sprong (bv. 55 -> 65) is een gebeurtenis
+_otev_prev = {}
+
+
+def ot_event_snapshot(payload):
+    """PUUR: de stop-relevante velden uit een OTThing /state-payload -> dict, of None bij rommel."""
+    try:
+        d = json.loads(payload.decode() if isinstance(payload, (bytes, bytearray)) else payload)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    md = lambda v: (v.get("data") if v.get("result", True) else None) if isinstance(v, dict) else v
+    slave, master, ru = d.get("slave") or {}, d.get("master") or {}, d.get("roomunit") or {}
+    ss = slave.get("status") or {}
+    ms, rus = md(master.get("status")) or {}, md(ru.get("status")) or {}
+    hc0 = (d.get("heatercircuit") or [{}])[0] or {}
+    return {
+        "flame": ss.get("flame"), "ch_mode": ss.get("ch_mode"), "fault": ss.get("fault"),
+        "slave_status": ss.get("value"),
+        "flow": slave.get("flow_t"), "ret": slave.get("return_t"), "rel_mod": slave.get("rel_mod"),
+        "on_min": (slave.get("flameStats") or {}).get("currentOnTime"),
+        "m_maxmod": md(master.get("max_rel_mod")), "m_ch_en": ms.get("ch_enable"),
+        "m_ch_set": md(master.get("ch_set_t")),
+        "ru_maxmod": md(ru.get("max_rel_mod")), "ru_ch_en": rus.get("ch_enable"),
+        "ru_ch_set": md(ru.get("ch_set_t")), "ru_room": md(ru.get("room_t")),
+        "ru_set": md(ru.get("room_set_t")), "ru_status": rus.get("value"),
+        "action": hc0.get("action"), "suspended": hc0.get("suspended"),
+        "flow_sp": hc0.get("flowsetpoint"),
+    }
+
+
+def ot_event_changes(prev, cur):
+    """PUUR: welke gebeurtenisvelden veranderden van prev naar cur -> lijst 'veld a->b'. Een lege
+    prev (eerste bericht) geeft niets; de aanroeper logt dan een beginstand."""
+    if not prev:
+        return []
+    out = [f"{k} {prev.get(k)}->{cur.get(k)}" for k in OT_EVENT_KEYS if prev.get(k) != cur.get(k)]
+    a, b = prev.get("ru_ch_set"), cur.get("ru_ch_set")
+    if a is None or b is None:
+        if a != b:
+            out.append(f"ru_ch_set {a}->{b}")
+    elif abs(b - a) >= OT_CHSET_JUMP:
+        out.append(f"ru_ch_set {a}->{b}")
+    return out
+
+
+def log_ot_events(payload):
+    """Vergelijk dit bericht met het vorige en log de veranderingen. ru_ch_set wordt alleen bij een
+    gelogde sprong als nieuwe referentie genomen, zodat langzaam kruipen geen sprong maskeert."""
+    cur = ot_event_snapshot(payload)
+    if cur is None:
+        return
+    changes = ot_event_changes(_otev_prev, cur)
+    snap = " ".join(f"{k}={v}" for k, v in cur.items())
+    if not _otev_prev:
+        dbg("OTEV", f"beginstand | {snap}")
+    elif changes:
+        dbg("OTEV", f"{', '.join(changes)} | {snap}")
+    keep_chset = _otev_prev.get("ru_ch_set")
+    jumped = any(c.startswith("ru_ch_set ") for c in changes)
+    _otev_prev.clear(); _otev_prev.update(cur)
+    if keep_chset is not None and not jumped:
+        _otev_prev["ru_ch_set"] = keep_chset
+
+
 def _on_thermo_msg(client, userdata, msg):
     """on_message: cache de verse Honeywell-setpoint (thread-safe) en wek de lus bij een bump."""
+    try:
+        log_ot_events(msg.payload)
+    except Exception as e:               # het gebeurtenislog mag de bump-detectie nooit breken
+        dbg("OTEV", f"faalde: {e}")
     setp = parse_roomunit_setpoint(msg.payload)
     if setp is None:
         return
@@ -805,6 +1021,7 @@ HA_SENSORS = [
     ("setpoint", "Setpoint (pi5)", "°C"),
     ("setpoint_nominal", "Setpoint nominaal", "°C"),
     ("bump_left", "Bump resterend", "min"),
+    ("lower_left", "Verlaging resterend", "min"),
     ("room", "Kamer", "°C"),
     ("outside", "Buiten (regeling)", "°C"),
     ("flow_base", "Aanvoer curve", "°C"),
@@ -831,15 +1048,16 @@ def ha_discovery_msgs():
     return msgs
 
 
-def bump_minutes_left(ovr_state, now):
-    """PUUR: hele minuten dat de lopende bump nog geldt (naar boven afgerond), 0 zonder bump."""
-    until = ovr_state.get("ovr_until")
+def bump_minutes_left(ovr_state, now, key="ovr_until"):
+    """PUUR: hele minuten dat de lopende bump (of met key="und_until" de verlaging) nog geldt
+    (naar boven afgerond), 0 zonder."""
+    until = ovr_state.get(key)
     if until is None or until <= now:
         return 0
     return int(-(-(until - now).total_seconds() // 60))
 
 
-def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_left=0):
+def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_left=0, lower_left=0):
     """PUUR: de regel-tussenstappen voor het HA-dashboard. flow_p/flow_pi = curve + P (+ I), vóór de
     begrenzing op [flow_min, flow_cap]; flow_target is wat er echt naar de WP gaat. sp_nominal = wat
     het schema nu zou geven (zonder bump)."""
@@ -847,6 +1065,7 @@ def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_le
         return None if x is None else round(x, 1)
     has_base = base is not None
     return {"setpoint": r(sp), "setpoint_nominal": r(sp_nominal), "bump_left": bump_left,
+            "lower_left": lower_left,
             "room": r(room), "outside": r(outside),
             "flow_base": r(base),
             "flow_p": r(base + p) if has_base else None,
@@ -906,6 +1125,10 @@ def main():
                    if cfg["valve_log"] else ""))
     dbg("CONF", f"handmatige override: thermostaat > {cfg['ovr_threshold']}°C → honoreer "
                 f"(cap {cfg['ovr_max']}°C) voor {cfg['ovr_hold_s']//60}m, dan nominaal")
+    dbg("CONF", f"prijs-overlay {'AAN' if cfg['price_overlay'] else 'UIT'}: goedkoopste "
+                f"{cfg['price_cheap_hours']:g}u in {cfg['price_cheap_from']}-{cfg['price_cheap_to']} -> "
+                f"{cfg['price_cheap_sp']}°C, daarna tot {cfg['price_coast_to']} -> {cfg['price_coast_sp']}°C "
+                f"(min. spreiding €{cfg['price_min_spread']}/kWh)")
     dbg("CONF", f"pi5new-REGELING = {'LIVE — STUURT DE WP (chMode1/chSetTemp1)!' if cfg['control_live'] else 'DROOG (logt alleen)'}"
                 f" | heat als kamer < setpoint-{cfg['heat_on_below']}, uit als kamer >= setpoint+{cfg['heat_off_above']}"
                 f" | curve {len(cfg['curve'])}pt + room-comp PI (Kp={cfg['rc_kp']}, Ki={cfg['rc_ki']}, "
@@ -921,19 +1144,23 @@ def main():
         if live_setpoint(cfg) is not None:
             break
         sleep(1)
-    ovr_state = {"ovr_until": None, "ovr_target": None, "last_setp": None}
+    ovr_state = {"ovr_until": None, "ovr_target": None, "und_until": None, "und_target": None,
+                 "last_setp": None}
     heat_state = {}                      # stateful hysterese voor de aan/uit-beslissing
     i_state = {"i": 0.0}                 # gedempte-I integrator voor de room-comp
     r_ovr, r_heat, r_i = load_state(datetime.now())   # een herstart verandert het gedrag niet
     ovr_state.update(r_ovr); heat_state.update(r_heat); i_state.update(r_i)
     dbg("CTRL", f"runtime-state hersteld: bump={ovr_state['ovr_target']}"
                 + (f" tot {ovr_state['ovr_until']:%H:%M}" if ovr_state["ovr_until"] else "")
+                + f" verlaging={ovr_state['und_target']}"
+                + (f" tot {ovr_state['und_until']:%H:%M}" if ovr_state["und_until"] else "")
                 + f" heat={heat_state.get('heat')} I={i_state['i']}")
     ha_announced = False                 # HA-discovery één keer per proces-start
+    price_logged = None                  # het prijsvenster één keer per wijziging loggen
     while True:
         if cfg["valve_log"]:
             write_valve(cfg)              # schrijf de verse (door reports + vorige /get) gecachete stand
-        room, outside, sp_db = read_latest(cfg)
+        room, outside, sp_db, flame = read_latest(cfg)
         sp_live = live_setpoint(cfg)                 # seconden-verse Honeywell-setpoint (MQTT)
         sp_now = sp_live if sp_live is not None else sp_db
         src = "MQTT-live" if sp_live is not None else "DB-5min"
@@ -941,7 +1168,14 @@ def main():
         if bump_from is not None:
             ovr_state["last_setp"] = bump_from       # zodat een snelle dip+omhoog als bump telt
         # alleen een live-stand mag een bump starten of beëindigen; de DB-rij loopt tot 5 min achter
-        sp, reason = decide_with_override(datetime.now(), sp_live, ovr_state, cfg)
+        price_win = None
+        if cfg["price_overlay"]:
+            today = datetime.now().date()
+            price_win, price_why = price_windows(read_day_prices(cfg, today), today, cfg)
+            if (today, price_why) != price_logged:
+                dbg("PRICE", f"{today}: {price_why}")
+                price_logged = (today, price_why)
+        sp, reason = decide_with_override(datetime.now(), sp_live, ovr_state, cfg, price_win)
         dbg("CTRL", f"kamer={room} buiten={outside} thermostaat_vraag={sp_now}({src}) "
                     f"-> gewenst={sp} ({reason})")
         if not cfg["control_live"]:
@@ -975,7 +1209,8 @@ def main():
         # de dial op 23 staan) de WP naar 23 stoken terwijl `gewenst` al terug op 21 (schema) is.
         base = curve_flow(ot, cfg["curve"])
         headroom = None if base is None else (cfg["flow_cap"] - base)   # ruimte tot de cap = anti-windup
-        boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom)
+        running = flame != 0                         # None (onbekend) -> gedrag als voorheen
+        boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom, running)
         heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
         flow_raw = regulated_flow(base, boost, cfg)
         if heat:
@@ -989,12 +1224,14 @@ def main():
         p_term = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"], cfg["rc_neg_max"])
         now = datetime.now()
         publish_ha(cfg, ha_state(sp, room, ot, base, p_term, i_term, flow, heat,
-                                 decide_setpoint(now, cfg)[0], bump_minutes_left(ovr_state, now)),
+                                 decide_setpoint(now, cfg)[0], bump_minutes_left(ovr_state, now),
+                                 bump_minutes_left(ovr_state, now, "und_until")),
                    not ha_announced)
         ha_announced = True
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
                     f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost}"
-                    f"(P+I, I={i_term}) -> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
+                    f"(P+I, I={i_term}{'' if running else ', WP staat stil: I bevroren'}) "
+                    f"-> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
         write_shadow(cfg, room=room, room_set=sp, outside=ot, flow_target=flow,
                      heat=heat, boost=boost, i_term=i_term)
 

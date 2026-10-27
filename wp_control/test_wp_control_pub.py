@@ -10,7 +10,7 @@ import os
 import sys
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # ── stub zware/apparaat-imports vóór de module ─────────────────────────────────────────
 sys.modules["mysql"] = MagicMock()
@@ -34,7 +34,7 @@ import wp_control as wp  # noqa: E402
 
 def cfg(**over):
     c = dict(schedule=wp.parse_schedule("05:00=20.0,06:00=20.5,07:00=21.0,19:00=19.0"),
-             ovr_threshold=21.5, ovr_max=23.0, ovr_hold_s=3600)
+             ovr_threshold=21.5, ovr_max=23.0, ovr_hold_s=3600, und_min=19.0, und_hold_s=3600)
     c.update(over)
     return c
 
@@ -164,6 +164,91 @@ class TestReadForecastOutside(unittest.TestCase):
         self.assertIsNone(wp.read_forecast_outside(wp.build_cfg()))
 
 
+def _ot_state(flame=True, m_maxmod=100, ru_maxmod=100, ru_ch_set=55, ch_en=True):
+    """Ingekorte OTThing /state zoals live op 10-27 (master/roomunit-velden {"result","data"})."""
+    w = lambda v: {"result": True, "data": v}
+    return json.dumps({
+        "slave": {"status": {"value": "10a" if flame else "002", "fault": False, "ch_mode": flame,
+                             "flame": flame}, "rel_mod": 0, "flow_t": 40.6, "return_t": 38.8,
+                  "flameStats": {"currentOnTime": 140}},
+        "master": {"max_rel_mod": w(m_maxmod), "ch_set_t": w(40.6),
+                   "status": w({"value": "100", "ch_enable": ch_en})},
+        "roomunit": {"max_rel_mod": w(ru_maxmod), "ch_set_t": w(ru_ch_set), "room_t": w(21.3),
+                     "room_set_t": w(21.0), "status": w({"value": "300", "ch_enable": True})},
+        "heatercircuit": [{"action": "heating" if flame else "idle", "suspended": False,
+                           "flowsetpoint": 40.6}],
+    })
+
+
+class TestOtEventLog(unittest.TestCase):
+    """Per OTThing-bericht loggen wat er verandert, zodat bij een stop te zien is wat eerst omviel."""
+
+    def setUp(self):
+        wp._otev_prev.clear()
+
+    def test_snapshot_unwraps_master_and_roomunit(self):
+        snap = wp.ot_event_snapshot(_ot_state())
+        self.assertEqual((snap["flame"], snap["m_maxmod"], snap["ru_maxmod"], snap["m_ch_en"],
+                          snap["ru_ch_set"], snap["on_min"]), (True, 100, 100, True, 55, 140))
+
+    def test_garbage_payload_is_none(self):
+        self.assertIsNone(wp.ot_event_snapshot(b"not json"))
+        self.assertIsNone(wp.ot_event_snapshot("[1, 2]"))
+
+    def test_first_message_has_no_changes(self):
+        self.assertEqual(wp.ot_event_changes({}, wp.ot_event_snapshot(_ot_state())), [])
+
+    def test_order_is_visible_per_message(self):
+        # het 07:55-raadsel: eerst de compressor uit, max_rel_mod pas een bericht later
+        a = wp.ot_event_snapshot(_ot_state())
+        b = wp.ot_event_snapshot(_ot_state(flame=False))
+        c = wp.ot_event_snapshot(_ot_state(flame=False, m_maxmod=0, ru_maxmod=0))
+        self.assertIn("flame True->False", wp.ot_event_changes(a, b))
+        self.assertNotIn("m_maxmod 100->0", wp.ot_event_changes(a, b))
+        self.assertIn("m_maxmod 100->0", wp.ot_event_changes(b, c))
+        self.assertIn("ru_maxmod 100->0", wp.ot_event_changes(b, c))
+
+    def test_creeping_ch_set_is_not_an_event_but_a_jump_is(self):
+        a = wp.ot_event_snapshot(_ot_state(ru_ch_set=55))
+        self.assertEqual(wp.ot_event_changes(a, wp.ot_event_snapshot(_ot_state(ru_ch_set=56))), [])
+        self.assertEqual(wp.ot_event_changes(a, wp.ot_event_snapshot(_ot_state(ru_ch_set=65))),
+                         ["ru_ch_set 55->65"])
+
+    def test_log_only_on_change(self):
+        with patch.object(wp, "dbg") as dbg:
+            wp.log_ot_events(_ot_state())                      # beginstand
+            wp.log_ot_events(_ot_state())                      # niets veranderd
+            wp.log_ot_events(_ot_state(flame=False))
+        msgs = [c.args[1] for c in dbg.call_args_list]
+        self.assertEqual(len(msgs), 2)
+        self.assertTrue(msgs[0].startswith("beginstand"))
+        self.assertTrue(msgs[1].startswith("flame True->False"))
+
+    def test_slow_creep_still_shows_as_jump_against_last_logged(self):
+        with patch.object(wp, "dbg") as dbg:
+            for v in (55, 56, 57, 58):                         # telkens +1: geen sprong per bericht
+                wp.log_ot_events(_ot_state(ru_ch_set=v))
+        self.assertEqual(len(dbg.call_args_list), 2)           # beginstand + 55->58
+        self.assertIn("ru_ch_set 55->58", dbg.call_args_list[1].args[1])
+
+
+class TestReadLatest(unittest.TestCase):
+    def _set_fetchone(self, value):
+        wp.mysql.connector.connect.return_value.cursor.return_value.fetchone.return_value = value
+
+    def test_returns_room_outside_setpoint_and_flame(self):
+        self._set_fetchone((21.3, 13.8, 21.0, 0))
+        self.assertEqual(wp.read_latest(wp.build_cfg()), (21.3, 13.8, 21.0, 0))
+
+    def test_missing_flame_stays_none(self):
+        self._set_fetchone((21.3, 13.8, 21.0, None))
+        self.assertIsNone(wp.read_latest(wp.build_cfg())[3])
+
+    def test_no_row_is_all_none(self):
+        self._set_fetchone(None)
+        self.assertEqual(wp.read_latest(wp.build_cfg()), (None, None, None, None))
+
+
 class TestHaOutside(unittest.TestCase):
     """HA-buitenvoeler = 1e keus voor outsideTemp (KNMI = fallback). parse_ha_state = de pure kern."""
 
@@ -289,7 +374,7 @@ class TestRoomCompBoost(unittest.TestCase):
 
 class TestRoomCompPi(unittest.TestCase):
     """Gedempte PI-room-compensatie: P reageert direct, I ruimt de rest-droop op (kamer klimt naar
-    het setpoint), en demping (closeness-leak + anti-windup) voorkomt doorschieten/windup."""
+    het setpoint), en demping (overshoot-leak + anti-windup) voorkomt doorschieten/windup."""
 
     def _cfg(self):
         return {"rc_kp": 4.0, "rc_max": 10.0, "rc_ki": 0.3, "rc_i_max": 8.0,
@@ -297,10 +382,10 @@ class TestRoomCompPi(unittest.TestCase):
 
     def test_first_cycle_p_plus_small_i(self):
         st = {"i": 0.0}
-        boost, i = wp.room_comp_pi(20.0, 21.0, st, self._cfg())   # err=1: P=4, I=0.3-leak
-        self.assertEqual(i, 0.28)                                 # 0.3*(1-0.2*0.3333)
-        self.assertEqual(boost, 4.3)                              # P 4.0 + I 0.28
-        self.assertEqual(st["i"], 0.28)                           # state bewaard
+        boost, i = wp.room_comp_pi(20.0, 21.0, st, self._cfg())   # err=1: P=4, I=0.3 (onder sp: geen lek)
+        self.assertEqual(i, 0.3)
+        self.assertEqual(boost, 4.3)                              # P 4.0 + I 0.3
+        self.assertEqual(st["i"], 0.3)                            # state bewaard
 
     def test_integrator_builds_over_cycles(self):
         st, cfg = {"i": 0.0}, self._cfg()
@@ -308,17 +393,17 @@ class TestRoomCompPi(unittest.TestCase):
         self.assertEqual(seq, sorted(seq))                        # I groeit cyclus na cyclus
         self.assertLess(seq[-1], cfg["rc_i_max"])                 # nog niet tegen de bodem/cap
 
-    def test_damps_near_setpoint(self):
+    def test_holds_integrator_at_setpoint(self):
+        # 2026-10-26: óp het setpoint draagt I wat de curve tekortkomt; weglekken gaf een golf
         st = {"i": 2.0}
-        boost, i = wp.room_comp_pi(21.0, 21.0, st, self._cfg())   # ÓP setpoint: closeness=1 -> volle leak
-        self.assertEqual(i, 1.6)                                  # 2.0 - 2.0*0.2*1.0
-        self.assertEqual(boost, 1.6)                              # P=0, alleen de (afbloedende) I
+        boost, i = wp.room_comp_pi(21.0, 21.0, st, self._cfg())
+        self.assertEqual((i, boost), (2.0, 2.0))
 
     def test_overshoot_bleeds_integrator(self):
         st = {"i": 3.0}
         _, i = wp.room_comp_pi(22.0, 21.0, st, self._cfg())       # kamer boven setpoint, err=-1
         self.assertLess(i, 3.0)                                   # negatieve err telt I af
-        self.assertEqual(i, 2.52)                                 # (3.0-0.3) - rest*leak*0.3333
+        self.assertEqual(i, 2.34)                                 # (3.0-0.3) - 2.7*leak*(1/1.5)
 
     def test_antiwindup_at_boost_max(self):
         st = {"i": 3.0}
@@ -358,11 +443,13 @@ class TestRoomCompPi(unittest.TestCase):
         self.assertTrue(all(b > a for a, b in zip(seen, seen[1:])))
         self.assertGreater(seen[-1], 1.5)
 
-    def test_defaults_still_bleed_at_setpoint(self):
+    def test_defaults_hold_at_setpoint_and_bleed_on_overshoot(self):
         cfg = wp.build_cfg()
-        st = {"i": 3.0}
-        wp.room_comp_pi(21.5, 21.5, st, cfg)
-        self.assertLess(st["i"], 3.0)
+        st = {"i": 4.7}
+        seen = [wp.room_comp_pi(21.5, 21.5, st, cfg)[1] for _ in range(6)]   # 30 min óp setpoint
+        self.assertEqual(seen[-1], 4.7)                   # niet 4,7 -> 1,0 zoals op 10-26
+        wp.room_comp_pi(21.7, 21.5, st, cfg)              # 0,2 doorschieten: vol lek + negatieve fout
+        self.assertLess(st["i"], 4.7 * 0.8)
 
     def test_above_setpoint_boost_goes_negative(self):
         st, cfg = {"i": 0.0}, dict(self._cfg(), rc_neg_max=8.0)
@@ -372,8 +459,27 @@ class TestRoomCompPi(unittest.TestCase):
     def test_leftover_integrator_softens_negative_p(self):
         st, cfg = {"i": 1.0}, dict(self._cfg(), rc_neg_max=8.0)
         boost, i = wp.room_comp_pi(21.5, 21.0, st, cfg)           # I=(1-0.15)-leak, P=-2
-        self.assertEqual(i, 0.737)                                # 0.85 - 0.85*0.2*0.667
-        self.assertEqual(boost, -1.3)                             # P -2 + I 0.737
+        self.assertEqual(i, 0.793)                                # 0.85 - 0.85*0.2*(0.5/1.5)
+        self.assertEqual(boost, -1.2)                             # P -2 + I 0.793
+
+    def test_no_buildup_while_compressor_stands_still(self):
+        st = {"i": 3.0}
+        boost, i = wp.room_comp_pi(20.0, 21.0, st, self._cfg(), running=False)
+        self.assertEqual(i, 3.0)                                  # tekort, maar de WP kan niet leveren
+        self.assertEqual(boost, 7.0)                              # P 4 + I 3: het doel zelf blijft staan
+
+    def test_bleeds_while_compressor_stands_still(self):
+        st = {"i": 3.0}
+        _, i = wp.room_comp_pi(22.0, 21.0, st, self._cfg(), running=False)
+        self.assertEqual(i, 2.34)                                 # afbouwen mag wel, als bij running
+
+    def test_lockout_hour_does_not_wind_up(self):
+        # 10-27 07:55-08:55: compressor uit, kamer 21,3 -> 20,9 onder sp 21,5; I liep 7,2 -> 8,0
+        cfg, st = wp.build_cfg(), {"i": 7.2}
+        rooms = [21.3, 21.3, 21.3, 21.2, 21.2, 21.2, 21.1, 21.1, 21.1, 21.0, 21.0, 20.9]
+        for r in rooms:
+            wp.room_comp_pi(r, 21.5, st, cfg, headroom=20.0, running=False)
+        self.assertEqual(st["i"], 7.2)
 
 
 class TestRegulatedFlow(unittest.TestCase):
@@ -499,6 +605,94 @@ class TestParseValve(unittest.TestCase):
 
     def test_accepts_already_parsed_dict(self):
         self.assertEqual(wp.parse_valve({"state": "OFF", "power": 0.0}), (0, 0.0))
+
+
+class TestTurnDown(unittest.TestCase):
+    """Knop omlaag onder wat de software wil = die stand (absoluut, min 19) voor een uur."""
+    # schema van cfg(): 07:00-19:00 21.0, 19:00-05:00 19.0
+
+    def _state(self, last_setp=21.0):
+        return {"ovr_until": None, "ovr_target": None, "und_until": None, "und_target": None,
+                "last_setp": last_setp}
+
+    def test_turn_down_is_honoured_absolute(self):
+        sp, r = wp.decide_with_override(datetime(2026, 1, 5, 12, 0), 20.0, self._state(), cfg())
+        self.assertEqual(sp, 20.0)
+        self.assertIn("handmatige verlaging", r)
+
+    def test_floor_at_19(self):
+        sp, _ = wp.decide_with_override(datetime(2026, 1, 5, 12, 0), 17.5, self._state(), cfg())
+        self.assertEqual(sp, 19.0)
+
+    def test_lasts_an_hour_then_schedule(self):
+        st, t0 = self._state(), datetime(2026, 1, 5, 12, 0)
+        wp.decide_with_override(t0, 20.0, st, cfg())
+        self.assertEqual(wp.decide_with_override(t0 + timedelta(minutes=59), 20.0, st, cfg())[0], 20.0)
+        self.assertEqual(wp.decide_with_override(t0 + timedelta(minutes=61), 20.0, st, cfg())[0], 21.0)
+
+    def test_new_turn_down_restarts_the_hour(self):
+        st, t0 = self._state(), datetime(2026, 1, 5, 12, 0)
+        wp.decide_with_override(t0, 20.5, st, cfg())
+        wp.decide_with_override(t0 + timedelta(minutes=50), 20.0, st, cfg())
+        sp, _ = wp.decide_with_override(t0 + timedelta(minutes=100), 20.0, st, cfg())
+        self.assertEqual(sp, 20.0)
+
+    def test_turning_up_ends_it(self):
+        st, t0 = self._state(), datetime(2026, 1, 5, 12, 0)
+        wp.decide_with_override(t0, 20.0, st, cfg())
+        sp, _ = wp.decide_with_override(t0 + timedelta(minutes=5), 20.5, st, cfg())
+        self.assertEqual(sp, 21.0)                         # omhoog, nog onder de bump-drempel
+
+    def test_turning_up_past_threshold_becomes_a_bump(self):
+        st, t0 = self._state(), datetime(2026, 1, 5, 12, 0)
+        wp.decide_with_override(t0, 20.0, st, cfg())
+        sp, r = wp.decide_with_override(t0 + timedelta(minutes=5), 22.5, st, cfg())
+        self.assertEqual(sp, 22.5); self.assertIn("override", r)
+
+    def test_not_lower_than_software_is_ignored(self):
+        # 21,5 -> 21,0 terwijl de software 21,0 wil: niets om te honoreren
+        sp, r = wp.decide_with_override(datetime(2026, 1, 5, 12, 0), 21.0,
+                                        self._state(last_setp=21.5), cfg())
+        self.assertEqual(sp, 21.0); self.assertIn("schema", r)
+
+    def test_honeywell_evening_program_step_does_not_count(self):
+        # het Honeywell-programma zet om 19:00 zelf 21 -> 19: gelijk aan onze avondverlaging
+        st = self._state()
+        wp.decide_with_override(datetime(2026, 1, 5, 19, 5), 19.0, st, cfg())
+        self.assertIsNone(st["und_until"])
+
+    def test_never_warmer_than_the_schedule(self):
+        # verlaging naar 20 om 18:30; om 19:00 wil het schema 19 -> 19, niet 20
+        st = self._state()
+        wp.decide_with_override(datetime(2026, 1, 5, 18, 30), 20.0, st, cfg())
+        sp, r = wp.decide_with_override(datetime(2026, 1, 5, 19, 0), 20.0, st, cfg())
+        self.assertEqual(sp, 19.0); self.assertIn("schema", r)
+
+    def test_wins_over_price_preheat(self):
+        c = dict(wp.build_cfg(), **cfg())
+        day = datetime(2026, 10, 28)
+        win, _ = wp.price_windows(_prices(day), day, c)
+        st = self._state(last_setp=21.5)
+        sp, _ = wp.decide_with_override(day.replace(hour=13), 21.0, st, c, win)   # software wil 22
+        self.assertEqual(sp, 21.0)
+
+    def test_survives_restart(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "state.json")
+        now = datetime(2026, 1, 5, 12, 0)
+        wp.save_state({"und_until": now + timedelta(minutes=40), "und_target": 20.0},
+                      {}, {}, now, path)
+        ovr, _, _ = wp.load_state(now + timedelta(minutes=1), path)
+        self.assertEqual(ovr, {"und_until": now + timedelta(minutes=40), "und_target": 20.0})
+        st = dict(self._state(last_setp=None), **ovr)
+        sp, _ = wp.decide_with_override(now + timedelta(minutes=1), 20.0, st, cfg())
+        self.assertEqual(sp, 20.0)
+
+    def test_minutes_left_for_ha(self):
+        now = datetime(2026, 1, 5, 12, 0)
+        self.assertEqual(wp.bump_minutes_left({"und_until": now + timedelta(minutes=30)}, now,
+                                              "und_until"), 30)
+        self.assertIn("homeassistant/sensor/wp_control/lower_left/config", dict(wp.ha_discovery_msgs()))
 
 
 class TestDecideWithOverride(unittest.TestCase):
@@ -942,12 +1136,85 @@ class TestFlowDropLimit(unittest.TestCase):
 
 
 class TestDefaultSchedule(unittest.TestCase):
-    def test_half_hourly_morning_ramp(self):
+    def test_warm_before_the_morning_peak(self):
         sched = wp.parse_schedule(wp.DEFAULT_SCHEDULE)
-        temps = [t for _, t in sched]
-        self.assertEqual(temps, [19.5, 20.0, 20.5, 21.0, 21.5, 19.0])
-        sp, _ = wp.decide_setpoint(datetime(2026, 10, 26, 12, 0), {"schedule": sched})
-        self.assertEqual(sp, 21.5)
-        sp, _ = wp.decide_setpoint(datetime(2026, 10, 26, 3, 0), {"schedule": sched})
+        self.assertEqual([t for _, t in sched], [21.0, 21.5, 19.0])
+        sp = lambda h, m=0: wp.decide_setpoint(datetime(2026, 10, 26, h, m), {"schedule": sched})[0]
+        self.assertEqual(sp(3, 0), 19.0)                  # nog nachtverlaging
+        self.assertEqual(sp(3, 30), 21.0)                 # opwarmen in de goedkope nachturen
+        self.assertEqual(sp(4, 30), 21.5)
+        self.assertEqual(sp(12), 21.5)
+        self.assertEqual(sp(19), 19.0)
+
+
+def _prices(day, cheap=(12, 15), cheap_eur=0.25, peak=(17, 19), peak_eur=0.39, other=0.30):
+    """Kwartierprijzen voor een dag: een goedkoop middagblok en een avondpiek."""
+    out, t = {}, datetime(day.year, day.month, day.day)
+    for k in range(96):
+        h = (t + timedelta(minutes=15 * k)).hour
+        out[t + timedelta(minutes=15 * k)] = (cheap_eur if cheap[0] <= h < cheap[1] else
+                                              peak_eur if peak[0] <= h < peak[1] else other)
+    return out
+
+
+class TestPriceOverlay(unittest.TestCase):
+    DAY = datetime(2026, 10, 28)
+
+    def _cfg(self, **over):
+        return dict(wp.build_cfg(), schedule=wp.parse_schedule(wp.DEFAULT_SCHEDULE), **over)
+
+    def test_defaults_match_the_agreed_comfort_band(self):
+        cfg = wp.build_cfg()
+        self.assertTrue(cfg["price_overlay"])
+        self.assertEqual((cfg["price_cheap_sp"], cfg["price_coast_sp"]), (22.0, 21.0))
+
+    def test_picks_cheapest_block_and_coasts_to_setback(self):
+        win, why = wp.price_windows(_prices(self.DAY), self.DAY, self._cfg())
+        self.assertEqual((win["cheap_start"].hour, win["cheap_end"].hour, win["coast_end"].hour),
+                         (12, 15, 19))
+        self.assertEqual((win["cheap_eur"], win["peak_eur"]), (0.25, 0.39))
+        self.assertIn("opladen 12:00-15:00", why)
+
+    def test_cheap_block_stays_inside_its_search_range(self):
+        # goedkoopst om 08-11, maar het blok mag pas om 10:00 beginnen
+        win, _ = wp.price_windows(_prices(self.DAY, cheap=(8, 11)), self.DAY, self._cfg())
+        self.assertGreaterEqual(win["cheap_start"], self.DAY.replace(hour=10))
+        self.assertLessEqual(win["cheap_end"], self.DAY.replace(hour=17))
+
+    def test_small_spread_means_no_overlay(self):
+        flat = _prices(self.DAY, cheap_eur=0.29, peak_eur=0.31)
+        win, why = wp.price_windows(flat, self.DAY, self._cfg())
+        self.assertIsNone(win)
+        self.assertIn("spreiding te klein", why)
+
+    def test_no_prices_means_no_overlay(self):
+        self.assertIsNone(wp.price_windows({}, self.DAY, self._cfg())[0])
+
+    def test_setpoint_through_the_day(self):
+        cfg = self._cfg()
+        win, _ = wp.price_windows(_prices(self.DAY), self.DAY, cfg)
+        sp = lambda h, m=0: wp.decide_with_override(self.DAY.replace(hour=h, minute=m), 21.5,
+                                                    {"last_setp": 21.5}, cfg, win)[0]
+        self.assertEqual([sp(11), sp(12), sp(14, 45), sp(15), sp(18, 45), sp(19)],
+                         [21.5, 22.0, 22.0, 21.0, 21.0, 19.0])
+
+    def test_never_raises_a_setback(self):
+        cfg = self._cfg()
+        win, _ = wp.price_windows(_prices(self.DAY), self.DAY, cfg)
+        sp, _ = wp.price_overlay(self.DAY.replace(hour=13), 19.0, "schema 19.0", win, cfg)
         self.assertEqual(sp, 19.0)
+
+    def test_bump_wins_over_the_price_window(self):
+        cfg = self._cfg()
+        win, _ = wp.price_windows(_prices(self.DAY), self.DAY, cfg)
+        st = {"last_setp": 21.5}
+        sp, why = wp.decide_with_override(self.DAY.replace(hour=16), 22.5, st, cfg, win)
+        self.assertEqual(sp, 22.5)                        # iemand draaide omhoog tijdens de uitrol
+        self.assertIn("handmatige override", why)
+
+    def test_read_day_prices_maps_rows(self):
+        t = self.DAY.replace(hour=12)
+        wp.mysql.connector.connect.return_value.cursor.return_value.fetchall.return_value = \
+            [(t, 0.25), (t + timedelta(minutes=15), None)]
+        self.assertEqual(wp.read_day_prices(wp.build_cfg(), self.DAY.date()), {t: 0.25})
 
