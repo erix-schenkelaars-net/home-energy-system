@@ -8,6 +8,7 @@ Run with:  python -m pytest test_read_bmw_pub.py -v
            python -m pytest test_read_bmw_pub.py -v --cov=read_bmw --cov-report=term-missing
 """
 
+import json
 import math
 import os
 import sys
@@ -389,3 +390,73 @@ class TestSaveToEnergy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSocChangedAt(unittest.TestCase):
+    """The optimiser trusts a SoC only when it took a new value around the manual 'car is home'
+    press; BMW's own timestamps are the request time and prove nothing."""
+
+    KEY = "vehicle.drivetrain.electricEngine.charging.level"
+    STAMP = "vehicle_drivetrain_electricEngine_charging_level_changed_at"
+
+    def setUp(self):
+        mod._state.clear()
+        mod._discovery_done.clear()
+        self.local = MagicMock()
+
+    def _msg(self, soc):
+        mod._on_bmw_message(self.local, "t", {"vin": "VIN1", "data": {self.KEY: {"value": soc}}})
+        return mod._state["VIN1"]
+
+    def test_first_value_after_restart_is_not_stamped(self):
+        self.assertNotIn(self.STAMP, self._msg("75"))
+
+    def test_same_value_again_is_not_stamped(self):
+        self._msg("75")
+        self.assertNotIn(self.STAMP, self._msg("75"))
+
+    def test_new_value_is_stamped_and_published(self):
+        self._msg("75")
+        state = self._msg("62")
+        self.assertIn(self.STAMP, state)
+        datetime.fromisoformat(state[self.STAMP])
+        published = json.loads(self.local.publish.call_args_list[-1].args[1])
+        self.assertEqual(published[self.STAMP], state[self.STAMP])
+
+    def test_stamp_is_timezone_aware_for_ha(self):
+        self._msg("75")
+        stamp = datetime.fromisoformat(self._msg("62")[self.STAMP])
+        self.assertIsNotNone(stamp.tzinfo)
+
+    def test_stamp_has_a_timestamp_sensor_in_ha(self):
+        etype, _, unit, dev_class, _ = mod.HA_ENTITIES[self.STAMP]
+        self.assertEqual((etype, unit, dev_class), ("sensor", None, "timestamp"))
+
+
+class TestFreshnessStamps(unittest.TestCase):
+    """HA shows when the car itself last sent data, separate from the 30-min cloud poll."""
+
+    def setUp(self):
+        mod._state.clear()
+        mod._discovery_done.clear()
+        self.local = MagicMock()
+
+    def _msg(self, topic):
+        mod._on_bmw_message(self.local, topic, {"vin": "VIN1", "data": {"vehicle.x": {"value": 1}}})
+        return mod._state["VIN1"]
+
+    def test_stream_message_sets_last_stream_at(self):
+        state = self._msg("gcid/VIN1")
+        self.assertIn("last_stream_at", state)
+        self.assertNotIn("last_rest_at", state)
+        self.assertIsNotNone(datetime.fromisoformat(state["last_stream_at"]).tzinfo)
+
+    def test_rest_poll_sets_last_rest_at_only(self):
+        state = self._msg("rest/VIN1")
+        self.assertIn("last_rest_at", state)
+        self.assertNotIn("last_stream_at", state)
+
+    def test_both_have_timestamp_sensors(self):
+        for key in ("last_stream_at", "last_rest_at"):
+            self.assertEqual(mod.HA_ENTITIES[key][3], "timestamp")
+

@@ -38,6 +38,14 @@ Subsequent runs:
 
 Home Assistant auto-discovery messages are published to `homeassistant/sensor/bmw_<VIN>_*/config` for each field.
 
+Three timestamps in the state are set by this service, not by BMW. BMW's per-field timestamps are the request time, also for a value cached in the cloud for days, so they cannot tell a fresh reading from an old one:
+
+| Field | Meaning |
+|---|---|
+| `vehicle_drivetrain_electricEngine_charging_level_changed_at` | when the SoC last took a **new** value; the optimiser trusts a SoC that changed around the manual "car is home" press. Absent after a restart until the first change |
+| `last_stream_at` | last message streamed by the car itself (proof the car just sent data) |
+| `last_rest_at` | last 30-minute cloud poll |
+
 ## Container ID and data subscription
 
 The BMW CarData API requires a "container" — a named data subscription specifying which REST keys to receive. On first run, `read_bmw` checks for an existing container via `GET /customers/containers`, creates one if needed, and then:

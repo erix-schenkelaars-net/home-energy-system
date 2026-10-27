@@ -251,6 +251,7 @@ CREATE TABLE IF NOT EXISTS `battery_schedule` (
   `gti_west_wm2`        float        DEFAULT NULL COMMENT 'KNMI GTI west string W/m²',
   `pv_source`           varchar(20)  DEFAULT NULL COMMENT 'GTI_KNMI | GHI_OM | CLEARSKY',
   `hp_correction_kwh`   float        DEFAULT NULL COMMENT 'Heat pump load correction kWh (heating delta vs reference temp)',
+  `hp_reserved_kwh`     float        DEFAULT NULL COMMENT 'Total kWh reserved for the heat pump: its share of the load profile (from sparrow_input_power_w, same weighting) + hp_correction_kwh. Display split only; already inside load_kwh. Added 2026-10-26: the correction alone (1.12 kWh) looked like the whole WP reservation on a ~10 kWh day',
   `cooling_correction_kwh` float     DEFAULT NULL COMMENT 'Airco load correction kWh (cooling delta vs temp-blind profile, CDH regression, clamped 0.7-1.4)',
   `total_om_raw_kwh`    float        DEFAULT NULL COMMENT 'Total OM-raw GHI forecast for this day kWh',
   `total_optimizer_kwh` float        DEFAULT NULL COMMENT 'Total optimizer PV forecast for this day kWh',

@@ -85,9 +85,13 @@ HP_load_correction = UA × (T_reference − T_forecast) / COP(T_forecast) × SLO
 
 where `UA = 248 W/K` (derived from 2019–2024 gas consumption data) and COP is a linear model calibrated to the heat pump's datasheet.
 
+The heat pump is already inside the historical load profile; the correction only adds the temperature delta. So the dashboard can show what is really reserved for it, `build_hp_profile()` splits the heat pump's share out of the profile (from `sparrow_input_power_w`, same window and recency weighting) and `battery_schedule.hp_reserved_kwh` stores share + correction per slot. Display only: it is already inside `load_kwh`.
+
 ### BMW EV smart charging
 
 If the BMW is at home (within 200 m, verified via BMW MQTT location) and SoC < 95 %, the LP allocates EV charge to the cheapest available quarter-slots before `BMW_READY_BY_HOUR` (09:00). A real-time power check via the Antela smart plug confirms the car is actually charging before locking the schedule.
+
+**Manual "car is home".** The BMW does not report its location reliably, so a long press on button 2 of the 4-button remote makes Home Assistant publish a retained timestamp on `EV_MANUAL_TOPIC` (`ev/manual_home`). While it is set the car counts as home and its charging status is ignored (it may be stale); the plug power alone drives the session, with a longer probe window (`EV_MANUAL_PROBE_WINDOW_S`) because there is no BMW status to guard a slow handshake. The SoC is used only when read_bmw saw it take a new value at most `EV_MANUAL_SOC_GRACE_MIN` (30 min) before the press; otherwise the session assumes `EV_MANUAL_WINDOW_H` (4 h). Below `EV_DONE_POWER_W` for `EV_DONE_HOLD_S` after charging means the car is full. The signal is cleared when the session ends and expires after `EV_MANUAL_MAX_AGE_H` (24 h).
 
 ## Price model
 

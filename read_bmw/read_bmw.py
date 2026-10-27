@@ -300,6 +300,17 @@ HA_ENTITIES: dict[str, tuple] = {
         ("sensor",        "Electric Range (PHEV)","km",  "distance", "mdi:lightning-bolt"),
     "vehicle_powertrain_tractionBattery_charging_port_anyPosition_isPlugged":
         ("binary_sensor", "Charger Connected",    None,  "plug",     "mdi:ev-plug-type2"),
+    # When the SoC last took a new value (set by this service, not by BMW: BMW's timestamps are
+    # the request time). The optimiser trusts a SoC that changed around the manual home press.
+    "vehicle_drivetrain_electricEngine_charging_level_changed_at":
+        ("sensor",        "Battery Level Changed", None, "timestamp", "mdi:clock-check-outline"),
+    # Freshness of the whole state (set by this service). BMW's per-field timestamps are the
+    # request time, so they cannot tell a fresh value from one cached in the cloud for days:
+    # only a message streamed by the car itself proves the car just sent data.
+    "last_stream_at":
+        ("sensor",        "Last Car Message",      None, "timestamp", "mdi:car-connected"),
+    "last_rest_at":
+        ("sensor",        "Last Cloud Poll",       None, "timestamp", "mdi:cloud-refresh"),
     "vehicle_drivetrain_lastRemainingRange":
         ("sensor",        "Total Range",          "km",  "distance", "mdi:map-marker-distance"),
     # ── Fuel (confirmed from official catalogue) ───────────────────────────────
@@ -413,6 +424,9 @@ def _publish_discovery(local: mqtt.Client, vin: str):
                 )
             cfg["payload_on"]  = "true"
             cfg["payload_off"] = "false"
+        if dev_class == "timestamp":
+            # absent until the first change after a restart -> 'None' = unknown in HA
+            cfg["value_template"] = f"{{{{ value_json.{nkey} | default(none) }}}}"
         if unit:      cfg["unit_of_measurement"] = unit
         if dev_class: cfg["device_class"]        = dev_class
         if icon:      cfg["icon"]                = icon
@@ -476,6 +490,12 @@ def _on_bmw_message(local: mqtt.Client, topic: str, payload: dict):
             log.info(f"  [new key] {raw_key} = {val!r}  ({unit})")
             _seen_keys.add(raw_key)
 
+        # When did the SoC last take a NEW value? BMW's own timestamps are useless for this (the
+        # REST timestamp is the request time, also for a value cached for days), so a change is
+        # the only proof of a fresh reading. The optimiser uses it to trust a SoC that arrived
+        # around the manual "car is home" press. First sight after a restart = unknown, no stamp.
+        if raw_key == _REST_SOC_KEY and nk in state and state[nk] != val:
+            state[nk + "_changed_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         state[nk] = val
 
         # Diagnostic: log value CHANGES for watched keys (find a reliable "in use" signal)
@@ -493,6 +513,10 @@ def _on_bmw_message(local: mqtt.Client, topic: str, payload: dict):
                 lon = float(val)
             except (TypeError, ValueError):
                 pass
+
+    # stream messages arrive on the CarData topic; the 30-min REST poll passes "rest/<vin>"
+    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    state["last_rest_at" if topic.startswith("rest/") else "last_stream_at"] = stamp
 
     avail = f"{BMW_TOPIC_PREFIX}/{vin}/availability"
     local.publish(avail, "online", retain=True)

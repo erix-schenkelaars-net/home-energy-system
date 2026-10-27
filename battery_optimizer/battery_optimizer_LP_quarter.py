@@ -247,6 +247,20 @@ EV_POWER_CHECK_WAIT_S       = 60     # wait time (s) after plug-on before power 
 EV_PROBE_POWER_W            = 1000   # measured plug power (W) that proves the BMW is charging
 EV_PROBE_WINDOW_S           = 180    # after plug-on, wait this long for power before abandoning
 EV_PROBE_RETRY_S            = 300    # after a failed probe, wait this long before trying again
+# Manual "car is home" signal (2026-10-26): the BMW does not report its location reliably, so a
+# long press on button 2 of the 4-button remote makes HA publish a retained timestamp on
+# EV_MANUAL_TOPIC. While it is set the car counts as home and its SoC/charging status are
+# ignored (both may be stale): the window assumes the maximum (EV_MANUAL_WINDOW_H) and the plug
+# power alone drives the session. Cleared when the session ends, expires after EV_MANUAL_MAX_AGE_H.
+EV_MANUAL_TOPIC             = os.environ.get("EV_MANUAL_TOPIC", "ev/manual_home")
+EV_MANUAL_MAX_AGE_H         = 24
+EV_MANUAL_WINDOW_H          = 4.0    # assumed charge length when the SoC is unknown
+EV_MANUAL_PROBE_WINDOW_S    = 300    # no BMW status to guard a slow handshake -> wait longer
+# A SoC is trusted in manual mode only when read_bmw saw it take a new value no earlier than
+# this long before the press (the car reports its SoC around arrival); otherwise the 4 h fallback.
+EV_MANUAL_SOC_GRACE_MIN     = 30
+EV_DONE_POWER_W             = 100    # below this for EV_DONE_HOLD_S after charging = car is full
+EV_DONE_HOLD_S              = 600
 BMW_HOME_LAT                = float(os.environ.get("BMW_HOME_LAT", "52.0"))
 BMW_HOME_LON                = float(os.environ.get("BMW_HOME_LON", "5.0"))
 BMW_HOME_RADIUS_M           = 200    # maximum distance from home (metres)
@@ -390,6 +404,7 @@ class HourSlot:
     gti_west_wm2: float = 0.0     # raw KNMI GTI west string (W/m²)
     pv_source: str = ""           # 'KNMI_GTI' | 'OM_GHI' | 'FORECAST_SOLAR' | 'CACHE'
     hp_correction_kwh: float = 0.0       # verwarmings-delta (warmtepomp) t.o.v. referentietemp
+    hp_reserved_kwh: float = 0.0         # totaal voor de WP gereserveerd (profiel + correctie)
     cooling_correction_kwh: float = 0.0  # koel-delta (airco) t.o.v. het temp-blinde profiel
     pv_clearsky_kwh: float = 0.0         # gemeten clear-sky-PV bij deze zonshoogte (referentielijn)
     pv_clearsky_east_kwh: Optional[float] = None  # dezelfde lijn per dakhelft, alleen voor weergave
@@ -1717,6 +1732,7 @@ def ensure_schedule_table(conn):
         ("gti_west_wm2",     "FLOAT"),
         ("pv_source",        "VARCHAR(20)"),
         ("hp_correction_kwh","FLOAT"),
+        ("hp_reserved_kwh",  "FLOAT"),
         ("cooling_correction_kwh","FLOAT"),
         ("total_om_raw_kwh",  "FLOAT"),
         ("total_optimizer_kwh","FLOAT"),
@@ -1753,8 +1769,8 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
                solver_status, bat_kwh, cloud_cover_pct, ghi_ratio,
                gti_east_wm2, gti_west_wm2, pv_source, hp_correction_kwh,
                cooling_correction_kwh, pv_clearsky_kwh,
-               pv_clearsky_east_kwh, pv_clearsky_west_kwh)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               pv_clearsky_east_kwh, pv_clearsky_west_kwh, hp_reserved_kwh)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             now, slot.dt, slot.action, slot.charge_kw,
             slot.import_price(), slot.pv_kwh, slot.load_kwh,
@@ -1766,7 +1782,7 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
             slot.gti_east_wm2, slot.gti_west_wm2,
             slot.pv_source or None, slot.hp_correction_kwh,
             slot.cooling_correction_kwh, slot.pv_clearsky_kwh,
-            slot.pv_clearsky_east_kwh, slot.pv_clearsky_west_kwh,
+            slot.pv_clearsky_east_kwh, slot.pv_clearsky_west_kwh, slot.hp_reserved_kwh,
         ))
     conn.commit()
 
@@ -1943,6 +1959,59 @@ def _read_load_skip_days() -> int:
     return 0
 
 
+def weighted_hour_profile(by_day: dict, until_d: date) -> dict[tuple[bool, int], float]:
+    """PURE: recency-weighted mean per (is_weekend, hour) in kWh/hour from {day: {hour: W}}.
+    Recent days count more (half-life LOAD_RECENCY_HALFLIFE_D); weekdays and weekends apart.
+    Shared by the house-load and heat-pump profiles so both are weighted identically."""
+    profile: dict[tuple[bool, int], float] = {}
+    for is_weekend in (False, True):
+        days = [dd for dd in by_day if (dd.weekday() >= 5) == is_weekend]
+        for h in range(24):
+            num = den = 0.0
+            for dd in days:
+                if h in by_day[dd]:
+                    age = (until_d - dd).days
+                    w   = 0.5 ** (age / LOAD_RECENCY_HALFLIFE_D)
+                    num += w * by_day[dd][h]
+                    den += w
+            if den > 0:
+                profile[(is_weekend, h)] = (num / den) / 1000.0
+    return profile
+
+
+def build_hp_profile(conn) -> dict[tuple[bool, int], float]:
+    """Heat-pump share of the load profile (kWh/hour per (is_weekend, hour)), from the measured
+    WP input power over the same window and weighting as build_load_profile(). The WP is already
+    inside the house-load profile; this only splits it out so the dashboard can show what is
+    really reserved for it (profile + temperature correction) instead of the correction alone."""
+    skip  = _read_load_skip_days()
+    until = datetime.now() - timedelta(days=skip)
+    since = until - timedelta(days=max(LOAD_LOOKBACK_DAYS, HISTORY_DAYS))
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT DATE(ts) AS d, HOUR(ts) AS hr, AVG(sparrow_input_power_w) AS avg_w
+        FROM energy WHERE ts >= %s AND ts < %s AND sparrow_input_power_w IS NOT NULL
+        GROUP BY DATE(ts), HOUR(ts)
+    """, (since, until))
+    by_day: dict[date, dict[int, float]] = {}
+    for r in cur.fetchall():
+        d = r["d"].date() if isinstance(r["d"], datetime) else r["d"]
+        by_day.setdefault(d, {})[int(r["hr"])] = max(r["avg_w"] or 0.0, 0.0)
+    cur.close()
+    by_day.pop(until.date(), None)                     # today is partial
+    profile = weighted_hour_profile(by_day, until.date())
+    log.info("HP profile: %d dagen, %.1f kWh/weekdag", len(by_day),
+             sum(profile.get((False, h), 0.0) for h in range(24)))
+    return profile
+
+
+def hp_reserved_kwh(hp_profile_h: float, load_scale: float, hp_correction: float,
+                    load_kwh: float) -> float:
+    """PURE: kWh reserved for the heat pump in one quarter = its profile share, scaled like the
+    total load (in-day factor, pessimism), plus the temperature correction; within [0, load]."""
+    return min(load_kwh, max(0.0, hp_profile_h * load_scale * SLOT_H + hp_correction))
+
+
 def build_load_profile(conn, base_load_w: float) -> dict[tuple[bool, int], float]:
     """Weekdag/weekend-bewust, recency-gewogen uur-van-de-dag load-profiel (kWh/uur).
     Geeft een dict met sleutel (is_weekend, hour). NB: GEEN pessimisme hier — dat
@@ -1984,19 +2053,7 @@ def build_load_profile(conn, base_load_w: float) -> dict[tuple[bool, int], float
         by_day.pop(lowest, None)
 
     # #5 recency-gewogen gemiddelde per (weekend?, uur)
-    profile: dict[tuple[bool, int], float] = {}
-    for is_weekend in (False, True):
-        days = [dd for dd in by_day if (dd.weekday() >= 5) == is_weekend]
-        for h in range(24):
-            num = den = 0.0
-            for dd in days:
-                if h in by_day[dd]:
-                    age = (until.date() - dd).days
-                    w   = 0.5 ** (age / LOAD_RECENCY_HALFLIFE_D)
-                    num += w * by_day[dd][h]
-                    den += w
-            if den > 0:
-                profile[(is_weekend, h)] = (num / den) / 1000.0
+    profile = weighted_hour_profile(by_day, until.date())
     # ontbrekende sleutels opvullen met de base-load fallback
     for is_weekend in (False, True):
         for h in range(24):
@@ -2367,9 +2424,12 @@ def optimise(  # noqa: C901
     replay_date: Optional[date] = None,
     replay_forecast: str = "schedule",
     nowcast_pv: Optional[dict] = None,
+    hp_profile: Optional[dict] = None,
 ) -> tuple[list[HourSlot], str]:
     if ref_temp_by_hour is None:
         ref_temp_by_hour = {}
+    if hp_profile is None:
+        hp_profile = {}
     if cooling_factors is None:
         cooling_factors = {}
     if nowcast_pv is None:
@@ -2448,8 +2508,8 @@ def optimise(  # noqa: C901
         # #5 weekdag/weekend-bewust profiel; #2 pessimisme; #1 in-day factor (alleen vandaag)
         db_load_h     = load_profile.get((d.weekday() >= 5, hour),
                                          load_profile.get((False, hour), BASE_LOAD_FALLBACK_W / 1000))
-        if d == today:
-            db_load_h *= inday_load_factor
+        load_scale    = inday_load_factor if d == today else 1.0
+        db_load_h    *= load_scale
         # Seizoensgate: stookdag (dag-max <= 16C) => warmtepomp aan, airco uit; anders omgekeerd.
         # Zo vullen de twee modellen elkaar aan i.p.v. dubbel te tellen in het tussenseizoen.
         heating_mode  = day_max_temp.get(d, 99.0) <= HEATING_MAX_TEMP_C
@@ -2462,6 +2522,9 @@ def optimise(  # noqa: C901
         hp_corr_h     = predict_hp_correction_kwh(forecast_temp, ref_temp, hour) if heating_mode else 0.0
         load          = max(0.05 * SLOT_H, (db_load_h + hp_corr_h) * SLOT_H)
         hp_correction = hp_corr_h * SLOT_H
+        hp_reserved   = hp_reserved_kwh(hp_profile.get((d.weekday() >= 5, hour), 0.0),
+                                        load_scale * cool_factor * LOAD_PESSIMISM,
+                                        hp_correction, load)
 
         cc, ghi_r = get_slot_weather_attrs(radiation, dt)
         gti_e, gti_w, pv_src = get_pv_forecast_details(radiation, dt)
@@ -2472,6 +2535,7 @@ def optimise(  # noqa: C901
                         cloud_cover_pct=cc, ghi_ratio=ghi_r,
                         gti_east_wm2=gti_e, gti_west_wm2=gti_w,
                         pv_source=pv_src, hp_correction_kwh=hp_correction,
+                        hp_reserved_kwh=hp_reserved,
                         cooling_correction_kwh=cooling_corr,
                         pv_clearsky_kwh=(pv_clearsky or 0.0),
                         pv_clearsky_east_kwh=pcs_east,
@@ -3197,6 +3261,32 @@ def read_bmw_location_mqtt() -> tuple[Optional[float], Optional[float]]:
     return r.get("lat"), r.get("lon")
 
 
+def read_bmw_soc_stamp() -> tuple[Optional[float], Optional[datetime]]:
+    """SoC plus the local time read_bmw saw it take a new value (None = unknown)."""
+    def parser(msg, result):
+        data = json.loads(msg.payload.decode())
+        soc  = data.get("vehicle_drivetrain_electricEngine_charging_level")
+        if soc is not None:
+            result["soc"] = float(soc)
+        stamp = data.get("vehicle_drivetrain_electricEngine_charging_level_changed_at")
+        if stamp:
+            at = datetime.fromisoformat(stamp)
+            result["changed_at"] = at.astimezone().replace(tzinfo=None) if at.tzinfo else at
+    r = _read_mqtt_topic(BMW_MQTT_STATE_TOPIC, parser)
+    return r.get("soc"), r.get("changed_at")
+
+
+def manual_soc_if_reliable(soc: Optional[float], changed_at: Optional[datetime],
+                           since: datetime) -> Optional[float]:
+    """PURE: the BMW SoC when it took a new value at most EV_MANUAL_SOC_GRACE_MIN before the
+    manual press (or after it), else None -> use the 4 h fallback."""
+    if soc is None or changed_at is None:
+        return None
+    if changed_at < since - timedelta(minutes=EV_MANUAL_SOC_GRACE_MIN):
+        return None
+    return soc
+
+
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6_371_000.0
     dlat = math.radians(lat2 - lat1)
@@ -3215,6 +3305,62 @@ def ev_at_home() -> Optional[bool]:
     at_home = dist <= BMW_HOME_RADIUS_M
     log.info("EV location: %.6f,%.6f  distance=%.0fm  at_home=%s", lat, lon, dist, at_home)
     return at_home
+
+
+def parse_ev_manual_home(payload: str, now: datetime) -> Optional[datetime]:
+    """PURE: the press time from the EV_MANUAL_TOPIC payload (ISO timestamp, as HA's now()),
+    or None when empty, unreadable or older than EV_MANUAL_MAX_AGE_H."""
+    try:
+        since = datetime.fromisoformat(payload.strip())
+    except (AttributeError, ValueError):
+        return None
+    if since.tzinfo is not None:
+        since = since.astimezone().replace(tzinfo=None)      # local naive, like the rest
+    if now - since > timedelta(hours=EV_MANUAL_MAX_AGE_H):
+        return None
+    return since
+
+
+def read_ev_manual_home(now: datetime) -> Optional[datetime]:
+    """Press time of the manual 'car is home' signal, or None. An expired signal is cleared."""
+    def parser(msg, result):
+        result["payload"] = msg.payload.decode()
+    raw = _read_mqtt_topic(EV_MANUAL_TOPIC, parser, timeout_s=2.0).get("payload")
+    if not raw:
+        return None
+    since = parse_ev_manual_home(raw, now)
+    if since is None:
+        log.info("EV: manual home signal expired or unreadable (%r) — clearing", raw)
+        clear_ev_manual_home()
+    return since
+
+
+def clear_ev_manual_home() -> None:
+    """Delete the retained manual signal (an empty retained payload removes it)."""
+    try:
+        try:
+            c = paho_mqtt.Client(callback_api_version=paho_mqtt.CallbackAPIVersion.VERSION2)
+        except AttributeError:
+            c = paho_mqtt.Client()
+        if MQTT_BROKER_USER:
+            c.username_pw_set(MQTT_BROKER_USER, MQTT_BROKER_PASS)
+        c.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, keepalive=10)
+        c.loop_start()
+        c.publish(EV_MANUAL_TOPIC, payload=b"", qos=1, retain=True).wait_for_publish(5)
+        c.loop_stop()
+        c.disconnect()
+    except Exception as e:
+        log.warning("EV: clearing manual home signal failed: %s", e)
+
+
+def ev_manual_soc_equiv(charged_s: float) -> float:
+    """PURE: a 'SoC' that makes ev_charge_window()/compute_ev_load_schedule() plan exactly the
+    quarters still assumed needed: EV_MANUAL_WINDOW_H minus what has charged so far (min. one).
+    It can be below 0 -- it is an energy equivalent, not a real state of charge."""
+    total_q = round(EV_MANUAL_WINDOW_H / SLOT_H)
+    left_q  = max(1, total_q - int(charged_s // (SLOT_H * 3600)))
+    kwh     = left_q * BMW_CHARGE_POWER_KW * SLOT_H - 1e-6     # -1e-6: ceil() must not add a quarter
+    return BMW_TARGET_SOC_PCT - kwh / BMW_BATTERY_KWH * 100.0
 
 
 def _ha_headers() -> dict:
@@ -3305,17 +3451,22 @@ def ev_plug_is_optimizer_controlled() -> bool:
 _ev_session_started   = False   # latch: real charging seen (power/INIT) -> never interrupt it
 _ev_probe_on_since    = None    # ts the plug was switched on to probe (None = not probing)
 _ev_probe_retry_after = None    # ts before which no new probe is attempted (after a failed one)
+_ev_charge_since      = None    # ts the session was committed (manual mode counts down from it)
+_ev_low_since         = None    # ts plug power first dropped below EV_DONE_POWER_W (manual mode)
 
 
 def _ev_reset_session() -> None:
     """Forget the current charge session (car left, or the BMW reported CHARGINGENDED)."""
     global _ev_session_started, _ev_probe_on_since, _ev_probe_retry_after
+    global _ev_charge_since, _ev_low_since
     _ev_session_started   = False
     _ev_probe_on_since    = None
     _ev_probe_retry_after = None
+    _ev_charge_since      = None
+    _ev_low_since         = None
 
 
-def _ev_probe_tick(charging_status: Optional[str]) -> Optional[float]:
+def _ev_probe_tick(charging_status: Optional[str], power_only: bool = False) -> Optional[float]:
     """One evaluation of a running probe (plug is on, session not yet ended). Owns the plug and
     the latch only -- it never plans load (that is run_ev_charging's return value).
 
@@ -3326,9 +3477,12 @@ def _ev_probe_tick(charging_status: Optional[str]) -> Optional[float]:
       * belt-and-suspenders: never abort while charging_status is anything but NOCHARGING, so a
         slow handshake mid-INITIALIZATION is never cut (that is what caused the CHARGINGERROR).
 
+    power_only (manual mode): the BMW status is ignored, so an idle probe is abandoned on power
+    alone, after the longer EV_MANUAL_PROBE_WINDOW_S.
+
     Returns the measured plug power (W) for logging, or None if unavailable.
     """
-    global _ev_session_started, _ev_probe_on_since, _ev_probe_retry_after
+    global _ev_session_started, _ev_probe_on_since, _ev_probe_retry_after, _ev_charge_since
     power_w  = get_ha_sensor_float(HA_EV_PLUG_POWER_ENTITY)
     charging = (power_w is not None and power_w > EV_PROBE_POWER_W) \
                or charging_status in ("INITIALIZATION", "CHARGINGACTIVE")
@@ -3339,6 +3493,8 @@ def _ev_probe_tick(charging_status: Optional[str]) -> Optional[float]:
                      power_w or 0, charging_status)
         _ev_session_started = True
         _ev_probe_on_since  = None
+        if _ev_charge_since is None:
+            _ev_charge_since = time.time()
         return power_w
 
     if _ev_session_started:
@@ -3349,7 +3505,8 @@ def _ev_probe_tick(charging_status: Optional[str]) -> Optional[float]:
         return power_w
 
     waited = time.time() - _ev_probe_on_since
-    if waited >= EV_PROBE_WINDOW_S and charging_status == "NOCHARGING":
+    window = EV_MANUAL_PROBE_WINDOW_S if power_only else EV_PROBE_WINDOW_S
+    if waited >= window and (power_only or charging_status == "NOCHARGING"):
         if ev_plug_is_optimizer_controlled():
             log.info("EV: probe idle %.0fs (%.0fW, NOCHARGING) — nothing plugged in, "
                      "plug OFF, retry in %ds", waited, power_w or 0, EV_PROBE_RETRY_S)
@@ -3360,10 +3517,97 @@ def _ev_probe_tick(charging_status: Optional[str]) -> Optional[float]:
     return power_w
 
 
+def _ev_done_tick(power_w: Optional[float]) -> bool:
+    """Manual mode: True once a committed session has drawn < EV_DONE_POWER_W for EV_DONE_HOLD_S
+    (the car is full). Called every minute by the poll loop and once per quarter."""
+    global _ev_low_since
+    if not _ev_session_started or power_w is None or power_w >= EV_DONE_POWER_W:
+        _ev_low_since = None
+        return False
+    if _ev_low_since is None:
+        _ev_low_since = time.time()
+    return time.time() - _ev_low_since >= EV_DONE_HOLD_S
+
+
+def _ev_finish_manual(power_w: Optional[float]) -> None:
+    """Manual session done: plug off (if we own it), signal cleared, session forgotten."""
+    if ev_plug_is_optimizer_controlled():
+        log.info("EV manual: load low (%.0fW for %ds) — charging done, plug OFF",
+                 power_w or 0, EV_DONE_HOLD_S)
+        set_ha_switch(HA_EV_PLUG_ENTITY, False)
+        set_ev_plug_control_flag(False)
+    else:
+        log.info("EV manual: load low — done, but plug controlled by HA/remote — skipping OFF")
+    clear_ev_manual_home()
+    _ev_reset_session()
+
+
+def _ev_manual_plug_on_tick() -> tuple[Optional[float], bool]:
+    """Manual mode with the plug on: commit/abandon the probe on power, end a finished session.
+    Returns (plug power W, session finished now)."""
+    power_w = _ev_probe_tick(None, power_only=True)
+    if _ev_session_started and _ev_done_tick(power_w):
+        _ev_finish_manual(power_w)
+        return power_w, True
+    return power_w, False
+
+
+def _run_ev_manual(current_hour: int, start_qtr_idx: int, prices: dict[int, float],
+                   since: datetime) -> tuple[bool, Optional[float]]:
+    """run_ev_charging() while the manual 'car is home' signal is set (location, SoC and BMW
+    charging status ignored). Returns (charging, SoC-equivalent for the LP window)."""
+    global _ev_session_started, _ev_probe_on_since
+    charged_s = time.time() - _ev_charge_since if _ev_charge_since else 0.0
+    real_soc  = manual_soc_if_reliable(*read_bmw_soc_stamp(), since)
+    soc_eq    = real_soc if real_soc is not None else ev_manual_soc_equiv(charged_s)
+    plug      = get_ha_switch_state(HA_EV_PLUG_ENTITY)
+    log.info("EV manual: car marked home at %s  plug=%s  %s", since.strftime("%d %H:%M"), plug,
+             f"SoC {real_soc:.0f}% (fresh)" if real_soc is not None else
+             "SoC unknown — assumed remaining %.1f h"
+             % ((BMW_TARGET_SOC_PCT - soc_eq) / 100.0 * BMW_BATTERY_KWH / BMW_CHARGE_POWER_KW))
+
+    if plug == "on":
+        power_w, finished = _ev_manual_plug_on_tick()
+        if finished:
+            return False, None                 # car is full -> no load and no forecast
+        if _ev_session_started:
+            log.info("EV manual: charging (%.0fW) — planning load, holding plug", power_w or 0)
+            return True, soc_eq
+        log.info("EV manual: plug on, probing (%.0fW) — no load planned yet", power_w or 0)
+        return False, soc_eq
+
+    _ev_session_started = False
+    if real_soc is not None and real_soc >= BMW_SOC_START_THRESHOLD_PCT:
+        log.info("EV manual: SoC %.0f%% >= %.0f%% — no charge needed", real_soc,
+                 BMW_SOC_START_THRESHOLD_PCT)
+        return False, real_soc
+    if _ev_probe_retry_after is not None and time.time() < _ev_probe_retry_after:
+        log.info("EV manual: waiting %.0fs before next probe attempt",
+                 _ev_probe_retry_after - time.time())
+        return False, soc_eq
+
+    window = ev_charge_window(start_qtr_idx, prices, soc_eq, current_hour)
+    if not window or start_qtr_idx not in window:
+        log.info("EV manual: not in cheapest %d-quarter window yet (starts %s, now=%d) — waiting",
+                 len(window), window[0] if window else "—", start_qtr_idx)
+        return False, soc_eq
+
+    log.info("EV manual: cheapest window reached (now=%d) — plug ON, probing for power",
+             start_qtr_idx)
+    set_ha_switch(HA_EV_PLUG_ENTITY, True)
+    set_ev_plug_control_flag(True)
+    _ev_probe_on_since = time.time()
+    return False, soc_eq
+
+
 def run_ev_charging(current_hour: int, start_qtr_idx: int,
                     prices: dict[int, float]) -> tuple[bool, Optional[float]]:
     global _ev_session_started, _ev_probe_on_since, _ev_probe_retry_after
     log.info("EV charge check...")
+
+    manual_since = read_ev_manual_home(datetime.now())
+    if manual_since is not None:
+        return _run_ev_manual(current_hour, start_qtr_idx, prices, manual_since)
 
     at_home = ev_at_home()
     if at_home is False:
@@ -3652,6 +3896,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
 
     base_load    = read_avg_consumption(conn)
     load_prof    = build_load_profile(conn, base_load)
+    hp_prof      = build_hp_profile(conn)       # WP-deel van load_prof, alleen voor de weergave
     inday_factor = compute_inday_load_factor(conn, load_prof, now)
     cooling_facs = compute_cooling_factors(conn, load_prof, now, radiation)  # begrensd; {} = temp-blind
     nowcast_pv   = load_nowcast_overlay(conn, now)  # verse KNMI-nowcast voor de 0-4u PV-overlay
@@ -3664,7 +3909,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     okw_base = dict(prices=prices, radiation=radiation, load_profile=load_prof, today=today,
                     mode=mode, ev_soc=ev_soc, ref_temp_by_hour=ref_temp_by_hour,
                     inday_load_factor=inday_factor, cooling_factors=cooling_facs,
-                    nowcast_pv=nowcast_pv)
+                    nowcast_pv=nowcast_pv, hp_profile=hp_prof)
 
     if rolling_range is not None:
         end_q = round((rolling_range[1] - datetime.combine(today, datetime.min.time())).total_seconds() / 900)
@@ -3691,6 +3936,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         cooling_factors   = cooling_facs,
         replay_date       = replay_at.date() if replay_at else None,
         nowcast_pv        = nowcast_pv,
+        hp_profile        = hp_prof,
     )
 
     if not schedule:
@@ -3802,6 +4048,12 @@ def _sleep_until_next_quarter():
 
         plug_state = get_ha_switch_state(HA_EV_PLUG_ENTITY)
         if plug_state != "on":
+            continue
+
+        if read_ev_manual_home(datetime.now()) is not None:
+            power_w, _ = _ev_manual_plug_on_tick()
+            log.info("EV poll (manual): %.0fW %s", power_w or 0,
+                     "charging" if _ev_session_started else "probing/idle")
             continue
 
         soc, charging_status, _ = read_bmw_state_mqtt()

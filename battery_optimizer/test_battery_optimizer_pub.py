@@ -1269,6 +1269,7 @@ class TestEvProbeCharging(unittest.TestCase):
         if prices is None:
             prices = {q: 0.22 for q in range(192)}   # flat -> cheapest window starts now
         with contextlib.ExitStack() as st:
+            st.enter_context(patch.object(mod, "read_ev_manual_home", return_value=None))
             st.enter_context(patch.object(mod, "ev_at_home", return_value=at_home))
             st.enter_context(patch.object(mod, "read_bmw_state_mqtt",
                                           return_value=(soc, status, None)))
@@ -1358,6 +1359,172 @@ class TestEvProbeCharging(unittest.TestCase):
         res = self._run(plug="off", soc=96.0)
         self.assertEqual(res, (False, 96.0))
         self.assertFalse(self._turned_on())
+
+
+class TestEvManualHome(unittest.TestCase):
+    """Long press on button 2 of the 4-button remote = 'the car is home' (the BMW does not report
+    its location reliably). Location, SoC and BMW charging status are then ignored: a 4-hour
+    window, plug power alone drives the session, plug off and signal cleared once the car is full.
+    """
+
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self):
+        mod._ev_reset_session()
+        self.soc_stamp = (75.0, None)          # SoC never seen changing -> not trusted
+
+    def _run(self, *, plug="off", power=0.0, prices=None, start_qtr=0, hour=0,
+             optimizer_owns=True):
+        if prices is None:
+            prices = {q: 0.22 for q in range(192)}
+        with contextlib.ExitStack() as st:
+            st.enter_context(patch.object(mod, "read_ev_manual_home", return_value=self.NOW))
+            st.enter_context(patch.object(mod, "read_bmw_soc_stamp", return_value=self.soc_stamp))
+            self.at_home = st.enter_context(patch.object(mod, "ev_at_home", return_value=False))
+            self.bmw = st.enter_context(patch.object(mod, "read_bmw_state_mqtt",
+                                                     return_value=(99.0, "CHARGINGENDED", None)))
+            st.enter_context(patch.object(mod, "get_ha_switch_state", return_value=plug))
+            st.enter_context(patch.object(mod, "get_ha_sensor_float", return_value=power))
+            st.enter_context(patch.object(mod, "ev_plug_is_optimizer_controlled",
+                                          return_value=optimizer_owns))
+            self.set_sw = st.enter_context(patch.object(mod, "set_ha_switch"))
+            st.enter_context(patch.object(mod, "set_ev_plug_control_flag"))
+            self.clear = st.enter_context(patch.object(mod, "clear_ev_manual_home"))
+            return mod.run_ev_charging(hour, start_qtr, prices)
+
+    def _switched(self, on):
+        return any(c.args == (mod.HA_EV_PLUG_ENTITY, on) for c in self.set_sw.call_args_list)
+
+    # -- the signal --
+    def test_parse_iso_timestamp_from_ha(self):
+        since = mod.parse_ev_manual_home("2026-10-26T17:30:00+01:00", self.NOW)
+        self.assertIsNotNone(since)
+        self.assertIsNone(since.tzinfo)
+
+    def test_parse_rejects_empty_garbage_and_expired(self):
+        self.assertIsNone(mod.parse_ev_manual_home("", self.NOW))
+        self.assertIsNone(mod.parse_ev_manual_home("on", self.NOW))
+        self.assertIsNone(mod.parse_ev_manual_home("2026-10-25T17:00:00", self.NOW))   # > 24 h
+
+    # -- the window --
+    def test_unknown_soc_plans_a_four_hour_window(self):
+        soc_eq = mod.ev_manual_soc_equiv(0)
+        self.assertEqual(len(mod.ev_charge_window(0, {q: 0.22 for q in range(192)}, soc_eq, 0)), 16)
+
+    def test_window_counts_down_while_charging(self):
+        soc_eq = mod.ev_manual_soc_equiv(3600)                       # 1 h charged
+        self.assertEqual(len(mod.ev_charge_window(0, {q: 0.22 for q in range(192)}, soc_eq, 0)), 12)
+        soc_eq = mod.ev_manual_soc_equiv(10 * 3600)                  # never below one quarter
+        self.assertEqual(len(mod.ev_charge_window(0, {q: 0.22 for q in range(192)}, soc_eq, 0)), 1)
+
+    # -- a fresh SoC beats the 4 h fallback --
+    def test_soc_changed_around_press_is_trusted(self):
+        since = self.NOW
+        self.assertEqual(mod.manual_soc_if_reliable(60.0, since - timedelta(minutes=10), since), 60.0)
+        self.assertEqual(mod.manual_soc_if_reliable(60.0, since + timedelta(minutes=5), since), 60.0)
+
+    def test_old_or_unknown_soc_change_falls_back(self):
+        since = self.NOW
+        self.assertIsNone(mod.manual_soc_if_reliable(60.0, since - timedelta(hours=2), since))
+        self.assertIsNone(mod.manual_soc_if_reliable(60.0, None, since))
+        self.assertIsNone(mod.manual_soc_if_reliable(None, since, since))
+
+    def test_fresh_soc_sets_a_shorter_window(self):
+        # 70 % of 7.7 kWh -> 2.31 kWh -> 5 quarters instead of 16; cheapest 5 are at 20..24
+        self.soc_stamp = (70.0, self.NOW - timedelta(minutes=5))
+        prices = {q: (0.05 if 20 <= q < 25 else 0.50) for q in range(192)}
+        _, soc = self._run(plug="off", prices=prices, start_qtr=20, hour=5)
+        self.assertEqual(soc, 70.0)
+        self.assertTrue(self._switched(True))
+        self.assertEqual(len(mod.ev_charge_window(20, prices, soc, 5)), 5)
+
+    def test_fresh_full_soc_does_not_charge(self):
+        self.soc_stamp = (97.0, self.NOW)
+        self.assertEqual(self._run(plug="off"), (False, 97.0))
+        self.assertFalse(self._switched(True))
+
+    def test_stale_soc_uses_four_hour_fallback(self):
+        _, soc = self._run(plug="off")
+        self.assertLess(soc, 0)               # energy equivalent of 4 h, not the stale 75 %
+
+    # -- control --
+    def test_location_and_stale_bmw_state_are_ignored(self):
+        # GPS says away, BMW says 99 % / CHARGINGENDED (stale) -> still starts in the window
+        self._run(plug="off")
+        self.assertTrue(self._switched(True))
+        self.at_home.assert_not_called()
+        self.bmw.assert_not_called()
+
+    def test_outside_window_waits(self):
+        prices = {q: (0.05 if 20 <= q < 36 else 0.50) for q in range(192)}
+        self._run(plug="off", prices=prices)
+        self.assertFalse(self._switched(True))
+
+    def test_power_commits_and_plans_load(self):
+        charging, soc_eq = self._run(plug="on", power=2200.0)
+        self.assertTrue(charging)
+        self.assertTrue(mod._ev_session_started)
+        self.assertLess(soc_eq, 0)            # energy equivalent of the remaining 4 h
+
+    def test_idle_probe_aborts_on_power_alone(self):
+        mod._ev_probe_on_since = 0.0          # long ago, no BMW status to guard it
+        self._run(plug="on", power=0.0)
+        self.assertTrue(self._switched(False))
+        self.clear.assert_not_called()        # car may still be plugged in later: keep the signal
+
+    def test_low_load_after_charging_ends_session(self):
+        mod._ev_session_started = True
+        mod._ev_charge_since = 1.0
+        mod._ev_low_since = 0.0               # below 100 W since long ago
+        charging, soc_eq = self._run(plug="on", power=20.0)
+        self.assertEqual((charging, soc_eq), (False, None))
+        self.assertTrue(self._switched(False))
+        self.clear.assert_called_once()
+        self.assertFalse(mod._ev_session_started)
+
+    def test_brief_dip_does_not_end_session(self):
+        mod._ev_session_started = True
+        mod._ev_charge_since = 1.0
+        charging, _ = self._run(plug="on", power=20.0)   # first low reading starts the timer
+        self.assertTrue(charging)
+        self.assertFalse(self._switched(False))
+        self.clear.assert_not_called()
+
+
+class TestHpReservation(unittest.TestCase):
+    """The dashboard shows what is really reserved for the heat pump (its share of the load
+    profile + the temperature correction), not the correction alone (2026-10-26: 1.12 kWh shown
+    on a day the WP drew ~10 kWh). The LP itself is untouched: this only splits the load."""
+
+    def test_weighted_profile_favours_recent_days(self):
+        until = date(2026, 10, 26)                     # Monday
+        by_day = {date(2026, 10, 23): {6: 2000.0},     # Friday, 3 days old
+                  date(2026, 10, 9): {6: 0.0}}         # Friday, 17 days old
+        prof = mod.weighted_hour_profile(by_day, until)
+        self.assertGreater(prof[(False, 6)], 1.5)      # pulled towards the recent 2 kW
+        self.assertNotIn((True, 6), prof)              # no weekend days given
+
+    def test_reserved_is_profile_plus_correction_within_load(self):
+        self.assertAlmostEqual(mod.hp_reserved_kwh(0.8, 1.1, 0.05, 1.0), 0.8 * 1.1 * 0.25 + 0.05)
+        self.assertEqual(mod.hp_reserved_kwh(0.0, 1.1, -0.2, 1.0), 0.0)      # never negative
+        self.assertEqual(mod.hp_reserved_kwh(9.0, 1.1, 0.0, 0.3), 0.3)       # never above load
+
+    def test_optimise_fills_reservation_per_slot(self):
+        hp = {(we, h): 0.4 for we in (False, True) for h in range(24)}
+        slots, st = mod.optimise(start_qtr_idx=0, prices=prices_make(), radiation=_build_radiation(cloud_flat(50)),
+                                 load_profile=LOAD_NORM, initial_soc_pct=50.0, today=TODAY,
+                                 ref_temp_by_hour=REF_TEMP, hp_profile=hp)
+        self.assertEqual(st, "OK")
+        for s in slots[:96]:
+            self.assertGreaterEqual(s.hp_reserved_kwh, 0.0)
+            self.assertLessEqual(s.hp_reserved_kwh, s.load_kwh + 1e-9)
+        # far more than the correction alone: ~0.4 kWh/h x 24 h ~ 10 kWh per day
+        self.assertGreater(sum(s.hp_reserved_kwh for s in slots[:96]), 8.0)
+
+    def test_without_hp_profile_reservation_is_the_correction(self):
+        slots, _ = run_scenario(soc=50.0, rad=_build_radiation(cloud_flat(50)), prices=prices_make())
+        for s in slots[:96]:
+            self.assertAlmostEqual(s.hp_reserved_kwh, max(0.0, min(s.load_kwh, s.hp_correction_kwh)))
 
 
 class TestEvChargeWindow(unittest.TestCase):
