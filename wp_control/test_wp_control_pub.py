@@ -431,17 +431,23 @@ class TestRoomCompPi(unittest.TestCase):
 
     def test_build_cfg_pi_defaults(self):
         cfg = wp.build_cfg()
-        self.assertEqual((cfg["rc_ki"], cfg["rc_i_max"], cfg["rc_damp_band"], cfg["rc_damp_leak"]),
-                         (0.5, 8.0, 0.2, 0.2))
+        # 2026-11-01: Ki 0.5 -> 0.15 + opbouw-poort (90 min na een sp-verhoging, kamer niet stijgend)
+        self.assertEqual((cfg["rc_ki"], cfg["rc_i_max"], cfg["rc_damp_band"], cfg["rc_damp_leak"],
+                          cfg["rc_i_hold_min"], cfg["rc_i_trend"]),
+                         (0.15, 8.0, 0.2, 0.2, 90.0, 0.05))
 
     def test_defaults_clear_a_persistent_droop(self):
         # 2026-10-26: kamer bleef 0,4 °C onder het setpoint en I zakte (2,45 -> 0,67). Met de
         # standaarden moet I bij zo'n vast tekort blijven groeien i.p.v. een plafond te vinden.
-        cfg = wp.build_cfg()
-        st = {"i": 0.67}
-        seen = [wp.room_comp_pi(21.1, 21.5, st, cfg)[1] for _ in range(6)]
-        self.assertTrue(all(b > a for a, b in zip(seen, seen[1:])))
+        # Sinds 11-01 (Ki 0,15 + poort) gaat dat bewust trager: 2 uur vastzitten i.p.v. 30 min.
+        cfg, st = wp.build_cfg(), {"i": 0.67}
+        t0 = datetime(2026, 10, 26, 12, 0)
+        seen = [wp.room_comp_pi(21.1, 21.5, st, cfg, now=t0 + timedelta(minutes=5 * k))[1]
+                for k in range(25)]
+        grow = seen[9:]                                   # na 45 min historie mag de opbouw
+        self.assertTrue(all(b > a for a, b in zip(grow, grow[1:])))
         self.assertGreater(seen[-1], 1.5)
+
 
     def test_defaults_hold_at_setpoint_and_bleed_on_overshoot(self):
         cfg = wp.build_cfg()
@@ -480,6 +486,99 @@ class TestRoomCompPi(unittest.TestCase):
         for r in rooms:
             wp.room_comp_pi(r, 21.5, st, cfg, headroom=20.0, running=False)
         self.assertEqual(st["i"], 7.2)
+
+
+class TestIBuildupGate(unittest.TestCase):
+    """2026-11-01: I bouwt alleen op als de kamer vastzit — niet na een setpoint-verhoging en niet
+    zolang de kamer stijgt. 10-31 liep I zo bij elke stap (ochtendtrap, opladen) vol tot 8."""
+
+    def _cfg(self):
+        return dict(wp.build_cfg(), rc_i_hold_min=90.0, rc_i_trend=0.05)
+
+    def _run(self, rooms, sps, st=None, cfg=None, running=True):
+        st, cfg = ({"i": 0.0} if st is None else st), (cfg or self._cfg())
+        t0 = datetime(2026, 10, 31, 3, 0)
+        for k, (r, sp) in enumerate(zip(rooms, sps)):
+            wp.room_comp_pi(r, sp, st, cfg, headroom=20.0, running=running,
+                            now=t0 + timedelta(minutes=5 * k))
+        return st
+
+    def test_no_buildup_too_little_history(self):
+        st = self._run([20.5] * 5, [21.0] * 5)            # 20 min: nog geen trend te meten
+        self.assertEqual(st["i"], 0.0)
+        self.assertEqual(st["i_gate"], "te weinig kamerhistorie")
+
+    def test_builds_when_stuck_below_setpoint(self):
+        st = self._run([20.5] * 24, [21.0] * 24)          # 2 uur vlak 0,5 onder: echte droop
+        self.assertGreater(st["i"], 0.5)
+        self.assertEqual(st["i_gate"], "")
+
+    def test_rising_room_blocks_buildup(self):
+        rooms = [20.0 + 0.02 * k for k in range(36)]      # +0,24 K/u: komt er zelf wel
+        st = self._run(rooms, [21.5] * 36)
+        self.assertEqual(st["i"], 0.0)
+        self.assertIn("stijgt", st["i_gate"])
+
+    def test_setpoint_step_holds_buildup(self):
+        sps = [21.0] * 12 + [21.5] * 13                   # stap na 1 uur vlak, dan 60 min
+        st = self._run([20.5] * 25, sps)
+        self.assertEqual(st["i_gate"], "setpoint 60 min geleden verhoogd")
+        i_at_step = st["i"]
+        st2 = self._run([20.5] * 32, [21.0] * 12 + [21.5] * 20)   # 95 min na de stap
+        self.assertEqual(st2["i_gate"], "")               # mag weer
+        self.assertGreater(st2["i"], i_at_step)
+
+    def test_bleeds_even_when_gate_closed(self):
+        st = self._run([22.0] * 3, [21.0] * 3, st={"i": 3.0})   # te weinig historie, maar te warm
+        self.assertLess(st["i"], 3.0)
+
+    def test_morning_trap_1031_stays_low(self):
+        # 10-31 03:30-07:00 (15-min-log, per 5 min herhaald): trap 21 -> 21,5, kamer stijgt.
+        # Oud: I 0 -> 8 (cap). Met de poort mag I hier niet vollopen.
+        rooms15 = [20.3, 20.4, 20.5, 20.7, 20.9, 21.1, 21.2, 21.3, 21.3, 21.3, 21.1, 21.0, 20.9, 20.8, 21.0]
+        sps15 = [21.0, 21.0, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5]
+        rooms = [r for r in rooms15 for _ in range(3)]
+        sps = [s for s in sps15 for _ in range(3)]
+        old = {"i": 0.0}
+        for r, s in zip(rooms, sps):
+            wp.room_comp_pi(r, s, old, dict(self._cfg(), rc_ki=0.5), headroom=20.0)
+        new = self._run(rooms, sps)
+        self.assertGreater(old["i"], 7.0)                 # het oude gedrag: vol
+        self.assertLess(new["i"], 1.5)
+
+
+class TestHeatOffAbove(unittest.TestCase):
+    """2026-11-01: tijdens de prijs-uitrol gaat de WP uit net boven het uitrol-setpoint (10-29 bleef
+    hij bij 21,7 vs sp 21,0 onder de 0,8-drempel en stookte door in €0,73)."""
+
+    WIN = {"cheap_start": datetime(2026, 10, 29, 11, 0), "cheap_end": datetime(2026, 10, 29, 14, 0),
+           "coast_end": datetime(2026, 10, 29, 19, 0), "cheap_eur": 0.3, "peak_eur": 0.7}
+
+    def test_coast_window_uses_tight_threshold(self):
+        cfg = wp.build_cfg()
+        self.assertEqual(wp.heat_off_above(datetime(2026, 10, 29, 14, 32), 21.0, self.WIN, cfg, 21.0), 0.1)
+        heat = wp.decide_heat(21.7, 21.0, {"heat": True}, cfg["heat_on_below"], 0.1)
+        self.assertFalse(heat)                            # 10-29 14:32: nu UIT
+
+    def test_afternoon_comfort_coasts_on_the_preload(self):
+        # 11-01: na het oplaadblok (22,5) houdt het schema 22; de WP gaat uit vanaf 22,1 en springt pas
+        # weer aan onder 21,8 — het voorgeladen huis draagt 13-17 zonder te stoken
+        cfg = wp.build_cfg()
+        off = wp.heat_off_above(datetime(2026, 10, 29, 15, 0), 22.0, self.WIN, cfg, 22.0)
+        self.assertEqual(off, 0.1)
+        self.assertFalse(wp.decide_heat(22.3, 22.0, {"heat": True}, cfg["heat_on_below"], off))
+        self.assertFalse(wp.decide_heat(21.9, 22.0, {"heat": False}, cfg["heat_on_below"], off))
+        self.assertTrue(wp.decide_heat(21.8, 22.0, {"heat": False}, cfg["heat_on_below"], off))
+
+    def test_bump_during_coast_keeps_normal_threshold(self):
+        cfg = wp.build_cfg()
+        self.assertEqual(wp.heat_off_above(datetime(2026, 10, 29, 15, 0), 23.0, self.WIN, cfg, 22.0), 0.8)
+
+    def test_outside_coast_or_no_window_normal(self):
+        cfg = wp.build_cfg()
+        self.assertEqual(wp.heat_off_above(datetime(2026, 10, 29, 12, 0), 22.5, self.WIN, cfg, 22.5), 0.8)
+        self.assertEqual(wp.heat_off_above(datetime(2026, 10, 29, 19, 0), 19.0, self.WIN, cfg, 19.0), 0.8)
+        self.assertEqual(wp.heat_off_above(datetime(2026, 10, 29, 15, 0), 22.0, None, cfg, 22.0), 0.8)
 
 
 class TestRegulatedFlow(unittest.TestCase):
@@ -706,10 +805,11 @@ class TestDayPlan(unittest.TestCase):
         self.assertEqual(len(plan["times"]), 96)
         self.assertEqual(plan["times"][0], "2026-10-28T00:00")
         at = dict(zip(plan["times"], plan["setpoints"]))
-        self.assertEqual([at["2026-10-28T01:45"], at["2026-10-28T03:00"], at["2026-10-28T11:45"],
-                          at["2026-10-28T12:00"], at["2026-10-28T15:00"], at["2026-10-28T19:00"]],
-                         [19.0, 20.5, 21.5, 22.0, 21.0, 19.0])
-        self.assertEqual(plan["now"], 22.0)                # 13:10 valt in het oplaadblok
+        self.assertEqual([at["2026-10-28T01:45"], at["2026-10-28T05:00"], at["2026-10-28T11:45"],
+                          at["2026-10-28T12:00"], at["2026-10-28T15:00"], at["2026-10-28T17:00"],
+                          at["2026-10-28T19:00"]],
+                         [19.0, 20.5, 21.5, 22.5, 22.0, 21.0, 19.0])
+        self.assertEqual(plan["now"], 22.5)                # 13:10 valt in het oplaadblok
 
     def test_discovery_has_plan_sensor_with_attributes(self):
         conf = json.loads(dict(wp.ha_discovery_msgs())["homeassistant/sensor/wp_control/day_plan/config"])
@@ -1162,16 +1262,16 @@ class TestFlowDropLimit(unittest.TestCase):
 
 
 class TestDefaultSchedule(unittest.TestCase):
-    def test_warm_before_the_morning_peak(self):
+    def test_agreed_day_profile(self):
+        # 2026-11-01 met de bewoners: 21,0 vóór 08:00 (opwarmen vanaf ~05:00, niet 02:00: vroeg
+        # stoken lekt ~1,2 %/u weg), 21,5 vanaf 09:00, 13-17 = 22, daarna 21 en om 19:00 19
         sched = wp.parse_schedule(wp.DEFAULT_SCHEDULE)
-        self.assertEqual([t for _, t in sched], [19.5, 20.0, 20.5, 21.0, 21.5, 19.0])
         sp = lambda h, m=0: wp.decide_setpoint(datetime(2026, 10, 26, h, m), {"schedule": sched})[0]
-        self.assertEqual(sp(1, 55), 19.0)                 # nog nachtverlaging
-        # halfuurlijks +0,5 in de goedkope nachturen: nooit een sprong
-        self.assertEqual([sp(2, 0), sp(2, 30), sp(3, 0), sp(3, 30), sp(4, 0)],
-                         [19.5, 20.0, 20.5, 21.0, 21.5])
-        self.assertEqual(sp(12), 21.5)
-        self.assertEqual(sp(19), 19.0)
+        self.assertEqual(sp(4, 25), 19.0)                 # nog nachtverlaging
+        # halfuurlijks +0,5: nooit een sprong
+        self.assertEqual([sp(4, 30), sp(5, 0), sp(5, 30), sp(8, 0), sp(9, 0)],
+                         [20.0, 20.5, 21.0, 21.0, 21.5])
+        self.assertEqual([sp(13), sp(16, 55), sp(17), sp(19)], [22.0, 22.0, 21.0, 19.0])
 
 
 def _prices(day, cheap=(12, 15), cheap_eur=0.25, peak=(17, 19), peak_eur=0.39, other=0.30):
@@ -1193,7 +1293,8 @@ class TestPriceOverlay(unittest.TestCase):
     def test_defaults_match_the_agreed_comfort_band(self):
         cfg = wp.build_cfg()
         self.assertTrue(cfg["price_overlay"])
-        self.assertEqual((cfg["price_cheap_sp"], cfg["price_coast_sp"]), (22.0, 21.0))
+        self.assertEqual((cfg["price_cheap_sp"], cfg["price_raise_from"], cfg["price_cheap_from"],
+                          cfg["price_cheap_to"], cfg["price_coast_to"]), (22.5, 21.0, "10:00", "15:00", "19:00"))
 
     def test_picks_cheapest_block_and_coasts_to_setback(self):
         win, why = wp.price_windows(_prices(self.DAY), self.DAY, self._cfg())
@@ -1222,8 +1323,9 @@ class TestPriceOverlay(unittest.TestCase):
         win, _ = wp.price_windows(_prices(self.DAY), self.DAY, cfg)
         sp = lambda h, m=0: wp.decide_with_override(self.DAY.replace(hour=h, minute=m), 21.5,
                                                     {"last_setp": 21.5}, cfg, win)[0]
-        self.assertEqual([sp(11), sp(12), sp(14, 45), sp(15), sp(18, 45), sp(19)],
-                         [21.5, 22.0, 22.0, 21.0, 21.0, 19.0])
+        # voorladen 12-15 op 22,5, dan het schema (13-17 = 22): de uitrol verlaagt niets meer
+        self.assertEqual([sp(11), sp(12), sp(14, 45), sp(15), sp(16), sp(17), sp(19)],
+                         [21.5, 22.5, 22.5, 22.0, 22.0, 21.0, 19.0])
 
     def test_never_raises_a_setback(self):
         cfg = self._cfg()

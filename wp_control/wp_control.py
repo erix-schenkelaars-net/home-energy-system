@@ -44,7 +44,11 @@ def dbg(area, msg):
 # stappen van 0,5 °C, zodat de aanvoer nooit hard springt (user: geen sprong). De extra stap om
 # 02:00 is voor ijskoude nachten: start de WP vanaf ~19 met een kleine vraag, dan schiet hij niet
 # door en staat daarna geen uur stil.
-DEFAULT_SCHEDULE = "02:00=19.5,02:30=20.0,03:00=20.5,03:30=21.0,04:00=21.5,19:00=19.0"
+# 2026-11-01: ochtend pas vanaf 04:30 (vroeg stoken lekt ~1,2 %/u weg; nacht-ochtendspread in de winter
+# maar 1-2 ct), 21,0 vóór 08:00 en door de 07-09-piek heen; 21,5 vanaf 09:00; 13-17 = 22 (de middag-
+# warmte die de vrouw des huizes wil); 17:00 21 en 19:00 19. Halfuurlijkse stappen: nooit een sprong.
+DEFAULT_SCHEDULE = ("04:30=20.0,05:00=20.5,05:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,"
+                    "19:00=19.0")
 
 
 def _hhmm_min(s, default=0):
@@ -142,7 +146,38 @@ def room_comp_boost(room, setpoint, kp, boost_max, neg_max=0.0):
     return round(max(-neg_max, min(kp * (setpoint - room), boost_max)), 1) + 0.0   # +0.0: geen -0.0
 
 
-def room_comp_pi(room, setpoint, state, cfg, headroom=None, running=True):
+def i_buildup_gate(room, setpoint, state, cfg, now):
+    """PUUR + stateful: mag I nu OPBOUWEN? Alleen als de kamer echt vastzit (2026-11-01).
+
+    Tot 10-31 integreerde I elk tekort, ook het geplande tekort na een setpoint-stap (ochtendtrap,
+    prijs-opladen, bump) terwijl de kamer nog traag oploopt. I liep dan in 1-2 uur vol (cap 8) en
+    zakte alleen na een doorschieter: een ratel. 10-31 11:00-13:45: I 8 bij kamer = setpoint = 22,
+    aanvoer ~45 °C, waar de curve alléén 09:30-10:00 de kamer op 36,5 °C hield (~8 °C te heet).
+
+    Opbouw mag alleen als (1) het setpoint minstens rc_i_hold_min minuten niet omhoog is gegaan en
+    (2) de kamer over het laatste uur niet stijgt (<= rc_i_trend K/u, gemeten over >= 45 min). Te
+    weinig historie (net gestart) = niet opbouwen. Houdt state['hist'] [[epoch, kamer], ...] en
+    state['sp_last'] / state['sp_up_at'] bij. -> (mag, reden)."""
+    t = now.timestamp()
+    sp_last = state.get("sp_last")
+    if sp_last is not None and setpoint > sp_last + 0.05:
+        state["sp_up_at"] = t
+    state["sp_last"] = setpoint
+    hist = [h for h in state.get("hist", []) if t - h[0] <= 3600] + [[t, room]]
+    state["hist"] = hist
+    up_at = state.get("sp_up_at")
+    if up_at is not None and t - up_at < cfg["rc_i_hold_min"] * 60:
+        return False, f"setpoint {int((t - up_at) // 60)} min geleden verhoogd"
+    span_h = (t - hist[0][0]) / 3600
+    if span_h < 0.75:
+        return False, "te weinig kamerhistorie"
+    trend = (room - hist[0][1]) / span_h
+    if trend > cfg["rc_i_trend"]:
+        return False, f"kamer stijgt {trend:+.2f} K/u"
+    return True, ""
+
+
+def room_comp_pi(room, setpoint, state, cfg, headroom=None, running=True, now=None):
     """PUUR + stateful: room-compensatie als GEDEMPTE PI -> extra aanvoer (°C) bovenop de curve.
 
     P (= room_comp_boost) reageert direct op het kamer-tekort; I bouwt het hardnekkige restant weg
@@ -163,6 +198,9 @@ def room_comp_pi(room, setpoint, state, cfg, headroom=None, running=True):
     laag is. 10-27 07:55-08:55 liep I zo 7,2 -> 8,0 (cap) tijdens de stilstand; de herstart op
     42 °C met volle I + zon gaf daarna 21,9 en de volgende stop. Afbouwen mag wel gewoon.
 
+    now (2026-11-01) = de opbouw-poort aan (i_buildup_gate): opbouwen alleen als de kamer vastzit;
+    de reden staat dan in state['i_gate'] ('' = opbouw mag). now=None = zonder poort.
+
     state['i'] = de integrator (°C aanvoer), bewaard tussen cycli (reset bij procesherstart).
     headroom = flow_cap - curve-base (None -> alleen rc_max begrenst). Geeft (boost, i) terug."""
     i = float(state.get("i", 0.0))
@@ -173,9 +211,12 @@ def room_comp_pi(room, setpoint, state, cfg, headroom=None, running=True):
     p = room_comp_boost(room, setpoint, cfg["rc_kp"], cfg["rc_max"], neg)   # P-term, -neg..rc_max
     # effectief boost-plafond: door rc_max én door de fysieke ruimte tot de aanvoer-cap
     ceil = cfg["rc_max"] if headroom is None else max(0.0, min(cfg["rc_max"], headroom))
-    # integreren: afbouwen (err<0) mag altijd; opbouwen alleen als de WP draait en we nog niet
-    # tegen het plafond zitten
-    if err < 0 or (running and (p + i) < ceil):
+    gate_ok = True
+    if now is not None:
+        gate_ok, state["i_gate"] = i_buildup_gate(room, setpoint, state, cfg, now)
+    # integreren: afbouwen (err<0) mag altijd; opbouwen alleen als de WP draait, we nog niet
+    # tegen het plafond zitten en de kamer echt vastzit
+    if err < 0 or (running and gate_ok and (p + i) < ceil):
         i += cfg["rc_ki"] * err
     # demping alleen bij doorschieten: 0 óp het setpoint .. volle leak bij setpoint + damp_band
     overshoot = max(0.0, min(1.0, -err / cfg["rc_damp_band"]))
@@ -246,6 +287,8 @@ def build_cfg():
         # uit-grens ruim (0.8, user 2026-10-24): rond het setpoint moduleert de WP LAAG door (negatieve
         # room-comp tot flow_min) i.p.v. een uur uit; een avond-setback (bv. 22->19) zit er ver boven -> uit.
         "heat_off_above": float(os.environ.get("WP_HEAT_OFF_ABOVE", "0.8")),
+        # tijdens de prijs-uitrol uit zodra de kamer net boven het uitrol-setpoint zit (2026-11-01)
+        "heat_off_above_coast": float(os.environ.get("WP_HEAT_OFF_ABOVE_COAST", "0.1")),
         # room-compensatie (P): extra aanvoer bovenop de curve bij een kamer-achterstand, zodat een
         # setpoint-sprong echt sneller opwarmt (anders blijft de aanvoer = curve). Gecapt op flow_cap.
         "rc_kp":    float(os.environ.get("WP_ROOMCOMP_KP", "4")),
@@ -258,7 +301,12 @@ def build_cfg():
         # 2026-10-26: Ki 0.3 -> 0.5. De demping lekte eerst rond het setpoint (I plafonneerde op ~0.8,
         # kamer bleef 0.4 °C te laag), daarna sterkst óp het setpoint (I liep weg zodra de kamer er
         # was). Nu lekt I alleen bij doorschieten: vol bij setpoint + band (0.2 °C).
-        "rc_ki":        float(os.environ.get("WP_ROOMCOMP_KI", "0.5")),
+        # 2026-11-01: Ki 0.5 -> 0.15 (het huis reageert in uren: τ ≈ 87 u) + opbouw-poort: I bouwt
+        # alleen op als de kamer vastzit — niet binnen rc_i_hold_min na een setpoint-verhoging en
+        # niet zolang de kamer stijgt (> rc_i_trend K/u). Zie i_buildup_gate.
+        "rc_ki":        float(os.environ.get("WP_ROOMCOMP_KI", "0.15")),
+        "rc_i_hold_min": float(os.environ.get("WP_ROOMCOMP_I_HOLD_MIN", "90")),
+        "rc_i_trend":   float(os.environ.get("WP_ROOMCOMP_I_TREND", "0.05")),
         "rc_i_max":     float(os.environ.get("WP_ROOMCOMP_I_MAX", "8")),
         "rc_damp_band": float(os.environ.get("WP_ROOMCOMP_DAMP_BAND", "0.2")),
         "rc_damp_leak": float(os.environ.get("WP_ROOMCOMP_DAMP_LEAK", "0.2")),
@@ -279,14 +327,15 @@ def build_cfg():
         "valve_stale_s": int(os.environ.get("WP_VALVE_STALE_S", "660")),
         # handmatige-override: kamerthermostaat staat (door user) op max ovr_threshold in alle periodes;
         # vraagt hij meer -> iemand draaide eraan -> honoreer (gecapt op ovr_max) voor ovr_hold_s, dan nominaal
-        # prijs-overlay (2026-10-27): het huis opladen in het goedkoopste middagblok en de avondpiek
-        # stil uitrollen; comfortband afgesproken met de bewoners (22 opladen, 21 uitrollen).
+        # prijs-overlay (2026-10-27, herzien 11-01): het huis voorladen in het goedkoopste blok
+        # (10-15 uur) tot 22,5 en daarna tot 19:00 uitrollen met een strakke uit-drempel; het
+        # schema houdt 13-17 op 22 (afgesproken met de bewoners). Nooit een nachtverlaging ophogen.
         "price_overlay":     os.environ.get("WP_PRICE_OVERLAY", "1") == "1",
-        "price_cheap_sp":    float(os.environ.get("WP_PRICE_CHEAP_SP", "22.0")),
-        "price_coast_sp":    float(os.environ.get("WP_PRICE_COAST_SP", "21.0")),
+        "price_cheap_sp":    float(os.environ.get("WP_PRICE_CHEAP_SP", "22.5")),
+        "price_raise_from":  float(os.environ.get("WP_PRICE_RAISE_FROM", "21.0")),
         "price_cheap_hours": float(os.environ.get("WP_PRICE_CHEAP_HOURS", "3")),
         "price_cheap_from":  os.environ.get("WP_PRICE_CHEAP_FROM", "10:00"),
-        "price_cheap_to":    os.environ.get("WP_PRICE_CHEAP_TO", "17:00"),
+        "price_cheap_to":    os.environ.get("WP_PRICE_CHEAP_TO", "15:00"),
         "price_coast_to":    os.environ.get("WP_PRICE_COAST_TO", "19:00"),
         "price_peak_hours":  float(os.environ.get("WP_PRICE_PEAK_HOURS", "2")),
         "price_min_spread":  float(os.environ.get("WP_PRICE_MIN_SPREAD", "0.05")),
@@ -343,6 +392,11 @@ def decide_setpoint(now, cfg):
 def price_windows(prices, day, cfg):
     """PUUR: kies voor `day` het blok om het huis met goedkope stroom op te laden en de uitrol daarna.
 
+    2026-11-01: opladen = voorladen tot price_cheap_sp (22,5) in het goedkoopste blok binnen
+    [price_cheap_from, price_cheap_to] = 10-15 uur; de uitrol (tot price_coast_to) verlaagt het
+    setpoint niet meer maar zet alleen de uit-drempel strak (heat_off_above): het schema houdt 13-17
+    op 22, het voorgeladen huis zakt ~0,15-0,2 °C/u en de WP blijft in de dure 15-21 uur uit.
+
     prices = {kwartier-slot_dt: €/kWh}. Opladen = het goedkoopste aaneengesloten blok van
     price_cheap_hours dat binnen [price_cheap_from, price_cheap_to] valt; uitrollen = van het einde
     daarvan tot price_coast_to (de avond-setback). Het huis is de accu: ~25 kWh warmte per °C, en
@@ -384,25 +438,37 @@ def price_windows(prices, day, cfg):
     win = {"cheap_start": cheap_start, "cheap_end": cheap_end, "coast_end": coast_end,
            "cheap_eur": round(cheap_eur, 3), "peak_eur": round(peak, 3)}
     return win, (f"opladen {cheap_start:%H:%M}-{cheap_end:%H:%M} (€{cheap_eur:.3f}) -> "
-                 f"{cfg['price_cheap_sp']}, uitrol tot {coast_end:%H:%M} (piek €{peak:.3f}) -> "
-                 f"{cfg['price_coast_sp']}")
+                 f"{cfg['price_cheap_sp']}, uitrol tot {coast_end:%H:%M} (piek €{peak:.3f}): "
+                 f"uit boven schema+{cfg['heat_off_above_coast']}")
 
 
 def price_overlay(now, nominal, reason, win, cfg):
-    """PUUR: het nominale schema-setpoint bijgesteld op het prijsvenster. Alleen in de comfort-
-    periode (nominaal >= het uitrol-setpoint): een nachtverlaging wordt nooit opgehoogd."""
-    if not win or nominal < cfg["price_coast_sp"]:
+    """PUUR: het nominale schema-setpoint bijgesteld op het prijsvenster: in het oplaadblok omhoog
+    naar price_cheap_sp. Alleen overdag (nominaal >= price_raise_from): een nachtverlaging wordt
+    nooit opgehoogd. Sinds 2026-11-01 verlaagt de uitrol het setpoint NIET meer — 10-30 rolde de
+    middag uit op 21 terwijl de vrouw het 13-17 warm wil (klacht 15:20); de uitrol is nu alleen de
+    strakke uit-drempel in heat_off_above."""
+    if not win or nominal < cfg["price_raise_from"]:
         return nominal, reason
     if win["cheap_start"] <= now < win["cheap_end"] and cfg["price_cheap_sp"] > nominal:
         return cfg["price_cheap_sp"], (f"prijs-opladen {cfg['price_cheap_sp']}°C tot "
                                        f"{win['cheap_end']:%H:%M} (i.p.v. {reason})")
-    if win["cheap_end"] <= now < win["coast_end"] and cfg["price_coast_sp"] < nominal:
-        return cfg["price_coast_sp"], (f"prijs-uitrol {cfg['price_coast_sp']}°C tot "
-                                       f"{win['coast_end']:%H:%M} (i.p.v. {reason})")
     return nominal, reason
 
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_state.json")
+def heat_off_above(now, sp, win, cfg, nominal):
+    """PUUR: de uit-drempel boven het setpoint voor decide_heat. Normaal heat_off_above (0,8: rond
+    het setpoint laag doordraaien i.p.v. uit). Tijdens de prijs-uitrol (na het oplaadblok tot
+    coast_end) heat_off_above_coast: het voorgeladen huis rolt uit en de WP blijft in de piek stil,
+    tenzij de kamer onder sp - heat_on_below zakt (comfort gaat voor). Niet bij een bump (sp boven
+    het nominale schema `nominal`): wie omhoog draait, wil nu warmte. 10-29: kamer 21,7 bij sp 21,0
+    bleef onder 21,0+0,8 -> HEAT in €0,73."""
+    if win and win["cheap_end"] <= now < win["coast_end"] and sp <= nominal + 0.01:
+        return cfg["heat_off_above_coast"]
+    return cfg["heat_off_above"]
+
+
+STATE_FILE =os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_state.json")
 STATE_MAX_AGE_S = 900   # aan/uit-stand en I-term ouder dan dit zijn niet meer representatief
 
 
@@ -1155,7 +1221,8 @@ def main():
                 f"(cap {cfg['ovr_max']}°C) voor {cfg['ovr_hold_s']//60}m, dan nominaal")
     dbg("CONF", f"prijs-overlay {'AAN' if cfg['price_overlay'] else 'UIT'}: goedkoopste "
                 f"{cfg['price_cheap_hours']:g}u in {cfg['price_cheap_from']}-{cfg['price_cheap_to']} -> "
-                f"{cfg['price_cheap_sp']}°C, daarna tot {cfg['price_coast_to']} -> {cfg['price_coast_sp']}°C "
+                f"{cfg['price_cheap_sp']}°C, daarna tot {cfg['price_coast_to']} uit boven schema+"
+                f"{cfg['heat_off_above_coast']}°C "
                 f"(min. spreiding €{cfg['price_min_spread']}/kWh)")
     dbg("CONF", f"pi5new-REGELING = {'LIVE — STUURT DE WP (chMode1/chSetTemp1)!' if cfg['control_live'] else 'DROOG (logt alleen)'}"
                 f" | heat als kamer < setpoint-{cfg['heat_on_below']}, uit als kamer >= setpoint+{cfg['heat_off_above']}"
@@ -1238,8 +1305,11 @@ def main():
         base = curve_flow(ot, cfg["curve"])
         headroom = None if base is None else (cfg["flow_cap"] - base)   # ruimte tot de cap = anti-windup
         running = flame != 0                         # None (onbekend) -> gedrag als voorheen
-        boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom, running)
-        heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], cfg["heat_off_above"])
+        now = datetime.now()
+        boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom, running, now)
+        nominal = price_overlay(now, *decide_setpoint(now, cfg), price_win, cfg)[0]   # zonder bump
+        off_above = heat_off_above(now, sp, price_win, cfg, nominal)
+        heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], off_above)
         flow_raw = regulated_flow(base, boost, cfg)
         if heat:
             flow = limit_flow_drop(flow_raw, heat_state, cfg["flow_max_drop"])
@@ -1250,7 +1320,6 @@ def main():
         command_wp(cfg, heat, flow, sp)
         save_state(ovr_state, heat_state, i_state, datetime.now())
         p_term = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"], cfg["rc_neg_max"])
-        now = datetime.now()
         plan = day_plan(now, cfg, price_win)
         publish_ha(cfg, ha_state(sp, room, ot, base, p_term, i_term, flow, heat,
                                  plan["now"], bump_minutes_left(ovr_state, now),
@@ -1259,8 +1328,10 @@ def main():
         ha_announced = True
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
                     f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost}"
-                    f"(P+I, I={i_term}{'' if running else ', WP staat stil: I bevroren'}) "
-                    f"-> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}")
+                    f"(P+I, I={i_term}{'' if running else ', WP staat stil: I bevroren'}"
+                    f"{', I-opbouw dicht: ' + i_state['i_gate'] if i_state.get('i_gate') else ''}) "
+                    f"-> {'HEAT ' + str(flow) + '°C' if heat else 'OFF'}"
+                    f"{'' if off_above == cfg['heat_off_above'] else f' (uitrol: uit bij sp+{off_above})'}")
         write_shadow(cfg, room=room, room_set=sp, outside=ot, flow_target=flow,
                      heat=heat, boost=boost, i_term=i_term)
 

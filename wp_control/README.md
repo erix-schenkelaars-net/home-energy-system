@@ -27,11 +27,16 @@ Each cycle:
    Only a live MQTT reading of the knob starts or ends a bump; the database
    row lags by up to 5 minutes. Outside a bump the **price overlay** adjusts the schedule: in
    the cheapest `WP_PRICE_CHEAP_HOURS` block between `WP_PRICE_CHEAP_FROM` and `WP_PRICE_CHEAP_TO`
-   the setpoint goes to `WP_PRICE_CHEAP_SP` (store heat in the house), and from the end of that
-   block until `WP_PRICE_COAST_TO` it drops to `WP_PRICE_COAST_SP`, so the heat pump coasts
-   through the evening peak. Prices are the quarter-hour prices in `battery_schedule` (latest
+   the setpoint goes to `WP_PRICE_CHEAP_SP` (store heat in the house). From the end of that block
+   until `WP_PRICE_COAST_TO` the setpoint stays on the schedule but the heat pump switches off
+   from setpoint + `WP_HEAT_OFF_ABOVE_COAST`: the preloaded house coasts through the dear
+   afternoon and evening hours, and the pump only comes back if the room falls below
+   setpoint − `WP_HEAT_ON_BELOW`. Prices are the quarter-hour prices in `battery_schedule` (latest
    optimizer run per slot). It only applies when the dearest `WP_PRICE_PEAK_HOURS` of the coast
-   are at least `WP_PRICE_MIN_SPREAD` dearer than the cheap block, and never raises a night setback.
+   are at least `WP_PRICE_MIN_SPREAD` dearer than the cheap block, and never raises a night setback
+   (schedule below `WP_PRICE_RAISE_FROM`). Until 2026-11-01 the coast also lowered the setpoint to
+   21; the afternoon then coasted down exactly when the household wants it warm (13–17), so comfort
+   now lives in the schedule and the price only decides *when* the pump runs.
 2. **On/off** (`decide_heat`): on below setpoint − `WP_HEAT_ON_BELOW`, off from setpoint +
    `WP_HEAT_OFF_ABOVE`; in between the previous state holds.
 3. **Flow target** = weather curve (`WP_FLOW_CURVE`, on the outside temperature) + room
@@ -122,16 +127,17 @@ them).
 
 | variable | default | meaning |
 |---|---|---|
-| `WP_SCHEDULE` | `02:00=19.5,02:30=20.0,03:00=20.5,03:30=21.0,04:00=21.5,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). Night 19 °C; +0.5 °C every half hour from 02:00, in the cheap night hours, so the house is warm before the 07–09 price peak. On a mild night the first steps sit below the room and the heat pump starts around 03:00–03:30; on a cold night they are real 0.5 °C steps (the 02:00 step is for icy nights, when the room is near 19), so the flow never jumps and the heat pump does not overshoot and then stand still for an hour (the old 04:30–06:30 ramp only started heating at 05:30 and ran through the peak) |
+| `WP_SCHEDULE` | `04:30=20.0,05:00=20.5,05:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). The agreed day: 21.0 before 08:00, 21.5 from 09:00, 22 from 13 to 17 (the afternoon warmth the household wants), 21 until the 19:00 setback. The morning steps are +0.5 °C per half hour, so the flow never jumps. They start at 04:30, not 02:00 (the schedule of 2026-10-27): the house loses ~1.2 % of stored heat per hour it is heated earlier (τ ≈ 87 h), and in winter the night-to-morning price spread was only 1–2 ct, so heating at 02:00 cost more than it saved. The night room only falls to ~20.4, so the pump really starts around 05:00, still a cheap hour, and the 07–09 peak is crossed at 21.0 without a further step |
 | `WP_OVERRIDE_THRESHOLD` | `21.5` | Honeywell above this = bump |
 | `WP_OVERRIDE_MAX` | `23.0` | upper limit of a bump |
 | `WP_OVERRIDE_HOLD_S` | `3600` | how long a bump lasts |
 | `WP_UNDERRIDE_MIN` | `19.0` | lowest setpoint a turn-down can ask for |
 | `WP_UNDERRIDE_HOLD_S` | `3600` | how long a turn-down lasts |
 | `WP_PRICE_OVERLAY` | `1` | price overlay on (`0` = schedule only) |
-| `WP_PRICE_CHEAP_SP` / `WP_PRICE_COAST_SP` | `22.0` / `21.0` | setpoint while storing heat / while coasting (agreed comfort band) |
+| `WP_PRICE_CHEAP_SP` | `22.5` | setpoint while storing heat: half a degree above the afternoon setpoint, so the house, falling ~0.15–0.2 °C/h with the pump off, is still ~22 at 17:00 |
+| `WP_PRICE_RAISE_FROM` | `21.0` | the overlay only raises a schedule setpoint of at least this (never a night setback) |
 | `WP_PRICE_CHEAP_HOURS` | `3` | length of the cheap block |
-| `WP_PRICE_CHEAP_FROM` / `WP_PRICE_CHEAP_TO` | `10:00` / `17:00` | the cheap block lies within this range |
+| `WP_PRICE_CHEAP_FROM` / `WP_PRICE_CHEAP_TO` | `10:00` / `15:00` | the cheap block lies within this range (ends by 15:00, so the afternoon comfort window is preloaded) |
 | `WP_PRICE_COAST_TO` | `19:00` | coasting ends here (the evening setback takes over) |
 | `WP_PRICE_PEAK_HOURS` / `WP_PRICE_MIN_SPREAD` | `2` / `0.05` | the dearest block of this length in the coast must be at least this much (€/kWh) dearer than the cheap block |
 
@@ -141,6 +147,7 @@ them).
 |---|---|---|
 | `WP_HEAT_ON_BELOW` | `0.2` | on when room < setpoint − this |
 | `WP_HEAT_OFF_ABOVE` | `0.8` | off when room ≥ setpoint + this. **Keep below 1.5**, or the OTThing room suspend acts before wp_control does |
+| `WP_HEAT_OFF_ABOVE_COAST` | `0.1` | the same, but during the price coast (setpoint = the coast setpoint, so not during a bump). The coast exists to keep the pump idle through the evening peak; with 0.8, on 2026-10-29 a room of 21.7 against a coast setpoint of 21.0 kept it heating at €0.73 |
 
 ### Flow
 
@@ -153,7 +160,9 @@ them).
 | `WP_ROOMCOMP_KP` | `4` | P: °C of flow per °C the room is short |
 | `WP_ROOMCOMP_MAX` | `10` | maximum positive compensation |
 | `WP_ROOMCOMP_NEG_MAX` | `8` | maximum negative compensation (room above setpoint) |
-| `WP_ROOMCOMP_KI` | `0.5` | I: build-up per cycle per °C short |
+| `WP_ROOMCOMP_KI` | `0.15` | I: build-up per cycle per °C short. The house responds over hours (τ ≈ 87 h), so this is slow on purpose |
+| `WP_ROOMCOMP_I_HOLD_MIN` | `90` | the integrator does not grow for this many minutes after a setpoint **increase** (morning steps, price preheat, bump). That shortfall is planned and the P term handles it; integrating it filled I to its ceiling within two hours, and it only drained after an overshoot. On 2026-10-31 I sat at 8 with room = setpoint = 22 and a flow of ~45 °C where the curve alone held the room at 36.5 °C |
+| `WP_ROOMCOMP_I_TREND` | `0.05` | nor while the room is still rising faster than this (K/h, over the last hour, at least 45 min of history). I is for a room that is *stuck* below the setpoint, not one on its way. Bleeding off (room above setpoint) is always allowed |
 | `WP_ROOMCOMP_I_MAX` | `8` | integrator ceiling. The integrator also stops growing while the compressor stands still (`honeywell_ot_boiler_flame=0`): after a stop the pump stays off for 60 min whatever we ask, so a deficit then says nothing about the curve |
 | `WP_ROOMCOMP_DAMP_BAND` | `0.2` | the integrator bleeds off only when the room overshoots, reaching the full bleed at setpoint + this. At and below the setpoint it holds: there it carries what the curve lacks (a bleed at the setpoint emptied it in an hour and made the room swing) |
 | `WP_ROOMCOMP_DAMP_LEAK` | `0.2` | fraction of the integrator bled per cycle at full overshoot |
@@ -196,3 +205,17 @@ docker compose up -d        # change to .env or docker-compose.yml
 ```
 
 Logs: `logs/debug_YYYY-MM-DD.log`. Tests: `test_wp_control_pub.py` (via `../test-all.sh`).
+
+Measuring and replaying (read-only, inside the container):
+
+```
+docker compose exec wp_control python3 wp_tools.py report 2026-10-28 2026-11-01
+docker compose exec wp_control python3 wp_tools.py replay "2026-10-31 00:00" "2026-11-01 00:00"
+```
+
+`report` is the fixed yardstick per day (kWh, COP, flow, starts, heat-pump-weighted price vs the day
+average, hours with I at its ceiling) plus COP per outside-temperature bin. `replay` runs the logged
+room/setpoint/outside/compressor rows through the real `room_comp_pi` / `decide_heat` twice, old rule
+vs current defaults. It is open-loop: the room does not respond to the new flow, so it shows how I and
+the flow target would have moved, not the comfort that would have followed. `I_log` vs `I_oud` checks
+that the replay reproduces what actually ran.
