@@ -39,7 +39,6 @@ os.environ.update({
     "BMW_VIN":        "TEST_VIN",
     "BMW_USERNAME":   "test@example.com",
     "BMW_PASSWORD":   "test_pass",
-    "CLAUDE_API_KEY": "sk-ant-test",
 })
 
 # ─────────────────────────────────────────────────────────────────────────────
