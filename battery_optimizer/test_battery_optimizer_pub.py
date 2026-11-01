@@ -1265,7 +1265,8 @@ class TestEvProbeCharging(unittest.TestCase):
         mod._ev_reset_session()
 
     def _run(self, *, soc=80.0, status="NOCHARGING", plug="on", power=0.0,
-             optimizer_owns=True, at_home=True, hour=0, start_qtr=0, prices=None):
+             optimizer_owns=True, at_home=True, hour=0, start_qtr=0, prices=None,
+             switch_ok=True):
         if prices is None:
             prices = {q: 0.22 for q in range(192)}   # flat -> cheapest window starts now
         with contextlib.ExitStack() as st:
@@ -1277,8 +1278,9 @@ class TestEvProbeCharging(unittest.TestCase):
             st.enter_context(patch.object(mod, "get_ha_sensor_float", return_value=power))
             st.enter_context(patch.object(mod, "ev_plug_is_optimizer_controlled",
                                           return_value=optimizer_owns))
-            self.set_sw = st.enter_context(patch.object(mod, "set_ha_switch"))
-            st.enter_context(patch.object(mod, "set_ev_plug_control_flag"))
+            self.set_sw = st.enter_context(patch.object(mod, "set_ha_switch",
+                                                       return_value=switch_ok))
+            self.flag = st.enter_context(patch.object(mod, "set_ev_plug_control_flag"))
             return mod.run_ev_charging(hour, start_qtr, prices)
 
     def _turned_off(self):
@@ -1359,6 +1361,46 @@ class TestEvProbeCharging(unittest.TestCase):
         res = self._run(plug="off", soc=96.0)
         self.assertEqual(res, (False, 96.0))
         self.assertFalse(self._turned_on())
+
+    def test_unavailable_plug_is_not_claimed(self):
+        # 2026-11-01: Tuya offline all night -> every quarter "plug ON" + ownership mark, which
+        # later made the poll switch off a plug the user had turned on by hand
+        res = self._run(plug="unavailable", power=None)
+        self.assertEqual(res, (False, 80.0))
+        self.assertFalse(self._turned_on())
+        self.flag.assert_not_called()
+        self.assertIsNone(mod._ev_probe_on_since)
+
+    def test_failed_switch_on_claims_nothing(self):
+        res = self._run(plug="off", switch_ok=False)
+        self.assertEqual(res, (False, 80.0))
+        self.assertTrue(self._turned_on())
+        self.flag.assert_not_called()
+        self.assertIsNone(mod._ev_probe_on_since)
+
+    def test_successful_switch_on_claims_control(self):
+        self._run(plug="off")
+        self.flag.assert_called_once_with(True)
+
+
+class TestEvPlugControlFlag(unittest.TestCase):
+    """The ownership check looks back 30 h, so clearing must clear every mark, not +-3 h."""
+
+    def _sql(self, set_control):
+        with patch.object(mod.mysql.connector, "connect") as connect:
+            self.assertTrue(mod.set_ev_plug_control_flag(set_control))
+            return connect.return_value.cursor.return_value.execute.call_args.args
+
+    def test_clear_removes_every_mark(self):
+        args = self._sql(False)
+        self.assertIn("SET ev_plug_control = 0", args[0])
+        self.assertIn("WHERE ev_plug_control = 1", args[0])
+        self.assertNotIn("slot_dt", args[0])
+
+    def test_set_marks_slots_around_now(self):
+        sql, (lo, hi) = self._sql(True)
+        self.assertIn("SET ev_plug_control = 1", sql)
+        self.assertEqual(hi - lo, mod.timedelta(hours=6))
 
 
 class TestEvManualHome(unittest.TestCase):

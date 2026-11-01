@@ -3401,18 +3401,25 @@ def set_ha_switch(entity_id: str, turn_on: bool) -> bool:
 
 
 def set_ev_plug_control_flag(set_control: bool) -> bool:
-    """Mark in battery_schedule that optimizer controls the plug."""
+    """Mark in battery_schedule that optimizer controls the plug.
+
+    Setting marks the slots around now; clearing clears EVERY marked slot. The ownership check
+    looks back 30 h, so a clear limited to +-3 h left older marks behind and the optimizer kept
+    "owning" the plug for a day -- switching off a plug the user had turned on by hand (2026-11-01).
+    """
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor()
-        now = datetime.now()
-        flag_val = 1 if set_control else 0
-        time_window = now - timedelta(hours=3)
-        cursor.execute(
-            "UPDATE battery_schedule SET ev_plug_control = %s "
-            "WHERE slot_dt >= %s AND slot_dt <= %s",
-            (flag_val, time_window, now + timedelta(hours=3))
-        )
+        if set_control:
+            now = datetime.now()
+            cursor.execute(
+                "UPDATE battery_schedule SET ev_plug_control = 1 "
+                "WHERE slot_dt >= %s AND slot_dt <= %s",
+                (now - timedelta(hours=3), now + timedelta(hours=3))
+            )
+        else:
+            cursor.execute("UPDATE battery_schedule SET ev_plug_control = 0 "
+                           "WHERE ev_plug_control = 1")
         conn.commit()
         cursor.close()
         conn.close()
@@ -3443,6 +3450,16 @@ def ev_plug_is_optimizer_controlled() -> bool:
     except Exception as e:
         log.warning("EV plug control flag check failed: %s", e)
         return False
+
+
+def ev_plug_on() -> bool:
+    """Switch the plug on and claim ownership -- only if HA accepted the command, so a failed
+    switch never leaves an ownership mark behind."""
+    if not set_ha_switch(HA_EV_PLUG_ENTITY, True):
+        log.warning("EV: plug ON failed — not claiming control")
+        return False
+    set_ev_plug_control_flag(True)
+    return True
 
 
 # --- EV probe/charge-session state -------------------------------------------------------
@@ -3591,12 +3608,14 @@ def _run_ev_manual(current_hour: int, start_qtr_idx: int, prices: dict[int, floa
         log.info("EV manual: not in cheapest %d-quarter window yet (starts %s, now=%d) — waiting",
                  len(window), window[0] if window else "—", start_qtr_idx)
         return False, soc_eq
+    if plug != "off":
+        log.warning("EV manual: cheapest window reached but plug=%s — not switching", plug)
+        return False, soc_eq
 
     log.info("EV manual: cheapest window reached (now=%d) — plug ON, probing for power",
              start_qtr_idx)
-    set_ha_switch(HA_EV_PLUG_ENTITY, True)
-    set_ev_plug_control_flag(True)
-    _ev_probe_on_since = time.time()
+    if ev_plug_on():
+        _ev_probe_on_since = time.time()
     return False, soc_eq
 
 
@@ -3690,12 +3709,17 @@ def run_ev_charging(current_hour: int, start_qtr_idx: int,
                  window[0] if window else "—", start_qtr_idx, soc)
         return False, soc
 
+    # Plug unreachable in HA (e.g. Tuya offline) -> do not claim it; that left a stale ownership
+    # mark all night on 2026-11-01 while the car charged on a plug HA could not see.
+    if plug_state != "off":
+        log.warning("EV: cheapest window reached but plug=%s — not switching", plug_state)
+        return False, soc
+
     # In the cheapest window -> switch the socket on and start probing (power confirms next ticks)
     log.info("EV: cheapest window reached (SoC=%.0f%%, now=%d) — plug ON, probing for power",
              soc, start_qtr_idx)
-    set_ha_switch(HA_EV_PLUG_ENTITY, True)
-    set_ev_plug_control_flag(True)
-    _ev_probe_on_since = time.time()
+    if ev_plug_on():
+        _ev_probe_on_since = time.time()
     return False, soc
 
 
