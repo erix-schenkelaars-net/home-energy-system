@@ -258,6 +258,56 @@ class TestParsePayload(unittest.TestCase):
         for k in expected_keys:
             self.assertIn(k, result)
 
+    def test_invalid_ot_frame_flow_128_dropped(self):
+        # 2026-10-30 15:00:16: OT f8.8 0x8000 -> 128.0 aanvoer in HA; mag niet in energy belanden
+        p = self._full_payload()
+        p["slave"]["flow_t"] = 128.0
+        result = mod.parse_payload(p)
+        self.assertIsNone(result["honeywell_ot_boiler_flow_t_c"])
+        self.assertAlmostEqual(result["honeywell_ot_boiler_return_t_c"], 40.0)   # rest blijft
+
+    def test_implausible_return_outside_room_dropped(self):
+        p = self._full_payload()
+        p["slave"]["return_t"] = 128.0
+        p["slave"]["outside_t"] = 128.0
+        p["heatercircuit"][0]["roomtemp"] = 128.0
+        p["heatercircuit"][0]["returnTemp"] = -128.0
+        p["roomunit"] = {"room_t": 83.2}
+        result = mod.parse_payload(p)
+        for k in ("honeywell_ot_boiler_return_t_c", "honeywell_ot_boiler_outside_t_c",
+                  "honeywell_ot_heater0_room_t_c", "honeywell_ot_heater0_return_t_c",
+                  "otthing_roomunit_room_t_c"):
+            self.assertIsNone(result[k], k)
+
+    def test_setpoints_not_range_checked(self):
+        # setpoints vallen buiten de check: een flowsetpoint 0 (WP uit) is geldig
+        p = self._full_payload()
+        p["heatercircuit"][0]["flowsetpoint"] = 0
+        self.assertEqual(mod.parse_payload(p)["honeywell_ot_flow_setpoint_c"], 0.0)
+
+
+class TestTempC(unittest.TestCase):
+
+    def test_in_range_passthrough(self):
+        self.assertAlmostEqual(mod.temp_c("31.4", mod.RANGE_WATER, "x"), 31.4)
+
+    def test_bounds_inclusive(self):
+        self.assertEqual(mod.temp_c(90, mod.RANGE_WATER, "x"), 90.0)
+        self.assertEqual(mod.temp_c(-10, mod.RANGE_WATER, "x"), -10.0)
+
+    def test_above_range_none(self):
+        self.assertIsNone(mod.temp_c(128.0, mod.RANGE_WATER, "x"))
+
+    def test_below_range_none(self):
+        self.assertIsNone(mod.temp_c(-41, mod.RANGE_OUTSIDE, "x"))
+
+    def test_negative_outside_valid(self):
+        self.assertEqual(mod.temp_c(-12.5, mod.RANGE_OUTSIDE, "x"), -12.5)
+
+    def test_none_and_garbage_none(self):
+        self.assertIsNone(mod.temp_c(None, mod.RANGE_ROOM, "x"))
+        self.assertIsNone(mod.temp_c("unavailable", mod.RANGE_ROOM, "x"))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # D.  on_message() — MQTT callback stores payload in userdata

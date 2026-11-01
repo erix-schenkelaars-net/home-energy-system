@@ -87,6 +87,26 @@ def flt(value):
     except (ValueError, TypeError):
         return None
 
+# Plausibele bereiken per meetsoort (°C). Een OpenTherm f8.8-woord 0x8000 (ongeldig/leeg antwoord)
+# komt als 128.0 door; HA toonde 2026-10-30 15:00:16 een aanvoer van 128 °C en 10-29 15:45 83,2 °C,
+# telkens ~5 s rond het uitschakelen van de WP. Valt de 5-min-snapshot op zo'n frame, dan zou dat in
+# energy belanden en COP-/huismodel-fits vervuilen — en buiten/kamer zijn wp_control-inputs.
+RANGE_WATER   = (-10.0, 90.0)
+RANGE_OUTSIDE = (-40.0, 50.0)
+RANGE_ROOM    = (0.0, 40.0)
+
+
+def temp_c(value, rng, name):
+    """flt() + plausibiliteitscheck: buiten [lo, hi] -> None (met logregel), anders de float."""
+    v = flt(value)
+    if v is None:
+        return None
+    lo, hi = rng
+    if not lo <= v <= hi:
+        dbg(1, "MQTT", f"{name}={v} buiten [{lo}, {hi}] °C -> genegeerd (NULL)")
+        return None
+    return v
+
 def boolean(value):
     """Convert bool/string to 1/0, return None on failure."""
     if value is None:
@@ -150,9 +170,9 @@ def parse_payload(p):
 
     return {
         # --- boiler (slave) ---
-        "honeywell_ot_boiler_flow_t_c":           flt(slave.get("flow_t")),
-        "honeywell_ot_boiler_return_t_c":          flt(slave.get("return_t")),
-        "honeywell_ot_boiler_outside_t_c":         flt(slave.get("outside_t")),
+        "honeywell_ot_boiler_flow_t_c":           temp_c(slave.get("flow_t"), RANGE_WATER, "slave.flow_t"),
+        "honeywell_ot_boiler_return_t_c":          temp_c(slave.get("return_t"), RANGE_WATER, "slave.return_t"),
+        "honeywell_ot_boiler_outside_t_c":         temp_c(slave.get("outside_t"), RANGE_OUTSIDE, "slave.outside_t"),
         "honeywell_ot_boiler_rel_mod_perc":        flt(slave.get("rel_mod")),
         "honeywell_ot_boiler_flame":               boolean(ss.get("flame")),
         "honeywell_ot_boiler_ch_mode":             boolean(ss.get("ch_mode")),
@@ -170,7 +190,7 @@ def parse_payload(p):
 
         # --- thermostat (master) --- master-velden zijn {"result","data"}-gewrapt, zie _md() ---
         "honeywell_ot_thermo_ch_set_t_c":          flt(_md(master.get("ch_set_t"))),
-        "honeywell_ot_thermo_room_t_c":            flt(_md(master.get("room_t"))),
+        "honeywell_ot_thermo_room_t_c":            temp_c(_md(master.get("room_t")), RANGE_ROOM, "master.room_t"),
         "honeywell_ot_thermo_room_set_t_c":        flt(_md(master.get("room_set_t"))),
         "honeywell_ot_thermo_max_rel_mod_perc":    flt(_md(master.get("max_rel_mod"))),
         "honeywell_ot_thermo_ch_enable":           boolean(ms.get("ch_enable")),
@@ -179,9 +199,9 @@ def parse_payload(p):
 
         # --- heater circuit 0 ---
         "honeywell_ot_heater0_action":             hc0.get("action"),
-        "honeywell_ot_heater0_room_t_c":           flt(hc0.get("roomtemp")),
+        "honeywell_ot_heater0_room_t_c":           temp_c(hc0.get("roomtemp"), RANGE_ROOM, "hc0.roomtemp"),
         "honeywell_ot_heater0_room_setpoint_c":    flt(hc0.get("roomsetpoint")),
-        "honeywell_ot_heater0_return_t_c":         flt(hc0.get("returnTemp")),
+        "honeywell_ot_heater0_return_t_c":         temp_c(hc0.get("returnTemp"), RANGE_WATER, "hc0.returnTemp"),
         "honeywell_ot_heater0_flow_min_c":         flt(hc0.get("flowMin")),
         "honeywell_ot_heater0_override_on":        boolean(hc0.get("ovrdOn")),
         "honeywell_ot_heater0_override_flow":      boolean(hc0.get("ovrdTemp")),
@@ -196,7 +216,7 @@ def parse_payload(p):
         #     OTThing->WP-commandokant. Live zijn 't plain scalars, maar _md() houdt het robuust
         #     mocht een firmware-variant ze ook {"result","data"}-wrappen.
         "otthing_roomunit_set_t_c":    flt(_md(ru.get("room_set_t"))),   # kamer-setpoint (de mens draait eraan)
-        "otthing_roomunit_room_t_c":   flt(_md(ru.get("room_t"))),       # door de Honeywell gemeten kamertemp
+        "otthing_roomunit_room_t_c":   temp_c(_md(ru.get("room_t")), RANGE_ROOM, "roomunit.room_t"),       # door de Honeywell gemeten kamertemp
         "otthing_roomunit_ch_set_t_c": flt(_md(ru.get("ch_set_t"))),     # flow die de Honeywell zelf zou vragen (bump)
         "otthing_roomunit_ch_enable":  boolean(rus.get("ch_enable")),    # Honeywell vraagt warmte
     }

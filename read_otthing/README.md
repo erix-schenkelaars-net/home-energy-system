@@ -52,6 +52,8 @@ OpenTherm is a standard protocol between a boiler and its thermostat. The OTThin
 
 **UPDATE not INSERT** — the service UPDATEs the existing 5-minute row that was already created by `read_p1`. All services write to the same row; the boiler data arrives last and fills in the `honeywell_ot_*` columns.
 
+**Plausibility check on measured temperatures** — water (flow/return) must lie in −10..90 °C, outside in −40..50, room in 0..40; anything else is written as NULL and logged. An invalid OpenTherm f8.8 frame (`0x8000`) decodes as 128.0: Home Assistant showed a 128 °C flow for ~5 s on 2026-10-30 (and 83.2 °C on 10-29), both as the heat pump switched off. A snapshot landing on such a frame would put it in `energy`, where it skews COP and house-model fits, and outside/room are `wp_control` inputs. Setpoints are not range-checked (a flow setpoint of 0 is valid).
+
 **Separation from `read_p1`** — OpenTherm data is on a different network path (MQTT via OTThing) and has different reliability characteristics. Merging it into `read_p1` would couple two independent data sources and make the container harder to restart individually.
 
 ## Configuration
