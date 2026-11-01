@@ -44,10 +44,12 @@ def dbg(area, msg):
 # stappen van 0,5 °C, zodat de aanvoer nooit hard springt (user: geen sprong). De extra stap om
 # 02:00 is voor ijskoude nachten: start de WP vanaf ~19 met een kleine vraag, dan schiet hij niet
 # door en staat daarna geen uur stil.
-# 2026-11-01: ochtend pas vanaf 04:30 (vroeg stoken lekt ~1,2 %/u weg; nacht-ochtendspread in de winter
-# maar 1-2 ct), 21,0 vóór 08:00 en door de 07-09-piek heen; 21,5 vanaf 09:00; 13-17 = 22 (de middag-
-# warmte die de vrouw des huizes wil); 17:00 21 en 19:00 19. Halfuurlijkse stappen: nooit een sprong.
-DEFAULT_SCHEDULE = ("04:30=20.0,05:00=20.5,05:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,"
+# 2026-11-01 (met de bewoners, keuze "A"): 21,0 rond 08:30 — 's ochtends zit alleen de user beneden (nooit
+# koud), de vrouw des huizes staat 09:00-10:30 op; opwarmen vanaf 05:30 (vroeg stoken lekt ~1,2 %/u weg,
+# nacht-ochtendspread in de winter maar 1-2 ct). Gesloten-lus-simulatie 10-31: kamer 09:00 ~21,1, ochtend
+# EUR 0,09 (zacht) .. 0,33 (8 K kouder) goedkoper dan opwarmen vanaf 04:30. 21,5 vanaf 09:00; 13-17 = 22
+# (de middagwarmte die zij wil); 17:00 21 en 19:00 19. Halfuurlijkse stappen: nooit een sprong.
+DEFAULT_SCHEDULE = ("05:30=20.0,06:00=20.5,06:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,"
                     "19:00=19.0")
 
 

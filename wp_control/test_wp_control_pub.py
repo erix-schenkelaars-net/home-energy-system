@@ -808,7 +808,7 @@ class TestDayPlan(unittest.TestCase):
         self.assertEqual([at["2026-10-28T01:45"], at["2026-10-28T05:00"], at["2026-10-28T11:45"],
                           at["2026-10-28T12:00"], at["2026-10-28T15:00"], at["2026-10-28T17:00"],
                           at["2026-10-28T19:00"]],
-                         [19.0, 20.5, 21.5, 22.5, 22.0, 21.0, 19.0])
+                         [19.0, 19.0, 21.5, 22.5, 22.0, 21.0, 19.0])
         self.assertEqual(plan["now"], 22.5)                # 13:10 valt in het oplaadblok
 
     def test_discovery_has_plan_sensor_with_attributes(self):
@@ -1263,13 +1263,13 @@ class TestFlowDropLimit(unittest.TestCase):
 
 class TestDefaultSchedule(unittest.TestCase):
     def test_agreed_day_profile(self):
-        # 2026-11-01 met de bewoners: 21,0 vóór 08:00 (opwarmen vanaf ~05:00, niet 02:00: vroeg
+        # 2026-11-01 met de bewoners (keuze A): 21,0 rond 08:30 (opwarmen vanaf 05:30, niet 02:00: vroeg
         # stoken lekt ~1,2 %/u weg), 21,5 vanaf 09:00, 13-17 = 22, daarna 21 en om 19:00 19
         sched = wp.parse_schedule(wp.DEFAULT_SCHEDULE)
         sp = lambda h, m=0: wp.decide_setpoint(datetime(2026, 10, 26, h, m), {"schedule": sched})[0]
-        self.assertEqual(sp(4, 25), 19.0)                 # nog nachtverlaging
+        self.assertEqual(sp(5, 25), 19.0)                 # nog nachtverlaging
         # halfuurlijks +0,5: nooit een sprong
-        self.assertEqual([sp(4, 30), sp(5, 0), sp(5, 30), sp(8, 0), sp(9, 0)],
+        self.assertEqual([sp(5, 30), sp(6, 0), sp(6, 30), sp(8, 55), sp(9, 0)],
                          [20.0, 20.5, 21.0, 21.0, 21.5])
         self.assertEqual([sp(13), sp(16, 55), sp(17), sp(19)], [22.0, 22.0, 21.0, 19.0])
 
