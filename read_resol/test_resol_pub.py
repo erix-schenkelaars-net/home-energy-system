@@ -365,5 +365,117 @@ class TestShouldRetryCycle(unittest.TestCase):
         self.assertTrue(mod._should_retry_cycle(False, 0))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# H.  Solar-pump duty — the pump cycles faster than one snapshot per 5 minutes
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _main_msg(rel1, errmsk=0):
+    """A complete main-data message (0x7E11 -> 0x10, cmd 0x0100) as it sits between two 0xAA."""
+    data = [0] * 100
+    data[76] = rel1
+    for k in range(4):
+        data[96 + k] = (errmsk >> (8 * k)) & 0xFF
+    payload = "".join(_make_frame(*data[i:i + 4]) for i in range(0, 100, 4))
+    header = [chr(b) for b in (0x10, 0x00, 0x11, 0x7E, 0x10, 0x00, 0x01, 25)]
+    return "".join(header) + chr(mod.getchk(header)) + payload
+
+
+def _stream(*msgs):
+    return "".join(chr(0xAA) + m for m in msgs) + chr(0xAA)
+
+
+class TestDutyMeter(unittest.TestCase):
+
+    def _meter(self, samples):
+        m = mod.DutyMeter()
+        for t, pct in samples:
+            m.add(t, pct)
+        return m.result()
+
+    def test_a_pump_on_all_interval_runs_the_whole_bucket(self):
+        self.assertEqual(self._meter([(t, 30) for t in range(0, 291)]), (300, 30.0))
+
+    def test_a_cycling_pump_is_counted_by_time_not_by_snapshot(self):
+        """2026-10-29: R1 cycled at 30 % while every 5-min snapshot read 0."""
+        samples = [(t, 30 if 60 <= t < 210 else 0) for t in range(0, 291)]
+        on_s, avg = self._meter(samples)
+        self.assertAlmostEqual(on_s, 300 * 150 / 290, delta=1)
+        self.assertAlmostEqual(avg, 30 * 150 / 290, delta=0.1)
+
+    def test_a_long_silence_is_left_out_not_stretched(self):
+        # on for 100 s, then a 60 s gap, then off for 100 s: the gap must not count as "on"
+        samples = [(t, 30) for t in range(0, 101)] + [(t, 0) for t in range(161, 262)]
+        on_s, _ = self._meter(samples)
+        self.assertAlmostEqual(on_s, 150, delta=2)
+
+    def test_too_little_observed_time_is_null_not_a_guess(self):
+        self.assertEqual(self._meter([(t, 30) for t in range(0, 30)]), (None, None))
+
+
+class TestMainPayloads(unittest.TestCase):
+
+    def test_the_main_data_payload_is_found_and_parses(self):
+        payloads = mod._main_payloads(_stream(_main_msg(30)))
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(mod.parsepayload(payloads[0], quiet=True)["rel1"], 30)
+
+    def test_other_packets_are_ignored(self):
+        heat_meter = _main_msg(30).replace(chr(0x11) + chr(0x7E), chr(0x31) + chr(0x7E), 1)
+        self.assertEqual(mod._main_payloads(_stream(heat_meter)), [])
+
+    def test_a_broken_header_is_ignored(self):
+        msg = _main_msg(30)
+        broken = msg[:8] + chr((ord(msg[8]) + 1) & 0x7F) + msg[9:]
+        self.assertEqual(mod._main_payloads(_stream(broken)), [])
+
+    def test_the_trailing_partial_message_waits_for_the_next_chunk(self):
+        self.assertEqual(mod._main_payloads(chr(0xAA) + _main_msg(30)), [])
+
+
+class TestCollectDuty(unittest.TestCase):
+
+    def _run(self, chunks, times, until):
+        clock = iter(times)
+        with patch.object(mod, "recv", side_effect=chunks), patch.object(mod, "dbg"):
+            return mod.collect_duty(until, clock=lambda: next(clock))
+
+    def test_it_time_weights_the_broadcasts(self):
+        # broadcasts at t=0..199 s: on for the first 100, then off
+        chunks = [_stream(_main_msg(30 if t < 100 else 0)) for t in range(200)]
+        times = [x for t in range(200) for x in (t, t)] + [999]   # loop check + stamp per chunk
+        on_s, avg = self._run(chunks, times, until=500)
+        self.assertAlmostEqual(on_s, 300 * 100 / 199, delta=1)
+        self.assertAlmostEqual(avg, 30 * 100 / 199, delta=0.1)
+
+    def test_a_misaligned_reading_does_not_count(self):
+        chunks = [_stream(_main_msg(30 if t % 2 else 100, errmsk=0 if t % 2 else 5)) for t in range(200)]
+        times = [x for t in range(200) for x in (t, t)] + [999]
+        on_s, avg = self._run(chunks, times, until=500)
+        self.assertEqual(avg, 30.0)          # only the clean readings, all at 30 %
+
+    def test_a_closed_stream_ends_early_but_keeps_what_it_saw(self):
+        chunks = [_stream(_main_msg(30)) for _ in range(100)] + [""]
+        times = [x for t in range(101) for x in (t, t)]
+        on_s, avg = self._run(chunks, times, until=500)
+        self.assertEqual((on_s, avg), (300, 30.0))
+
+
+class TestSaveDuty(unittest.TestCase):
+
+    def test_it_upserts_only_its_own_columns_on_the_interval_row(self):
+        import mysql.connector as _mc
+        from datetime import datetime
+        db, cur = MagicMock(), MagicMock()
+        db.cursor.return_value = cur
+        bucket = datetime(2026, 10, 29, 15, 15)
+        with patch.object(_mc, "connect", return_value=db):
+            mod.save_duty(bucket, 150, 15.0)
+        sql, params = cur.execute.call_args.args
+        self.assertIn("`resol_r1_on_s`", sql)
+        self.assertIn("`resol_r1_avg_pct`", sql)
+        self.assertNotIn("resol_relay_1", sql)     # the snapshot column stays the snapshot's
+        self.assertEqual(params, (bucket, 150, 15.0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

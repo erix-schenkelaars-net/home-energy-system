@@ -10,6 +10,9 @@ Every 5 minutes:
 3. Receives and parses the binary VBus 1.0 protocol stream.
 4. Inserts a row with 19 temperatures, 4 flow rates, 4 relay states, and the error mask into MariaDB.
 5. Publishes each sensor as a Home Assistant MQTT auto-discovery entity (retained).
+6. Stays on the stream until ~8 s before the next tick, time-weights the solar pump (R1) over every
+   broadcast (~1/s), and upserts `resol_r1_on_s` + `resol_r1_avg_pct` into the same row. Nothing is
+   logged per broadcast and nothing per second reaches the database -- one aggregate per interval.
 
 ## Hardware
 
@@ -59,9 +62,11 @@ VBus 1.0 protocol:
 
 **Module-level main loop (no `__main__` guard)** — this is a legacy design from the original script. The blocking `while True` / `sleep_until_next_5min()` structure runs at module import time. The test suite handles this by intercepting `time.sleep` during import.
 
-**5-minute cycle** — the Resol controller updates its VBus stream every few seconds. A 5-minute polling cycle is sufficient for solar thermal energy accounting and matches the DB write interval of all other services.
+**5-minute cycle** — the Resol controller updates its VBus stream every few seconds. A 5-minute polling cycle is sufficient for temperatures and matches the DB write interval of all other services.
 
-**`errmsk = 0` write gate** — the DB write is skipped if `errmsk != 0`. A non-zero error mask means the controller reported a fault (pump failure, sensor short, etc.); storing those values would corrupt the energy totals.
+**…but not for the solar pump** — on weak sun R1 cycles: it starts at its 30 % minimum, cools the collector below the switch-off ΔT within minutes, stops, and restarts. A snapshot at the tick misses most of that (2026-10-29: `resol_relay_1` read 0 from 14:50 to 15:15 while the pump demonstrably ran — warm flow, cooler return, stopped on manual off). Hence the duty meter after the snapshot. `resol_relay_1` itself stays the snapshot so existing charts keep their meaning. The collector flow meter (`vol17`) reads 0 all year, even at R1 = 100 % in summer — not connected or not configured in the controller, so it cannot stand in for pump runtime.
+
+**Error mask** — the row is always written. With `errmsk != 0` the mask is recorded and the sensor values are left NULL (the old behaviour of skipping the whole row dropped every other service's data for that interval too). A misaligned reading is re-read first, see `_accept_reading` / `_should_retry_cycle`.
 
 **MQTT auto-discovery** — sensors are published with Home Assistant discovery topics so they appear automatically in the HA dashboard without manual entity configuration.
 

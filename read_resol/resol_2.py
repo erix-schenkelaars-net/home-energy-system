@@ -8,6 +8,8 @@ via a VBus-to-LAN adapter (TCP socket), then:
   - Inserts a row with all sensor values into MariaDB every 5 minutes.
   - Publishes each sensor as a Home Assistant MQTT discovery entity
     and sends the current values via MQTT retain.
+  - Stays connected for the rest of the interval and measures how long the solar pump (R1)
+    actually ran, from every broadcast (~1/s): resol_r1_on_s / resol_r1_avg_pct.
 
 The VBus stream is parsed according to the Resol VBus protocol 1.0 spec:
   - 0xAA framing, 6-byte payload frames with checksum and septet injection
@@ -113,6 +115,16 @@ RETRY_SECONDS     = 5
 MAX_CYCLE_RETRIES = 3
 _cycle_healthy    = False
 
+# The solar pump cycles: on weak sun it starts at its 30 % minimum, cools the collector below the
+# switch-off delta-T within minutes, stops, and starts again once the collector has warmed up.
+# One snapshot per 5 minutes catches a fraction of that -- on 2026-10-29 it read R1=0 at 14:50..15:15
+# while the pump demonstrably ran (warm flow, cooler return, stopped on manual off). So after the
+# snapshot we stay on the stream until just before the next tick and time-weight every broadcast.
+# Only that aggregate is written: still one row per 5 minutes, no per-second data in the database.
+DUTY_STOP_BEFORE_S = 8      # leave the next tick room to connect on a fresh socket
+DUTY_MAX_GAP_S     = 20     # a longer silence between broadcasts is unknown, not "same as before"
+DUTY_MIN_COVER_S   = 60     # less observed time than this -> store NULL rather than a guess
+
 # --------------------------------------------------
 # TIMER (exact 5-minute alignment)
 # --------------------------------------------------
@@ -142,10 +154,12 @@ def getchk(data):
 # --------------------------------------------------
 # SOCKET
 # --------------------------------------------------
-def recv():
-    dbg(3, "SOCKET", "Receiving...")
+def recv(quiet=False):
+    if not quiet:
+        dbg(3, "SOCKET", "Receiving...")
     dat = sock.recv(2048)
-    dbg(3, "SOCKET", f"Received {len(dat)} bytes")
+    if not quiet:
+        dbg(3, "SOCKET", f"Received {len(dat)} bytes")
     return "".join(chr(i) for i in dat)
 
 def send(dat):
@@ -402,15 +416,17 @@ def login():
         buf = _carry_tail(buf) + recv()
 
 
-def parsepayload(payload):
+def parsepayload(payload, quiet=False):
     """
     Parse individual payload of a VBus status message.
     Reads and validates frames (each with checksum and septet injection).
     Returns None on checksum error, otherwise a dict of sensor values.
+    quiet=True logs nothing: the duty meter parses every broadcast, ~300 per interval.
     """
+    log = _no_log if quiet else dbg
     # Zero-pad: hex(5) is "0x5" -> "5", so an unpadded dump has variable width per byte and
     # you cannot count offsets in it. That matters here -- the error mask sits at 96..99.
-    dbg(3, "parsepayload", f"parse Payload: {''.join(f'{ord(i):02x}' for i in payload)}")
+    log(3, "parsepayload", f"parse Payload: {''.join(f'{ord(i):02x}' for i in payload)}")
 
     data = []
 
@@ -472,7 +488,7 @@ def parsepayload(payload):
         chk = ord(frame[5])
         ourchk = getchk(frame[:-1])
         if chk != ourchk:
-            dbg(1, "parsepayload", f"!!FRAME CHECKSUM MISMATCH!! {chk} != {ourchk}")
+            log(1, "parsepayload", f"!!FRAME CHECKSUM MISMATCH!! {chk} != {ourchk}")
             return None
 
         septet = ord(frame[4])
@@ -483,8 +499,8 @@ def parsepayload(payload):
             else:
                 data.append(frame[j])
 
-    dbg(3, "parsepayload", "injecting septets... ->")
-    dbg(3, "parsepayload", ' '.join([hex(ord(i))[2:] for i in data]))
+    log(3, "parsepayload", "injecting septets... ->")
+    log(3, "parsepayload", ' '.join([hex(ord(i))[2:] for i in data]))
 
 
     vals = {}
@@ -494,7 +510,7 @@ def parsepayload(payload):
             # RESOL does not publish the bit layout, so a non-zero mask is only diagnosable if
             # we can see the bytes it came from. Log here rather than stashing it in vals --
             # every key in there becomes an MQTT entity in Home Assistant.
-            dbg(1, "parsepayload",
+            log(1, "parsepayload",
                 f"errmsk={vals[i]} (0x{vals[i]:08X}) bits "
                 f"{[b for b in range(31) if vals[i] >> b & 1]} from bytes "
                 f"{rng[0]}..{rng[1]} = {' '.join(f'{ord(b):02x}' for b in data[rng[0]:rng[1]+1])}")
@@ -506,19 +522,19 @@ def parsepayload(payload):
                 vals[i] -= 1 << bits
             vals[i] = float(vals[i])/10
             if abs(vals[i]) > 200 and i != 'temp8':  # sanity check for erroneous values
-                dbg(1, "parsepayload", f"!!SANITY CHECK FAILED FOR {i} with value {vals[i]}!!")
+                log(1, "parsepayload", f"!!SANITY CHECK FAILED FOR {i} with value {vals[i]}!!")
                 return None
         if i.startswith('vol') and vals[i]!=0:
             vals[i] = round((float(vals[i])/60),1)  # liter/hour → liter/min
             if vals[i] < 0 or vals[i] > 110:  # sanity check for erroneous values
-                dbg(1, "parsepayload", f"!!SANITY CHECK FAILED FOR {i} with value {vals[i]}!!")
+                log(1, "parsepayload", f"!!SANITY CHECK FAILED FOR {i} with value {vals[i]}!!")
                 return None
         if i.startswith('rel'):
             if abs(vals[i]) > 100:  # sanity check for erroneous values
-                dbg(1, "parsepayload", f"!!SANITY CHECK FAILED FOR {i} with value {vals[i]}!!")
+                log(1, "parsepayload", f"!!SANITY CHECK FAILED FOR {i} with value {vals[i]}!!")
                 return None
     for i,j in sorted(vals.items()):
-        dbg(1, "parsepayload", f"{i}\t{j}")
+        log(1, "parsepayload", f"{i}\t{j}")
 
     return vals
 
@@ -634,8 +650,128 @@ def _should_retry_cycle(healthy, attempt):
 
 
 # ==================================================
+# SOLAR-PUMP DUTY (rest of each interval, from the stream)
+# ==================================================
+
+def _no_log(*_):
+    pass
+
+
+class DutyMeter:
+    """Time-weighted R1 duty over one interval, from successive broadcasts.
+
+    Sample-and-hold: each reading counts until the next one arrives. Gaps longer than
+    DUTY_MAX_GAP_S are left out instead of being stretched, and the result is scaled from the
+    time actually observed to the full bucket, so a short reconnect does not read as "pump off".
+    """
+
+    def __init__(self):
+        self.samples = []
+
+    def add(self, t, pct):
+        self.samples.append((t, pct))
+
+    def result(self, bucket_seconds=300):
+        """(seconds on, scaled to the bucket; average %) -- or (None, None) if too little seen."""
+        covered = on = weighted = 0.0
+        for (t0, p0), (t1, _) in zip(self.samples, self.samples[1:]):
+            dt = t1 - t0
+            if dt <= 0 or dt > DUTY_MAX_GAP_S:
+                continue
+            covered += dt
+            weighted += p0 * dt
+            if p0 > 0:
+                on += dt
+        if covered < DUTY_MIN_COVER_S:
+            return None, None
+        return round(on / covered * bucket_seconds), round(weighted / covered, 1)
+
+
+def _main_payloads(buf):
+    """Payloads of the complete, header-valid main-data messages (0x7E11 -> 0x10, cmd 0x0100)
+    in buf, without logging. Same framing rules as parsestream()."""
+    out = []
+    for msg in buf.split(chr(0xAA))[1:-1]:
+        if len(msg) < 9 or gb(msg, 4, 5) != 0x10:
+            continue
+        if gb(msg, 0, 2) != 0x10 or gb(msg, 2, 4) != 0x7e11 or gb(msg, 5, 7) != 0x0100:
+            continue
+        if getchk(msg[0:8]) != gb(msg, 8, 9):
+            continue
+        frames = gb(msg, 7, 8)
+        if len(msg) >= 9 + 6 * frames:
+            out.append(msg[9:9 + 6 * frames])
+    return out
+
+
+def collect_duty(until, clock=time.time):
+    """Read the open stream until `until` (epoch s) and return DutyMeter.result().
+
+    Only readings the controller vouches for count (errmsk 0, sanity checks passed). A socket
+    error just ends the collection early -- what was seen so far still counts.
+    """
+    meter, buf, frames = DutyMeter(), "", 0
+    try:
+        while clock() < until:
+            chunk = recv(quiet=True)
+            if not chunk:
+                raise ConnectionError("adapter closed the stream")
+            buf = _carry_tail(buf) + chunk
+            now = clock()
+            for payload in _main_payloads(buf):
+                vals = parsepayload(payload, quiet=True)
+                if vals is not None and vals.get("errmsk") == 0:
+                    meter.add(now, vals["rel1"])
+                    frames += 1
+    except Exception as e:
+        dbg(1, "DUTY", f"stream ended early: {e}")
+    on_s, avg = meter.result()
+    dbg(1, "DUTY", f"R1 on {on_s} s, avg {avg} % ({frames} readings)")
+    return on_s, avg
+
+
+def save_duty(bucket_ts, on_s, avg_pct):
+    """Upsert the pump duty into the interval's own row (the snapshot already went in at the tick)."""
+    db = cursor = None
+    try:
+        db = mysql.connector.connect(host=DB_HOST, user=DB_USER, passwd=DB_PASSWORD, database=DB_NAME)
+        cursor = db.cursor()
+        cursor.execute(er.upsert_sql(["resol_r1_on_s", "resol_r1_avg_pct"]), (bucket_ts, on_s, avg_pct))
+        db.commit()
+    except mysql.connector.Error as err:
+        dbg(1, "DUTY", f"Database error: {err}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if db is not None:
+            db.close()
+
+
+def ensure_duty_columns():
+    """Idempotently add the duty columns (MariaDB ADD COLUMN IF NOT EXISTS). Best-effort: on
+    failure log and carry on -- the snapshot write does not depend on them."""
+    db = None
+    try:
+        db = mysql.connector.connect(host=DB_HOST, user=DB_USER, passwd=DB_PASSWORD, database=DB_NAME)
+        cur = db.cursor()
+        cur.execute("ALTER TABLE energy "
+                    "ADD COLUMN IF NOT EXISTS `resol_r1_on_s` smallint(6) DEFAULT NULL, "
+                    "ADD COLUMN IF NOT EXISTS `resol_r1_avg_pct` float DEFAULT NULL")
+        db.commit()
+        cur.close()
+        dbg(1, "DUTY", "schema OK (resol_r1_on_s, resol_r1_avg_pct)")
+    except Exception as e:
+        dbg(1, "DUTY", f"ensure_duty_columns failed: {e}")
+    finally:
+        if db is not None:
+            db.close()
+
+
+# ==================================================
 # MAIN LOOP (runs every 5 minutes)
 # ==================================================
+
+ensure_duty_columns()
 
 # Sleep until next 5-minute interval before starting
 sleep_until_next_5min()
@@ -643,6 +779,8 @@ sleep_until_next_5min()
 while True:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     dbg(1, "MAIN", f" -- Starting execution at {now_str} -- ")
+    cycle_bucket = er.bucket()
+    duty_until = cycle_bucket.timestamp() + er.BUCKET_MINUTES * 60 - DUTY_STOP_BEFORE_S
 
     for attempt in range(MAX_CYCLE_RETRIES + 1):
         _cycle_healthy = False
@@ -667,6 +805,10 @@ while True:
 
             # Login & get data
             login()
+
+            # Snapshot stored: stay on this stream for the pump duty of the rest of the interval
+            if _cycle_healthy:
+                save_duty(cycle_bucket, *collect_duty(duty_until))
 
         except Exception as e:
             dbg(1, "SOCKET", f"Connection failed: {e}")

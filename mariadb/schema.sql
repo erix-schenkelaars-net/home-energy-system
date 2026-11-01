@@ -43,6 +43,14 @@ CREATE TABLE IF NOT EXISTS `energy` (
   -- mask could not physically fit. RESOL does not publish the bit layout.
   `resol_error_code`                    int(10) unsigned DEFAULT NULL COMMENT 'Resol Fehlermaske (31-bit bitmask, packet 0x7E11 offset 96)',
   `resol_relay_1`                       tinyint(4)   DEFAULT NULL COMMENT '% solar collector pump',
+  -- The solar pump CYCLES on weak sun (starts at its 30 % minimum, cools the collector below the
+  -- switch-off delta-T within minutes, stops, restarts): resol_relay_1 is one snapshot at the tick
+  -- and caught a fraction of that (2026-10-29: 0 at 14:50..15:15 while the pump ran). read_resol
+  -- therefore stays on the VBus stream for the rest of the interval and time-weights every
+  -- broadcast (~1/s); only the aggregate lands here. Scaled from the time actually observed to
+  -- the 300 s bucket; NULL when under 60 s was observed. Added 2026-10-29.
+  `resol_r1_on_s`                       smallint(6)  DEFAULT NULL COMMENT 'solar pump (R1) seconds on in this 5-min bucket, from the VBus stream',
+  `resol_r1_avg_pct`                    float        DEFAULT NULL COMMENT 'solar pump (R1) time-weighted average % over this bucket',
   `resol_relay_2`                       tinyint(4)   DEFAULT NULL COMMENT '% 3-way valve glycol',
   `resol_relay_3`                       tinyint(4)   DEFAULT NULL COMMENT '% wood gasifier pump',
   `resol_relay_6`                       tinyint(4)   DEFAULT NULL COMMENT 'OLD/DEFUNCT R6 channel for the return 3-way valve: valve shorted ~2026-10, likely killed the R6 thyristor on the Resol M1, and the valve was rewired off Resol onto a Zigbee plug 2026-10-15. Resol may still log its intent here but it no longer drives the valve -- ignore for valve state; use buffer_valve_* instead',
