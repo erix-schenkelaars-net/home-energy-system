@@ -1,12 +1,12 @@
 # Full pip freeze of the running image (2026-10-24), incl. transitive deps.
 # Bump deliberately, one service at a time, then test + rebuild.
-certifi==2026.7.22
-charset-normalizer==3.5.1
-idna==3.19
-mysql-connector-python==9.5.0
+certifi==2026.10.18
+charset-normalizer==3.5.2
+idna==3.20
+mysql-connector-python==9.7.0
 numpy==2.2.4
 paho-mqtt==2.1.0
-python-dotenv==1.0.1
-requests==2.32.3
+python-dotenv==1.2.4
+requests==2.34.2
 scipy==1.17.1
-urllib3==2.7.0
+urllib3==2.8.0

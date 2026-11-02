@@ -3,8 +3,8 @@
 
 For every service on every host: the base image (Dockerfile FROM / compose image:) against the
 newest tag in the same series (Docker Hub, or ghcr.io), and every pinned pip package against PyPI --
-newest release, newest in the same major, and the known vulnerabilities (PyPI's OSV data) of the
-version we run. Hosts: this repo on the local machine, plus every remote in CHECK_UPDATES_REMOTES
+newest release, the version to TAKE (newest in our major that is at least MIN_AGE_DAYS old), and the
+known vulnerabilities (PyPI's OSV data) of the version we run and of the one to take. Hosts: this repo on the local machine, plus every remote in CHECK_UPDATES_REMOTES
 (ssh aliases, default "pi5"), read over ssh from its ~/docker/<service>/ files. A running container
 whose image differs from what its compose file now names is flagged: the pin only lands on `up -d`.
 
@@ -18,6 +18,9 @@ Usage:
   python3 tools/check_updates.py read_p1 ...  # only these services
   python3 tools/check_updates.py --local-only # skip the remote hosts
 
+Runs weekly from the pi user's crontab (Monday 07:30) and mails the report; it never updates
+anything itself -- updates stay manual, one service at a time.
+
 Needs internet (Docker Hub + PyPI), so it is not part of the test suite.
 """
 import os
@@ -27,6 +30,8 @@ import subprocess
 import json
 import pathlib
 import argparse
+import io
+import contextlib
 import urllib.request
 from datetime import datetime, timezone
 
@@ -34,8 +39,9 @@ ROOT         = pathlib.Path(__file__).resolve().parent.parent
 MIN_AGE_DAYS = 14
 TIMEOUT_S    = 20
 REMOTES      = os.environ.get("CHECK_UPDATES_REMOTES", "pi5").split()
-FILE_GLOBS   = ("*/Dockerfile", "*/docker-compose*.yml", "*/requirements.txt")
+FILE_GLOBS   = ("*/Dockerfile", "*/docker-compose*.yml", "*/requirements.txt", "*/test_*pub*.py")
 _cache: dict = {}
+TODO: dict[str, dict[str, dict]] = {}   # host label -> service -> what to change (summary + commands)
 
 
 def get_json(url: str):
@@ -190,27 +196,102 @@ def read_requirements(text: str) -> list[tuple[str, str, str]]:
     return out
 
 
-def pypi_report(name: str, version: str) -> tuple[str, str, str, int]:
-    """(newest stable, its age, newest in our major, number of known vulns in our version)."""
+def pypi_report(name: str, version: str) -> tuple[str, str, str, int, int]:
+    """(newest stable, its age, TAKE = newest in our major that is >= MIN_AGE_DAYS old,
+    known vulns in our version, known vulns in TAKE)."""
     d = get_json(f"https://pypi.org/pypi/{name}/json")
-    stable = [v for v, files in d["releases"].items()
+    stable = {v: files for v, files in d["releases"].items()
               if files and re.fullmatch(r"[\d.]+(\.post\d+)?", v)
-              and not all(f.get("yanked") for f in files)]
+              and not all(f.get("yanked") for f in files)}
     newest = max(stable, key=vkey) if stable else d["info"]["version"]
     files = d["releases"].get(newest) or [{}]
     major = version.split(".")[0]
-    same_major = max((v for v in stable if v.split(".")[0] == major), key=vkey, default="")
-    try:
-        vulns = len(get_json(f"https://pypi.org/pypi/{name}/{version}/json").get("vulnerabilities") or [])
-    except Exception:
-        vulns = -1
-    return newest, age_days(files[0].get("upload_time_iso_8601")), same_major, vulns
+
+    def old_enough(v):
+        a = age_days(stable[v][0].get("upload_time_iso_8601"))
+        return a != "?" and int(a) >= MIN_AGE_DAYS
+    take = max((v for v in stable if v.split(".")[0] == major and old_enough(v)), key=vkey, default="")
+    if take and vkey(take) < vkey(version):
+        take = version                      # never suggest a downgrade
+
+    def vulns_of(v):
+        try:
+            return len(get_json(f"https://pypi.org/pypi/{name}/{v}/json").get("vulnerabilities") or [])
+        except Exception:
+            return -1
+    return (newest, age_days(files[0].get("upload_time_iso_8601")), take, vulns_of(version),
+            vulns_of(take) if take and take != version else vulns_of(version))
+
+
+def python_take(tag: str) -> str:
+    """For a python:3.X.Y-<suffix> image: the newest 3.X.Z released >= MIN_AGE_DAYS ago (python.org dates)."""
+    m = re.fullmatch(r"(3\.\d+)\.(\d+)(-.+)?", tag)
+    if not m:
+        return ""
+    minor, suffix = m.group(1), m.group(3) or ""
+    rel = get_json("https://www.python.org/api/v2/downloads/release/?is_published=true")
+    best = None
+    for r in rel:
+        mm = re.fullmatch(r"Python " + re.escape(minor) + r"\.(\d+)", r.get("name", ""))
+        if mm and r.get("release_date") and int(age_days(r["release_date"])) >= MIN_AGE_DAYS:
+            n = int(mm.group(1))
+            best = n if best is None or n > best else best
+    if best is None or best < int(m.group(2)):
+        return tag
+    return f"{minor}.{best}{suffix}"
+
+
+def _todo(label: str, svc: str) -> dict:
+    return TODO.setdefault(label, {}).setdefault(
+        svc, {"lines": [], "from": [], "compose": [], "req": [], "redeploy": False})
+
+
+def update_commands(host: str | None, svc: str, t: dict, files: dict[str, str]) -> list[str]:
+    """Shell steps that apply this service's update the controlled way: bump the pins, keep the
+    old image as :prev, rebuild, run the service's tests INSIDE the new image, then up -d."""
+    base = "/home/pi/docker" if host is None else "~/docker"
+    out = [f"ssh {host}"] if host else []
+    out.append(f"cd {base}/{svc}")
+    if any("mariadb" in n for _, n in t["compose"]) or (t["redeploy"] and "mariadb" in " ".join(t["lines"])):
+        out.append("# FIRST a fresh dump: docker exec <db-container> mariadb-dump --all-databases "
+                   "-uroot -p\"$ROOT_PW\" > ~/dump_$(date +%F).sql")
+    if t["from"]:
+        out.append("sed -i " + " ".join(f"-e 's|^FROM {o}$|FROM {n}|'" for o, n in t["from"]) + " Dockerfile")
+    if t["req"]:
+        out.append("sed -i " + " ".join(f"-e 's|^{p}=={o}$|{p}=={n}|'" for p, o, n in t["req"]) + " requirements.txt")
+    if t["compose"]:
+        out.append("sed -i " + " ".join(f"-e 's|image: {o}$|image: {n}|'" for o, n in t["compose"])
+                   + " docker-compose.yml")
+    compose = next((txt for pth, txt in files.items()
+                    if pth.startswith(svc + "/docker-compose") and pth.endswith(".yml")), "")
+    prof = re.search(r"profiles:\s*\[\s*\"?([\w-]+)", compose)
+    dc = f"docker compose --profile {prof.group(1)}" if prof else "docker compose"
+    if t["from"] or t["req"]:
+        out.append(f'img=$({dc} config --images | head -1); docker tag "$img" "$img:prev"')
+        out.append(f"{dc} build --no-cache")
+        tests = sorted(p.partition("/")[2][:-3] for p in files
+                       if p.startswith(svc + "/") and re.fullmatch(r"test_.*pub.*\.py", p.partition("/")[2]))
+        for mod in tests:
+            out.append(f'docker run --rm --entrypoint python3 -v "$PWD":/app -v "$PWD/../common":/app/common:ro '
+                       f'-w /app "$img" -m unittest {mod}')
+        out.append("# manual-only service (compose profile): build only, do NOT start it" if prof
+                   else "docker compose up -d")
+    elif t["compose"] or t["redeploy"]:
+        out.append("docker compose pull && docker compose up -d")
+    own_build = f"{svc}/Dockerfile" in files
+    out.append("tail -f logs/debug_$(date +%F).log   # watch the first cycle" if own_build
+               else "docker compose logs -f --tail 50   # watch it come up")
+    out.append("# rollback: git revert, then " + ("docker tag \"$img:prev\" \"$img\" && docker compose up -d"
+                                                if own_build else "docker compose up -d"))
+    out.append("git commit -am '" + svc + ": update' && git push" if host
+               else "cd .. && ./test-all.sh   # then commit (bundled)")
+    return out
 
 
 def report_host(label: str, files: dict[str, str], running: dict[str, set[str]],
                 want: set[str], only_stale: bool) -> dict[str, int]:
     print(f"\n{'=' * 100}\n{label}\n{'=' * 100}\n")
-    print(f"{'service':<20} {'current':<50} {'newest in series':<22} {'pushed d':>8}  {'next series':<14} note")
+    print(f"{'service':<20} {'current':<50} {'newest in series':<22} {'take (>=14 d)':<20} {'pushed d':>8}  {'next series':<14} note")
     for svc, img, kind in find_images(files):
         if want and svc not in want:
             continue
@@ -225,10 +306,30 @@ def report_host(label: str, files: dict[str, str], running: dict[str, set[str]],
         if kind == "compose" and other:
             note = (note + "; " if note else "") + f"running {','.join(other)} -> up -d"
         cur = img.split(":", 1)[1] if ":" in img else img
+        take = ""
+        if img.startswith("python:"):
+            try:
+                take = python_take(cur)
+            except Exception:
+                take = "?"
         mark = "" if newest in ("?", cur) else "  <-"
-        print(f"{svc:<20} {img:<50} {newest:<22} {age:>8}  {hint:<14} {note}{mark}")
+        if take and take not in ("?", cur):
+            t = _todo(label, svc)
+            t["lines"].append(f"python:{cur} -> python:{take}")
+            t["from" if kind == "FROM" else "compose"].append((img, f"python:{take}"))
+        elif not img.startswith("python:") and newest not in ("?", cur) and "pin it" not in note:
+            t = _todo(label, svc)
+            t["lines"].append(f"{img} -> {newest}  (check the release date first)")
+            t["from" if kind == "FROM" else "compose"].append((img, f"{repo}:{newest}"))
+        if "pin it" in note:
+            _todo(label, svc)["lines"].append(f"{img} -- {note}")
+        elif "-> up -d" in note:
+            t = _todo(label, svc)
+            t["lines"].append(f"{img} -- {note}")
+            t["redeploy"] = True
+        print(f"{svc:<20} {img:<50} {newest:<22} {take:<20} {age:>8}  {hint:<14} {note}{mark}")
 
-    print(f"\n{'service':<20} {'package':<26} {'current':<14} {'same major':<14} {'newest':<14} {'age d':>6} {'vulns':>5}")
+    print(f"\n{'service':<20} {'package':<26} {'current':<14} {'vulns':>5}  {'take (>=14 d)':<14} {'vulns':>5}  {'newest':<14} {'age d':>6}")
     per_svc: dict[str, int] = {}
     for path, text in sorted(files.items()):
         svc, _, name = path.partition("/")
@@ -236,7 +337,7 @@ def report_host(label: str, files: dict[str, str], running: dict[str, set[str]],
             continue
         for pkg, op, ver in read_requirements(text):
             try:
-                newest, age, same_major, vulns = pypi_report(pkg, ver)
+                newest, age, take, vulns, vulns_take = pypi_report(pkg, ver)
             except Exception as e:
                 print(f"{svc:<20} {pkg:<26} {ver:<14} lookup failed: {e}")
                 continue
@@ -244,9 +345,16 @@ def report_host(label: str, files: dict[str, str], running: dict[str, set[str]],
             if only_stale and current and vulns <= 0:
                 continue
             per_svc[svc] = per_svc.get(svc, 0) + max(vulns, 0)
+            if take and take != ver and op == "==":
+                t = _todo(label, svc)
+                minor = ver.split(".")[:2] != take.split(".")[:2] and not re.fullmatch(r"20\d\d\..*", ver)
+                t["lines"].append(f"{pkg} {ver} -> {take}" + (f"  ({vulns} vulns now)" if vulns > 0 else "")
+                                  + ("  [MINOR bump: deliberate, read the changelog]" if minor and vulns <= 0 else ""))
+                t["req"].append((pkg, ver, take))
             shown_ver = ver if op == "==" else f"{op}{ver}"
-            print(f"{svc:<20} {pkg:<26} {shown_ver:<14} {same_major:<14} {newest:<14} {age:>6} "
-                  f"{('?' if vulns < 0 else vulns):>5}{'' if current else '  <-'}")
+            q = lambda n: "?" if n < 0 else n
+            print(f"{svc:<20} {pkg:<26} {shown_ver:<14} {q(vulns):>5}  {take:<14} {q(vulns_take):>5}  "
+                  f"{newest:<14} {age:>6}{'' if current else '  <-'}")
     return per_svc
 
 
@@ -262,18 +370,34 @@ def main() -> int:
           "rebuilt often, so it is NOT the release age; check the upstream release date before taking\n"
           f"it (policy: >= {MIN_AGE_DAYS} d). Packages: vulns = known advisories for the version we pin\n"
           "(PyPI/OSV). '<-' = something newer exists.")
-    hosts = [("local (this repo)", local_files(), running_images(None))]
+    hosts = [("local (this repo)", local_files(), running_images(None), None)]
     for h in ([] if a.local_only else REMOTES):
         try:
-            hosts.append((f"{h} (~/docker over ssh)", remote_files(h), running_images(h)))
+            hosts.append((f"{h} (~/docker over ssh)", remote_files(h), running_images(h), h))
         except Exception as e:
             print(f"\n{h}: unreachable over ssh ({e}) -- skipped")
-    totals = {label: report_host(label, files, run, want, a.only_stale) for label, files, run in hosts}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        totals = {label: report_host(label, files, run, want, a.only_stale) for label, files, run, _ in hosts}
 
-    print("\nknown vulnerabilities in pinned packages:")
-    for label, per_svc in totals.items():
-        detail = ", ".join(f"{k} {v}" for k, v in sorted(per_svc.items()) if v) or "none"
-        print(f"  {label:<26} {sum(per_svc.values()):>4}   ({detail})")
+    # summary first: the weekly mail should say at a glance whether anything needs doing
+    print(f"\nSUMMARY ({datetime.now():%Y-%m-%d}) -- versions to take are >= {MIN_AGE_DAYS} d old, same major")
+    for label, files, _, host in hosts:
+        per_svc, svcs = totals[label], TODO.get(label, {})
+        n = sum(len(t["lines"]) for t in svcs.values())
+        print(f"\n  {label}: {n} to take in {len(svcs)} services, "
+              f"{sum(per_svc.values())} known vulnerabilities in pinned packages")
+        for svc, t in svcs.items():
+            print(f"\n    {svc}")
+            for line in t["lines"]:
+                print(f"      - {line}")
+            if t["from"] or t["req"] or t["compose"] or t["redeploy"]:
+                print("      commands:")
+                for c in update_commands(host, svc, t, files):
+                    print(f"        {c}")
+    print("\n  Order and policy: one service at a time, low-risk readers first; battery/inverter control on a\n"
+          "  calm day; take a mariadb-dump before any mariadb update; minor/major bumps only deliberately.")
+    print(buf.getvalue())
     return 0
 
 

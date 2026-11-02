@@ -277,6 +277,9 @@ class TestHaOutside(unittest.TestCase):
     def test_stale_is_none(self):
         stamp = datetime(2026, 1, 5, 9, 0).astimezone().isoformat()     # 3 u oud > 7200 s
         self.assertIsNone(wp.parse_ha_state(self._json("10.0", stamp), self._now(), 7200, -40, 50))
+        # ...maar binnen de default van 6 u blijft dezelfde 3 u oude waarde bruikbaar
+        self.assertEqual(wp.parse_ha_state(self._json("10.0", stamp), self._now(),
+                                           wp.build_cfg()["ha_max_age"], -40, 50), 10.0)
 
     def test_bad_json_is_none(self):
         self.assertIsNone(wp.parse_ha_state("not json", self._now(), 7200, -40, 50))
@@ -284,7 +287,7 @@ class TestHaOutside(unittest.TestCase):
     def test_build_cfg_ha_defaults(self):
         c = wp.build_cfg()
         self.assertEqual(c["ha_entity"], "sensor.outdoor_temperature")  # generieke default (echte = .env)
-        self.assertEqual(c["ha_max_age"], 7200)
+        self.assertEqual(c["ha_max_age"], 21600)   # 6 u: voeler meldt alleen bij verandering
 
     def test_read_ha_outside_no_creds_is_none(self):
         self.assertIsNone(wp.read_ha_outside(wp.build_cfg()))           # geen HA_URL/HA_TOKEN in test-env
@@ -808,7 +811,7 @@ class TestDayPlan(unittest.TestCase):
         self.assertEqual([at["2026-10-28T01:45"], at["2026-10-28T05:00"], at["2026-10-28T11:45"],
                           at["2026-10-28T12:00"], at["2026-10-28T15:00"], at["2026-10-28T17:00"],
                           at["2026-10-28T19:00"]],
-                         [19.0, 19.0, 21.5, 22.5, 22.0, 21.0, 19.0])
+                         [19.0, 21.0, 21.5, 22.5, 22.0, 21.0, 19.0])   # 05:00: ochtend al op 21
         self.assertEqual(plan["now"], 22.5)                # 13:10 valt in het oplaadblok
 
     def test_discovery_has_plan_sensor_with_attributes(self):
@@ -1263,14 +1266,13 @@ class TestFlowDropLimit(unittest.TestCase):
 
 class TestDefaultSchedule(unittest.TestCase):
     def test_agreed_day_profile(self):
-        # 2026-11-01 met de bewoners (keuze A): 21,0 rond 08:30 (opwarmen vanaf 05:30, niet 02:00: vroeg
-        # stoken lekt ~1,2 %/u weg), 21,5 vanaf 09:00, 13-17 = 22, daarna 21 en om 19:00 19
+        # 2026-11-02 (user): opwarmen vóór 07:00 — 04:00 20,5 (boven de kamer na de nacht, dus de WP start
+        # meteen), 04:30 21,0; 21,5 vanaf 09:00, 13-17 = 22, daarna 21 en om 19:00 19
         sched = wp.parse_schedule(wp.DEFAULT_SCHEDULE)
         sp = lambda h, m=0: wp.decide_setpoint(datetime(2026, 10, 26, h, m), {"schedule": sched})[0]
-        self.assertEqual(sp(5, 25), 19.0)                 # nog nachtverlaging
-        # halfuurlijks +0,5: nooit een sprong
-        self.assertEqual([sp(5, 30), sp(6, 0), sp(6, 30), sp(8, 55), sp(9, 0)],
-                         [20.0, 20.5, 21.0, 21.0, 21.5])
+        self.assertEqual(sp(3, 55), 19.0)                 # nog nachtverlaging
+        self.assertEqual([sp(4, 0), sp(4, 30), sp(6, 59), sp(8, 55), sp(9, 0)],
+                         [20.5, 21.0, 21.0, 21.0, 21.5])
         self.assertEqual([sp(13), sp(16, 55), sp(17), sp(19)], [22.0, 22.0, 21.0, 19.0])
 
 

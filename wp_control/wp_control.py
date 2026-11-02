@@ -49,7 +49,11 @@ def dbg(area, msg):
 # nacht-ochtendspread in de winter maar 1-2 ct). Gesloten-lus-simulatie 10-31: kamer 09:00 ~21,1, ochtend
 # EUR 0,09 (zacht) .. 0,33 (8 K kouder) goedkoper dan opwarmen vanaf 04:30. 21,5 vanaf 09:00; 13-17 = 22
 # (de middagwarmte die zij wil); 17:00 21 en 19:00 19. Halfuurlijkse stappen: nooit een sprong.
-DEFAULT_SCHEDULE = ("05:30=20.0,06:00=20.5,06:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,"
+# 2026-11-02 (user): opwarmen VÓÓR 07:00. Eerste meetochtend met schema A: de stap 05:30=20,0 lag onder
+# de inschakeldrempel (kamer 19,93 > 20,0-0,2), de WP startte pas 06:10 en stookte vooral 07-10 u, de
+# duurste uren (08-09 u EUR 0,51); kamer 08:30 20,8, 10:00 pas 21,0. Nu 04:00=20,5 (kamer na de nacht
+# ~20,0 -> start meteen) en 04:30=21,0: het opwarmen valt in de goedkope 04-07 u (~EUR 0,40).
+DEFAULT_SCHEDULE = ("04:00=20.5,04:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,"
                     "19:00=19.0")
 
 
@@ -275,12 +279,18 @@ def build_cfg():
         "ha_url":     os.environ.get("HA_URL"),
         "ha_token":   os.environ.get("HA_TOKEN"),
         "ha_entity":  os.environ.get("WP_OUTSIDE_ENTITY", "sensor.outdoor_temperature"),
-        "ha_max_age": int(os.environ.get("WP_OUTSIDE_MAX_AGE_S", "7200")),
+        # 6 u (2026-11-02, was 2 u): de buitenvoeler meldt alleen bij verandering — 's nachts en bij stabiel
+        # weer gaten tot ~5 u. Geen melding = niet veranderd; met 2 u viel hij midden in het ochtend-
+        # opwarmen (07:49-10:44) onnodig terug op KNMI.
+        "ha_max_age": int(os.environ.get("WP_OUTSIDE_MAX_AGE_S", "21600")),
         # 6-punts weercurve (user 2026-10-22) "buiten:aanvoer,..." = wat pi5new ZOU sturen (shadow,
         # nog DRY). Zelfde curve als in de OTThing; verschil met de OTThing-target = demping + later
         # preheat/prijs/PV. Zie [[heatpump-control-lever]].
+        # 2026-11-02: punt 10 °C 35 -> 38. Eerste dag zonder I-ratel (Ki 0,15 + opbouwpoort): rond 10 °C
+        # buiten bleef de kamer 0,4-0,6 °C onder het setpoint (11:00: 20,9 bij 21,5, aanvoer ~39) — de
+        # oude hoge I had dat gat steeds dichtgedrukt. Hogere basis i.p.v. de I weer los.
         "curve": parse_curve(os.environ.get("WP_FLOW_CURVE",
-                                            "20:28,10:35,0:42,-10:48,-25:50,-30:50")),
+                                            "20:28,10:38,0:42,-10:48,-25:50,-30:50")),
         # pi5new-REGELING: wij beslissen aan/uit + aanvoer en sturen de WP (chMode1/chSetTemp1).
         # control_live=0 -> alleen loggen (shadow); 1 -> echt sturen. Hysterese rond het Honeywell-
         # setpoint voorkomt pendelen. overrideChFlow1 moet AAN staan zodat chSetTemp1 wint.

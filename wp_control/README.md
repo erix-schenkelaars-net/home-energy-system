@@ -127,7 +127,7 @@ them).
 
 | variable | default | meaning |
 |---|---|---|
-| `WP_SCHEDULE` | `05:30=20.0,06:00=20.5,06:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). The agreed day: 21.0 around 08:30 (only one person is downstairs early and never feels cold; the other gets up between 09:00 and 10:30), 21.5 from 09:00, 22 from 13 to 17 (the afternoon warmth the household wants), 21 until the 19:00 setback. The morning steps are +0.5 °C per half hour, so the flow never jumps. They start at 05:30, not 02:00 (the schedule of 2026-10-27): the house loses ~1.2 % of stored heat per hour it is heated earlier (τ ≈ 87 h), and in winter the night-to-morning price spread was only 1–2 ct, so heating at 02:00 cost more than it saved. The house warms slowly (its mass has to come along), so a later start mostly trades a few tenths of a degree before 09:00 for money: a closed-loop simulation of 2026-10-31 gave ~21.1 at 09:00 and a morning EUR 0.09 (mild) to 0.33 (8 K colder) cheaper than starting at 04:30; every extra 0.1 °C at 09:00 costs roughly EUR 0.10–0.15 a morning |
+| `WP_SCHEDULE` | `04:00=20.5,04:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,19:00=19.0` | breakpoints `HH:MM=temp`, each valid until the next (before the first one, the last one of the previous day applies). The day: 21.0 from early morning, 21.5 from 09:00, 22 from 13 to 17 (the afternoon warmth the household wants), 21 until the 19:00 setback. Since 2026-11-02 the morning warm-up starts at 04:00 so it falls before 07:00, in the cheap 04–07 h, not in the 07–10 h price peak. The first measured morning with a 05:30 start (2026-11-02) missed: its 20.0 step was under the switch-on threshold (room 19.93), the heat pump only started at 06:10, heated mostly at 07–10 h (08–09 h EUR 0.51) and the room reached 21.0 only at 10:00. 04:00 = 20.5 lies above the room after the night (~20.0), so the heat pump starts at once. Heating earlier costs ~1.2 % of stored heat per hour (τ ≈ 87 h); with a 10 ct spread between 04–07 h and 08–09 h that is well worth it |
 | `WP_OVERRIDE_THRESHOLD` | `21.5` | Honeywell above this = bump |
 | `WP_OVERRIDE_MAX` | `23.0` | upper limit of a bump |
 | `WP_OVERRIDE_HOLD_S` | `3600` | how long a bump lasts |
@@ -153,7 +153,7 @@ them).
 
 | variable | default | meaning |
 |---|---|---|
-| `WP_FLOW_CURVE` | `20:28,10:35,0:42,-10:48,-25:50,-30:50` | weather curve `outside:flow`, linearly interpolated |
+| `WP_FLOW_CURVE` | `20:28,10:38,0:42,-10:48,-25:50,-30:50` | weather curve `outside:flow`, linearly interpolated. The 10 °C point went 35 → 38 on 2026-11-02: on the first day without the I ratchet the room stayed 0.4–0.6 °C under the setpoint around 10 °C outside (the old high I had been hiding that gap) |
 | `WP_FLOW_MIN` | `28` | flow floor (also with negative compensation) |
 | `WP_FLOW_CAP` | `50` | flow ceiling |
 | `WP_FLOW_MAX_DROP` | `1.0` | the flow target falls by at most this many °C per cycle (rises immediately); a sudden drop below the return temperature makes the heat pump stop and then sit idle for 60 min |
@@ -172,7 +172,7 @@ them).
 | variable | default | meaning |
 |---|---|---|
 | `WP_OUTSIDE_ENTITY` | `sensor.outdoor_temperature` | Home Assistant outdoor sensor, first choice. **Set in `.env`** (own entity name) |
-| `WP_OUTSIDE_MAX_AGE_S` | `7200` | older than this = not used; fall back to the KNMI forecast |
+| `WP_OUTSIDE_MAX_AGE_S` | `21600` | older than this = not used; fall back to the KNMI forecast. 6 h because the sensor only reports on change (gaps up to ~5 h at night) |
 | `WP_SCHED_TABLE` | `battery_schedule` | table holding the KNMI forecast (`forecast_temp_c`) for that fallback |
 | `WP_OUTSIDE_MIN` / `WP_OUTSIDE_MAX` | `-40` / `50` | values outside this range are ignored |
 | `WP_OUTSIDE_FALLBACK` | `15` | assumed when there is no outside temperature at all; without a flow target the heat pump would switch off (and sit idle for 60 min). Not published to the OTThing |
