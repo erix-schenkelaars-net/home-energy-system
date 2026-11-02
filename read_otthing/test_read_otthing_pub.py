@@ -422,5 +422,15 @@ class TestRoomunit(unittest.TestCase):
         self.assertEqual(d["otthing_roomunit_set_t_c"], 22.0)
 
 
+class TestMqttCallbackApi(unittest.TestCase):
+    """paho 2.x deprecates the VERSION1 callback API (a DeprecationWarning every cycle): use VERSION2."""
+
+    def test_client_uses_callback_api_version2(self):
+        with patch.object(mod, "mqtt") as m, patch.object(mod.time, "sleep"):
+            mod.execute_cycle()                     # no message arrives -> DB update is skipped
+        kwargs = m.Client.call_args.kwargs
+        self.assertIs(kwargs["callback_api_version"], m.CallbackAPIVersion.VERSION2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

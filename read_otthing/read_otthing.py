@@ -230,8 +230,10 @@ def execute_cycle():
 
     state = {"state": None}
 
+    # VERSION2: VERSION1 is deprecated in paho 2.x and warned on every cycle. Only on_message is
+    # used here, and its signature is the same in both versions.
     if hasattr(mqtt, 'CallbackAPIVersion'):
-        client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION1, userdata=state)
+        client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2, userdata=state)
     else:
         client = mqtt.Client(userdata=state)
     client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
