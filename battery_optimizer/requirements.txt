@@ -4,9 +4,9 @@ certifi==2026.10.18
 charset-normalizer==3.5.2
 idna==3.20
 mysql-connector-python==9.7.0
-numpy==2.2.4
+numpy==2.5.4
 paho-mqtt==2.1.0
 python-dotenv==1.2.4
 requests==2.34.2
-scipy==1.17.1
+scipy==1.18.1
 urllib3==2.8.0
