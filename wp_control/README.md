@@ -197,6 +197,42 @@ them).
 `DB_*`, `MQTT_BROKER/PORT/USERNAME/PASSWORD`, `MQTT_OTTHING_TOPIC`, `HA_URL`, `HA_TOKEN`,
 `OTTHING_HOST` (only for `otthing_config.py`).
 
+## Planner (in development, not wired in yet)
+
+The rules above react to the room once it is already too cold; with a house this slow they stay
+behind (room 0.4-0.8 °C under the setpoint for hours on 2026-11-03). The planner replaces them by
+planning ahead on a model of the house:
+
+- `house_model.py` - two-node model (room air + building mass) plus the heat pump (emitter, COP).
+  Pure Python, so wp_control can use it without extra packages.
+- `house_model_params.json` - fitted values. 2026-11-03: Cr 9.5 kWh/K, Cm 25 kWh/K, UA 172 W/K,
+  ~0.85 kW heat per kW PV, internal gains -0.7 kW at night (bedroom window open) to +0.4 kW in the
+  morning. Tested on held-out days: 12 h ahead median error 0.13 K (p90 0.24 K).
+- `fit_house_model.py` - refits it (scored as the planner uses it: 24 h ahead from the measured
+  room, the mass from an observer). Refit as colder weather brings data: there is none below 6 °C.
+- `wp_planner.py` - every quarter, 36 h ahead: on/off and heat per quarter at minimum electricity
+  cost, within `WP_COMFORT_MIN` (+0.2 K margin). Includes what the P60 does by itself: minimum
+  1.5 kW heat, no restart for ~60 min after any stop, COP falling with supply temperature.
+  `backtest DAY [DAY...]` replays logged days on the model.
+
+Heat pump facts it relies on (measured 2026-11-03): the P60 stops by itself when its supply
+overshoots the target (the house asks less than its minimum output) and refuses to restart for
+~60 min after every stop, ours or its own; COP ≈ 5.75 + 0.107·T_out − 0.059·T_supply.
+
+First backtest, 2026-10-31..11-02 (perfect foresight of weather and prices, both on the model):
+the planner keeps every comfort bound (actual control: 2.7 K·h under) at EUR 13.64 against
+EUR 14.89 actual, counting the heat it leaves stored in the house at the end of the day.
+Not yet: buffer tank, irradiance (PV stands in), frost.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `WP_PLANNER` | `off` | `off` = rules only; `shadow` = the planner plans every cycle and logs (`energy.wp_plan_*`, table `wp_plan`, `[PLAN]` in the log) while the rules drive the heat pump; `live` = the plan drives it and the rules take over on any planner error (logged as mode 2). In live the OTThing room setpoint follows the planned room (its own suspend at setpoint+1.5 must not fight a deliberately warm house) |
+| `WP_COMFORT_MIN` | `07:00-09:00=20.8,09:00-13:00=21.3,13:00-17:30=21.7,17:30-01:00=20.5,01:00-07:00=18.0` | hard floor for the room per time band (`HH:MM-HH:MM=temp`, may cross midnight; no band = no requirement) |
+
+The planner needs numpy/scipy (in the wp_control image since 2026-11-03); wp_control imports it only
+when `WP_PLANNER` is shadow or live, so the rules run without it. Fitting and backtests also run in
+the battery_optimizer image (see the module docstrings).
+
 ## Running
 
 ```

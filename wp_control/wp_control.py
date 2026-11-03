@@ -325,6 +325,10 @@ def build_cfg():
         # negatieve room-comp: kamer boven setpoint -> aanvoer tot rc_neg_max °C ONDER de curve, nooit
         # onder flow_min. Zo draait de WP laag door i.p.v. aan/uit te pendelen.
         "rc_neg_max":   float(os.environ.get("WP_ROOMCOMP_NEG_MAX", "8")),
+        # Planner (2026-11-03): off = rules only; shadow = plan + log, the rules still drive the heat pump;
+        # live = the plan drives it, the rules take over on any planner error. Comfort floor per band.
+        "planner":   os.environ.get("WP_PLANNER", "off").strip().lower(),
+        "comfort":   os.environ.get("WP_COMFORT_MIN", ""),
         "flow_min": float(os.environ.get("WP_FLOW_MIN", "28")),
         "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
         "flow_max_drop": float(os.environ.get("WP_FLOW_MAX_DROP", "1.0")),  # °C per cyclus omlaag
@@ -1095,6 +1099,50 @@ def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, boost=Non
         dbg("SHADOW", f"write_shadow faalde: {e}")
 
 
+def ensure_plan_columns(cfg):
+    """Idempotent: planner columns in energy + the wp_plan table (the plan per quarter, read by the
+    battery optimiser as the heat pump's load). Best-effort."""
+    try:
+        c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
+        cur = c.cursor()
+        cur.execute(f"ALTER TABLE {cfg['db_table']} "
+                    f"ADD COLUMN IF NOT EXISTS `wp_plan_mode` tinyint(1) DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_plan_q_kw` float DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_plan_elec_kw` float DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_plan_room_c` float DEFAULT NULL, "
+                    f"ADD COLUMN IF NOT EXISTS `wp_plan_mass_c` float DEFAULT NULL")
+        cur.execute("""CREATE TABLE IF NOT EXISTS wp_plan (
+                         slot_dt DATETIME NOT NULL PRIMARY KEY,
+                         heat_kwh FLOAT, elec_kwh FLOAT, room_c FLOAT, on_flag TINYINT(1),
+                         created_at DATETIME NOT NULL)""")
+        c.commit(); cur.close(); c.close()
+        dbg("PLAN", "schema OK (energy.wp_plan_* + table wp_plan)")
+    except Exception as e:
+        dbg("PLAN", f"ensure_plan_columns faalde: {e}")
+
+
+def write_plan(cfg, mode, dec=None, res=None, diag=None, now=None):
+    """Log the planner: its decision for this interval in energy (wp_plan_*; mode 0 shadow, 1 live,
+    2 live but fell back to the rules) and the whole plan per quarter in wp_plan. Best-effort."""
+    now = now or datetime.now()
+    try:
+        c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
+        cur = c.cursor()
+        cols = ["wp_plan_mode", "wp_plan_q_kw", "wp_plan_elec_kw", "wp_plan_room_c", "wp_plan_mass_c"]
+        vals = (mode, None, None, None, None) if dec is None else \
+               (mode, round(dec["q"], 3), round(dec["elec"], 3), round(dec["room_next"], 2), round(diag["tm"], 2))
+        cur.execute(er.upsert_sql(cols, cfg["db_table"]), (er.bucket(now),) + vals)
+        if res is not None:
+            cur.execute("DELETE FROM wp_plan WHERE slot_dt >= %s", (diag["times"][0],))
+            cur.executemany("INSERT INTO wp_plan (slot_dt, heat_kwh, elec_kwh, room_c, on_flag, created_at) "
+                            "VALUES (%s,%s,%s,%s,%s,%s)",
+                            [(t, round(q * 0.25, 4), round(e * 0.25, 4), round(r, 2), int(o), now)
+                             for t, q, e, r, o in zip(diag["times"], res["Q"], res["elec"], res["room"], res["on"])])
+        c.commit(); cur.close(); c.close()
+    except Exception as e:
+        dbg("PLAN", f"write_plan faalde: {e}")
+
+
 HA_STATE_TOPIC = "wp_control/state"
 HA_PLAN_TOPIC  = "wp_control/plan"
 # (sleutel, naam, eenheid). HA leidt de entity-id af van device + naam (sensor.wp_control_setpoint_pi5,
@@ -1212,6 +1260,33 @@ def command_wp(cfg, heat, flow, sp=None):
         _mqtt_publish(f"{cfg['base_topic']}/chMode{ch}/set", "off", cfg, dry, retain=True)
 
 
+def plan_cycle(cfg, now, room, ovr_state):
+    """Run the planner for this cycle and log it. Returns the decision, or None on any failure
+    (the caller then keeps the rule-based decision). numpy/scipy are imported here, so wp_control
+    itself still runs without them."""
+    mode = 1 if cfg["planner"] == "live" else 0
+    try:
+        import wp_planner
+        bands = wp_planner.parse_comfort(cfg["comfort"] or wp_planner.DEFAULT_COMFORT)
+        active = lambda u: u is not None and u > now
+        bump = (ovr_state["ovr_until"], ovr_state["ovr_target"]) if active(ovr_state.get("ovr_until")) else None
+        lower = (ovr_state["und_until"], ovr_state["und_target"]) if active(ovr_state.get("und_until")) else None
+        dec, res, diag = wp_planner.run_live(cfg["db"], now, room, bands, bump, lower, cfg["flow_min"], cfg["flow_cap"])
+    except Exception as e:
+        dbg("PLAN", f"planner faalde: {type(e).__name__}: {e}")
+        write_plan(cfg, 2 if mode == 1 else 0, now=now)
+        return None
+    on_next = "".join("#" if o else "." for o in res["on"][:48])
+    run_txt = "draait" if diag["running"] else f"stil {diag['off_min']:.0f} min"
+    bias = "?" if diag["bias"] is None else f"{diag['bias']:+.1f}"
+    act = f"HEAT Q={dec['q']:.2f}kW aanvoer {dec['flow']}°C" if dec["heat"] else "OFF"
+    dbg("PLAN", f"[{'LIVE' if mode else 'SCHADUW'}] kamer={room} massa={diag['tm']:.2f} {run_txt} "
+                f"KNMI-bias={bias}K -> {act}"
+                f" | kamer over 1u {res['room'][3]:.2f} | OTThing-sp {dec['room_sp']} | 12u {on_next} | €{diag['cost']:.2f}/{diag['slots'] / 4:.0f}u")
+    write_plan(cfg, mode, dec, res, diag, now)
+    return dec
+
+
 # ── hoofdlus ─────────────────────────────────────────────────────────────────────────
 def main():
     cfg = build_cfg()
@@ -1245,6 +1320,11 @@ def main():
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
     ensure_shadow_columns(cfg)           # shadow-vergelijking met de OTThing (DRY)
+    if cfg["planner"] in ("shadow", "live"):
+        ensure_plan_columns(cfg)
+        dbg("CONF", f"PLANNER = {cfg['planner'].upper()} "
+                    f"({'stuurt de WP, regels = terugval' if cfg['planner'] == 'live' else 'rekent mee + logt, regels sturen'})"
+                    f" | comfort {cfg['comfort'] or '(standaard)'}")
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
     # wacht kort op een verse Honeywell-stand: de DB-rij kan nog de stand van vóór een draai bevatten
     for _ in range(15):
@@ -1329,7 +1409,17 @@ def main():
             flow, heat_state["flow"] = flow_raw, None   # na een stop begint de rem opnieuw
         if flow != flow_raw:
             dbg("CTRL", f"aanvoer-rem: {flow_raw} -> {flow}°C (max -{cfg['flow_max_drop']}°C/cyclus)")
-        command_wp(cfg, heat, flow, sp)
+        sp_cmd, planned = sp, None
+        if cfg["planner"] in ("shadow", "live"):
+            planned = plan_cycle(cfg, now, room, ovr_state)
+            if cfg["planner"] == "live":
+                if planned is not None:
+                    heat, flow, sp_cmd = planned["heat"], planned["flow"], planned["room_sp"]
+                    heat_state["heat"] = heat            # the rules resume from the real state on fallback
+                    heat_state["flow"] = flow
+                else:
+                    dbg("PLAN", "-> TERUGVAL: regel-gebaseerde beslissing")
+        command_wp(cfg, heat, flow, sp_cmd)
         save_state(ovr_state, heat_state, i_state, datetime.now())
         p_term = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"], cfg["rc_neg_max"])
         plan = day_plan(now, cfg, price_win)

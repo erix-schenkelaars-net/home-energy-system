@@ -201,6 +201,14 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `wp_cmd_heat`                         tinyint(1)   DEFAULT NULL COMMENT 'pi5new aan/uit-besluit: 1=heat gecommandeerd (chMode1=heat), 0=off (chMode1=off)',
   `wp_cmd_boost_c`                      float        DEFAULT NULL COMMENT 'pi5new room-comp boost °C bovenop de curve = P+I samen (gecapt op WP_ROOMCOMP_MAX en de ruimte tot WP_FLOW_CAP)',
   `wp_cmd_i_c`                          float        DEFAULT NULL COMMENT 'pi5new room-comp I-term apart °C (gedempte integrator: bloedt af bij nadering setpoint + anti-windup); boost = P + dit. Tunen Ki/demping',
+  -- WP planner (wp_control, 2026-11-03): the decision of the model-based planner for this interval.
+  -- mode 0 = shadow (planned + logged, the rules drove the heat pump), 1 = live (the plan drove it),
+  -- 2 = live but the planner failed and the rules took over. The whole plan per quarter is in wp_plan.
+  `wp_plan_mode`                        tinyint(1)   DEFAULT NULL COMMENT 'planner: 0 shadow, 1 live, 2 live fell back to rules',
+  `wp_plan_q_kw`                        float        DEFAULT NULL COMMENT 'planned heat for the current quarter (kW)',
+  `wp_plan_elec_kw`                     float        DEFAULT NULL COMMENT 'planned electricity for the current quarter (kW, model COP)',
+  `wp_plan_room_c`                      float        DEFAULT NULL COMMENT 'room the plan expects at the end of the current quarter (°C)',
+  `wp_plan_mass_c`                      float        DEFAULT NULL COMMENT 'estimated building-mass temperature (observer on the measured room, °C)',
   `honeywell_ot_thermo_ch_enable`       tinyint(1)   DEFAULT NULL COMMENT 'CH enabled',
   `honeywell_ot_thermo_ch_set_t_c`      float        DEFAULT NULL COMMENT 'Thermostat CH setpoint °C',
   `honeywell_ot_thermo_max_rel_mod_perc` float       DEFAULT NULL,
@@ -232,6 +240,20 @@ CREATE TABLE IF NOT EXISTS `energy` (
 -- quarter-hour slot over the next 48 hours).
 -- Read by read_growatt to determine the current inverter action.
 -- ---------------------------------------------------------------------------
+-- wp_plan: the WP planner's latest plan per quarter (wp_control/wp_planner.py). Rewritten from the
+-- current quarter on every 5-min cycle, so past rows are the last plan that existed for them. The
+-- battery optimiser reads elec_kwh as the heat pump's load instead of estimating it from history,
+-- so battery and heat pump plan around the same picture.
+CREATE TABLE IF NOT EXISTS `wp_plan` (
+  `slot_dt`    datetime   NOT NULL COMMENT 'quarter start (local time)',
+  `heat_kwh`   float      DEFAULT NULL COMMENT 'planned heat in this quarter (kWh)',
+  `elec_kwh`   float      DEFAULT NULL COMMENT 'planned electricity in this quarter (kWh)',
+  `room_c`     float      DEFAULT NULL COMMENT 'room the plan expects at the end of the quarter',
+  `on_flag`    tinyint(1) DEFAULT NULL COMMENT '1 = heat pump planned on',
+  `created_at` datetime   NOT NULL COMMENT 'when this plan was made',
+  PRIMARY KEY (`slot_dt`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 CREATE TABLE IF NOT EXISTS `battery_schedule` (
   `id`                  bigint(20)   NOT NULL AUTO_INCREMENT,
   `created_at`          datetime     NOT NULL COMMENT 'Timestamp of the optimiser run',

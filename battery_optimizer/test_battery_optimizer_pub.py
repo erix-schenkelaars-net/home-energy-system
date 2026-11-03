@@ -2136,5 +2136,41 @@ class TestAdaptiveFloor(unittest.TestCase):
 
 
 
+
+class TestWpPlanInLoad(unittest.TestCase):
+    """wp_control's planned heat-pump electricity replaces the estimated heat-pump share of the load."""
+
+    def test_swaps_the_heat_pump_share(self):
+        load, res = mod.apply_wp_plan(0.50, 0.20, 0.35)
+        self.assertAlmostEqual(load, 0.65)
+        self.assertAlmostEqual(res, 0.35)
+
+    def test_no_plan_leaves_the_estimate(self):
+        self.assertEqual(mod.apply_wp_plan(0.50, 0.20, None), (0.50, 0.20))
+
+    def test_never_below_the_floor(self):
+        load, _ = mod.apply_wp_plan(0.10, 0.40, 0.0)
+        self.assertAlmostEqual(load, 0.05 * mod.SLOT_H)
+
+    def _conn(self, made, rows):
+        cur = MagicMock()
+        cur.fetchone.return_value = (made,)
+        cur.fetchall.return_value = rows
+        conn = MagicMock(); conn.cursor.return_value = cur
+        return conn
+
+    def test_fresh_plan_is_used(self):
+        now = datetime(2026, 11, 3, 13, 0)
+        plan = mod.load_wp_plan(self._conn(now - timedelta(minutes=4), [(now, 0.25)]), now)
+        self.assertEqual(plan, {now: 0.25})
+
+    def test_stale_plan_is_ignored(self):
+        now = datetime(2026, 11, 3, 13, 0)
+        self.assertEqual(mod.load_wp_plan(self._conn(now - timedelta(hours=2), [(now, 0.25)]), now), {})
+
+    def test_db_error_is_ignored(self):
+        conn = MagicMock(); conn.cursor.side_effect = RuntimeError("down")
+        self.assertEqual(mod.load_wp_plan(conn, datetime(2026, 11, 3, 13)), {})
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

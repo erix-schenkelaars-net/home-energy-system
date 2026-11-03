@@ -1434,6 +1434,45 @@ def load_nowcast_overlay(conn, now: datetime) -> dict:
         return {}
 
 
+# WP planner coordination (2026-11-03): wp_control writes its plan per quarter to wp_plan. Its planned
+# electricity replaces the heat pump's share of the load estimate, so the battery plans around what the
+# heat pump will actually do instead of its historical profile (the planner shifts heating in time).
+WP_PLAN_IN_LOAD     = os.environ.get("WP_PLAN_IN_LOAD", "1") not in ("0", "false", "False", "")
+WP_PLAN_MAX_AGE_MIN = 30     # wp_control rewrites it every 5 min; older = planner not running -> own estimate
+
+
+def load_wp_plan(conn, now: datetime) -> dict:
+    """Planned heat-pump electricity (kWh per quarter) from the newest wp_plan, {} when disabled,
+    missing or older than WP_PLAN_MAX_AGE_MIN -- then the optimiser keeps its own estimate."""
+    if not WP_PLAN_IN_LOAD:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(created_at) FROM wp_plan")
+        made = cur.fetchone()[0]
+        if made is None or (now - made).total_seconds() > WP_PLAN_MAX_AGE_MIN * 60:
+            log.info("WP plan: geen vers plan (laatste=%s) — eigen WP-schatting", made)
+            cur.close()
+            return {}
+        cur.execute("SELECT slot_dt, elec_kwh FROM wp_plan WHERE slot_dt >= %s AND elec_kwh IS NOT NULL",
+                    (now - timedelta(minutes=15),))
+        plan = {r[0]: float(r[1]) for r in cur.fetchall()}
+        cur.close()
+        log.info("WP plan: %s, %d kwartieren, %.1f kWh gepland", made, len(plan), sum(plan.values()))
+        return plan
+    except Exception as exc:
+        log.warning("WP plan laden faalde: %s — eigen WP-schatting", exc)
+        return {}
+
+
+def apply_wp_plan(load_kwh: float, hp_reserved: float, plan_kwh: Optional[float]) -> tuple[float, float]:
+    """PURE: swap the estimated heat-pump share of a quarter's load for the planned one.
+    Returns (load, hp_reserved); unchanged without a plan for the quarter."""
+    if plan_kwh is None:
+        return load_kwh, hp_reserved
+    return max(0.05 * SLOT_H, load_kwh - hp_reserved + plan_kwh), plan_kwh
+
+
 def nowcast_blend_weight(lead_h: float) -> float:
     """Gewicht [0..1] van de nowcast in de PV-blend op lead-tijd `lead_h` (uren vooruit):
     1.0 tot PV_NOWCAST_BLEND_START_H, lineair aflopend naar 0.0 op PV_NOWCAST_HORIZON_H,
@@ -2425,6 +2464,7 @@ def optimise(  # noqa: C901
     replay_forecast: str = "schedule",
     nowcast_pv: Optional[dict] = None,
     hp_profile: Optional[dict] = None,
+    wp_plan: Optional[dict] = None,
 ) -> tuple[list[HourSlot], str]:
     if ref_temp_by_hour is None:
         ref_temp_by_hour = {}
@@ -2434,6 +2474,8 @@ def optimise(  # noqa: C901
         cooling_factors = {}
     if nowcast_pv is None:
         nowcast_pv = {}
+    if wp_plan is None:
+        wp_plan = {}
 
     dbg(2, DEBUG_OPT, "OPT",
         f"LP Optimiser  start_qtr_idx={start_qtr_idx}  "
@@ -2525,6 +2567,7 @@ def optimise(  # noqa: C901
         hp_reserved   = hp_reserved_kwh(hp_profile.get((d.weekday() >= 5, hour), 0.0),
                                         load_scale * cool_factor * LOAD_PESSIMISM,
                                         hp_correction, load)
+        load, hp_reserved = apply_wp_plan(load, hp_reserved, wp_plan.get(dt))
 
         cc, ghi_r = get_slot_weather_attrs(radiation, dt)
         gti_e, gti_w, pv_src = get_pv_forecast_details(radiation, dt)
@@ -3924,6 +3967,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     inday_factor = compute_inday_load_factor(conn, load_prof, now)
     cooling_facs = compute_cooling_factors(conn, load_prof, now, radiation)  # begrensd; {} = temp-blind
     nowcast_pv   = load_nowcast_overlay(conn, now)  # verse KNMI-nowcast voor de 0-4u PV-overlay
+    wp_plan      = load_wp_plan(conn, now) if replay_at is None else {}   # live WP-plan, niet in replays
 
     mode = "DYNAMIC_PRICE"
     log.info("Optimizer mode: %s", mode)
@@ -3961,6 +4005,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         replay_date       = replay_at.date() if replay_at else None,
         nowcast_pv        = nowcast_pv,
         hp_profile        = hp_prof,
+        wp_plan           = wp_plan,
     )
 
     if not schedule:

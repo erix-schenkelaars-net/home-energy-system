@@ -1049,6 +1049,40 @@ class TestComputeFlowTarget(unittest.TestCase):
         self.assertEqual(wp.compute_flow_target(self._dt(12), 0.0, self.cfg), 41.0)    # middag = geen preheat
 
 
+class TestPlannerFallback(unittest.TestCase):
+    """WP_PLANNER=live must never leave the heat pump without a decision: any planner failure
+    returns None so the loop keeps the rule-based one, and the failure is logged as mode 2."""
+
+    def _cfg(self, mode):
+        return dict(wp.build_cfg(), planner=mode, comfort="")
+
+    def test_failure_returns_none_and_logs_fallback(self):
+        import wp_planner
+        with patch.object(wp_planner, "run_live", side_effect=RuntimeError("no data")), \
+             patch.object(wp, "write_plan") as wplan:
+            self.assertIsNone(wp.plan_cycle(self._cfg("live"), datetime(2026, 11, 3, 13), 21.0, {}))
+        self.assertEqual(wplan.call_args.args[1], 2)
+
+    def test_shadow_failure_is_mode_0(self):
+        import wp_planner
+        with patch.object(wp_planner, "run_live", side_effect=RuntimeError("x")), \
+             patch.object(wp, "write_plan") as wplan:
+            wp.plan_cycle(self._cfg("shadow"), datetime(2026, 11, 3, 13), 21.0, {})
+        self.assertEqual(wplan.call_args.args[1], 0)
+
+    def test_success_returns_the_decision(self):
+        import wp_planner
+        dec = {"heat": True, "flow": 40.0, "q": 3.0, "elec": 0.7, "room_next": 21.2, "room_sp": 21.5}
+        res = {"on": [1] * 48, "Q": [3.0] * 48, "elec": [0.7] * 48, "room": [21.2] * 48}
+        diag = {"tm": 20.8, "running": True, "off_min": 0, "bias": 0.3, "cost": 4.0, "slots": 144,
+                "times": [datetime(2026, 11, 3, 13)] * 48}
+        with patch.object(wp_planner, "run_live", return_value=(dec, res, diag)), patch.object(wp, "write_plan"):
+            self.assertEqual(wp.plan_cycle(self._cfg("live"), datetime(2026, 11, 3, 13), 21.0, {}), dec)
+
+    def test_planner_default_is_off(self):
+        self.assertEqual(wp.build_cfg()["planner"], "off")
+
+
 if __name__ == "__main__":
     unittest.main()
 
