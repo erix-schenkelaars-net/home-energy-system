@@ -251,7 +251,26 @@ CREATE TABLE IF NOT EXISTS `wp_plan` (
   `room_c`     float      DEFAULT NULL COMMENT 'room the plan expects at the end of the quarter',
   `on_flag`    tinyint(1) DEFAULT NULL COMMENT '1 = heat pump planned on',
   `created_at` datetime   NOT NULL COMMENT 'when this plan was made',
+  `tmin_c`     float      DEFAULT NULL COMMENT 'comfort floor the plan had to keep (WP_COMFORT_MIN, bump/lowering included), NULL = none',
+  `price_eur_kwh` float   DEFAULT NULL COMMENT 'price the planner used (as known then: proxy before day-ahead is published)',
+  `t_out_c`    float      DEFAULT NULL COMMENT 'outside temperature the planner used (KNMI forecast, bias-corrected to sensor 5)',
   PRIMARY KEY (`slot_dt`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- wp_plan_snapshot: the WP plan as it stood at 00:00, 06:00, 12:00 and 18:00 (first cycle of each
+-- 6 h block). wp_plan is overwritten every 5 min, so only these copies show what the planner
+-- expected hours ahead -- the real test of the house model ("planned at 06:00" vs measured).
+CREATE TABLE IF NOT EXISTS `wp_plan_snapshot` (
+  `snap_dt`       datetime   NOT NULL COMMENT 'start of the 6 h block the copy was taken in',
+  `slot_dt`       datetime   NOT NULL COMMENT 'quarter start',
+  `heat_kwh`      float      DEFAULT NULL,
+  `elec_kwh`      float      DEFAULT NULL,
+  `room_c`        float      DEFAULT NULL,
+  `on_flag`       tinyint(1) DEFAULT NULL,
+  `tmin_c`        float      DEFAULT NULL,
+  `price_eur_kwh` float      DEFAULT NULL,
+  `t_out_c`       float      DEFAULT NULL,
+  PRIMARY KEY (`snap_dt`, `slot_dt`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE IF NOT EXISTS `battery_schedule` (

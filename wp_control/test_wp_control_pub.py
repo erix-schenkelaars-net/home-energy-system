@@ -1049,6 +1049,15 @@ class TestComputeFlowTarget(unittest.TestCase):
         self.assertEqual(wp.compute_flow_target(self._dt(12), 0.0, self.cfg), 41.0)    # middag = geen preheat
 
 
+class TestPlanSnapshot(unittest.TestCase):
+    def test_six_hour_blocks(self):
+        at = lambda h, m: wp.snapshot_due(datetime(2026, 11, 3, h, m, 7))
+        self.assertEqual(at(0, 3), datetime(2026, 11, 3, 0, 0))
+        self.assertEqual(at(5, 59), datetime(2026, 11, 3, 0, 0))
+        self.assertEqual(at(6, 0), datetime(2026, 11, 3, 6, 0))
+        self.assertEqual(at(23, 55), datetime(2026, 11, 3, 18, 0))
+
+
 class TestPlannerFallback(unittest.TestCase):
     """WP_PLANNER=live must never leave the heat pump without a decision: any planner failure
     returns None so the loop keeps the rule-based one, and the failure is logged as mode 2."""
@@ -1075,9 +1084,13 @@ class TestPlannerFallback(unittest.TestCase):
         dec = {"heat": True, "flow": 40.0, "q": 3.0, "elec": 0.7, "room_next": 21.2, "room_sp": 21.5}
         res = {"on": [1] * 48, "Q": [3.0] * 48, "elec": [0.7] * 48, "room": [21.2] * 48}
         diag = {"tm": 20.8, "running": True, "off_min": 0, "bias": 0.3, "cost": 4.0, "slots": 144,
-                "times": [datetime(2026, 11, 3, 13)] * 48}
+                "times": [datetime(2026, 11, 3, 13)] * 48,
+                "inputs": {"tmin": [21.7] * 48, "price": [0.4] * 48, "t_out": [9.7] * 48}}
         with patch.object(wp_planner, "run_live", return_value=(dec, res, diag)), patch.object(wp, "write_plan"):
-            self.assertEqual(wp.plan_cycle(self._cfg("live"), datetime(2026, 11, 3, 13), 21.0, {}), dec)
+            got = wp.plan_cycle(self._cfg("live"), datetime(2026, 11, 3, 13), 21.0, {})
+        self.assertEqual({k: got[k] for k in dec}, dec)
+        self.assertEqual(got["mass"], 20.8)
+        self.assertEqual(got["heatplan"]["q_now"], 3.0)
 
     def test_planner_default_is_off(self):
         self.assertEqual(wp.build_cfg()["planner"], "off")
@@ -1155,11 +1168,29 @@ class TestHaTelemetry(unittest.TestCase):
         wp.publish_ha(c, {"setpoint": 21.5}, with_discovery=True)
         topics = [call.args[0] for call in wp.mqtt_publish.single.call_args_list]
         self.assertEqual(topics[-1], wp.HA_STATE_TOPIC)
-        self.assertEqual(len(topics), len(wp.HA_SENSORS) + 2)    # + dagplan-discovery
+        self.assertEqual(len(topics), len(wp.HA_SENSORS) + 3)    # + dagplan- en warmteplan-discovery
         wp.mqtt_publish.single.reset_mock()
         wp.publish_ha(c, {"setpoint": 21.5}, plan={"now": 21.5, "times": [], "setpoints": []})
         topics = [call.args[0] for call in wp.mqtt_publish.single.call_args_list]
         self.assertEqual(topics, [wp.HA_STATE_TOPIC, wp.HA_PLAN_TOPIC])
+        wp.mqtt_publish.single.reset_mock()
+        wp.publish_ha(c, {"setpoint": 21.5}, heatplan={"q_now": 3.0})
+        topics = [call.args[0] for call in wp.mqtt_publish.single.call_args_list]
+        self.assertEqual(topics, [wp.HA_STATE_TOPIC, wp.HA_HEATPLAN_TOPIC])
+
+    def test_heatplan_payload_and_state_fields(self):
+        t0 = datetime(2026, 11, 3, 13)
+        res = {"Q": [3.04, 2.5], "elec": [0.6912, 0.55], "room": [21.81, 21.9]}
+        diag = {"times": [t0, t0 + timedelta(minutes=15)],
+                "inputs": {"tmin": [21.7, None], "price": [0.3912, 0.4], "t_out": [9.73, 9.8]}}
+        pl = wp.heatplan_payload(res, diag, t0)
+        self.assertEqual(pl["q_now"], 3.04)
+        self.assertEqual(pl["times"], ["2026-11-03T13:00", "2026-11-03T13:15"])
+        self.assertEqual(pl["tmin"], [21.7, None])
+        self.assertEqual(pl["elec"], [0.691, 0.55])                 # kW electricity, for "planned energy today"
+        st = wp.ha_state(21.5, 21.8, 9.7, 38.0, 1.0, 0.4, 42.9, True, planned={"q": 3.04, "room_next": 21.81, "mass": 20.72},
+                         planner_mode=1)
+        self.assertEqual((st["planner_mode"], st["plan_q"], st["plan_room"], st["plan_mass"]), (1, 3.04, 21.81, 20.72))
 
 
 class TestBumpBetweenCycles(unittest.TestCase):

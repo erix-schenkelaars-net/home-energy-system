@@ -40,7 +40,7 @@ PENALTY_RAMP_SLOTS = 8       # first 2 h: comfort penalty AND margin ramp up fro
 BIAS_HOURS = 6               # forecast-vs-sensor offset measured over this many hours ...
 BIAS_DECAY_H = 12            # ... and faded out over the horizon with this time constant
 TANGENTS = tuple(x / 2 for x in range(3, 21))   # 1.5 .. 10 kW every 0.5: coarser lines made the plan stick to their kinks
-DEFAULT_COMFORT = "07:00-09:00=20.8,09:00-13:00=21.3,13:00-17:30=21.7,17:30-01:00=20.5,01:00-07:00=18.0"
+DEFAULT_COMFORT = "07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=18.0"
 
 
 # ---------------------------------------------------------------- comfort bands

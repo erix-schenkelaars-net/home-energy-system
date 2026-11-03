@@ -1115,10 +1115,26 @@ def ensure_plan_columns(cfg):
                          slot_dt DATETIME NOT NULL PRIMARY KEY,
                          heat_kwh FLOAT, elec_kwh FLOAT, room_c FLOAT, on_flag TINYINT(1),
                          created_at DATETIME NOT NULL)""")
+        cur.execute("ALTER TABLE wp_plan ADD COLUMN IF NOT EXISTS tmin_c FLOAT DEFAULT NULL, "
+                    "ADD COLUMN IF NOT EXISTS price_eur_kwh FLOAT DEFAULT NULL, "
+                    "ADD COLUMN IF NOT EXISTS t_out_c FLOAT DEFAULT NULL")
+        cur.execute("""CREATE TABLE IF NOT EXISTS wp_plan_snapshot (
+                         snap_dt DATETIME NOT NULL, slot_dt DATETIME NOT NULL,
+                         heat_kwh FLOAT, elec_kwh FLOAT, room_c FLOAT, on_flag TINYINT(1),
+                         tmin_c FLOAT, price_eur_kwh FLOAT, t_out_c FLOAT,
+                         PRIMARY KEY (snap_dt, slot_dt))""")
         c.commit(); cur.close(); c.close()
-        dbg("PLAN", "schema OK (energy.wp_plan_* + table wp_plan)")
+        dbg("PLAN", "schema OK (energy.wp_plan_* + tables wp_plan, wp_plan_snapshot)")
     except Exception as e:
         dbg("PLAN", f"ensure_plan_columns faalde: {e}")
+
+
+SNAPSHOT_HOURS = 6     # keep a copy of the plan at 00:00, 06:00, 12:00 and 18:00
+
+
+def snapshot_due(now):
+    """PURE: the 6-hour block the plan of `now` belongs to (its first cycle in a block is the copy)."""
+    return now.replace(hour=now.hour - now.hour % SNAPSHOT_HOURS, minute=0, second=0, microsecond=0)
 
 
 def write_plan(cfg, mode, dec=None, res=None, diag=None, now=None):
@@ -1133,11 +1149,23 @@ def write_plan(cfg, mode, dec=None, res=None, diag=None, now=None):
                (mode, round(dec["q"], 3), round(dec["elec"], 3), round(dec["room_next"], 2), round(diag["tm"], 2))
         cur.execute(er.upsert_sql(cols, cfg["db_table"]), (er.bucket(now),) + vals)
         if res is not None:
+            inp = diag["inputs"]
+            rows = [(t, round(q * 0.25, 4), round(e * 0.25, 4), round(r, 2), int(o),
+                     tm, None if pr is None else round(pr, 4), None if to is None else round(to, 1))
+                    for t, q, e, r, o, tm, pr, to in zip(diag["times"], res["Q"], res["elec"], res["room"], res["on"],
+                                                         inp["tmin"], inp["price"], inp["t_out"])]
             cur.execute("DELETE FROM wp_plan WHERE slot_dt >= %s", (diag["times"][0],))
-            cur.executemany("INSERT INTO wp_plan (slot_dt, heat_kwh, elec_kwh, room_c, on_flag, created_at) "
-                            "VALUES (%s,%s,%s,%s,%s,%s)",
-                            [(t, round(q * 0.25, 4), round(e * 0.25, 4), round(r, 2), int(o), now)
-                             for t, q, e, r, o in zip(diag["times"], res["Q"], res["elec"], res["room"], res["on"])])
+            cur.executemany("INSERT INTO wp_plan (slot_dt, heat_kwh, elec_kwh, room_c, on_flag, tmin_c, price_eur_kwh, "
+                            "t_out_c, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            [row + (now,) for row in rows])
+            # every 6 h keep a copy of the plan as it stood: "what was expected" vs what happened
+            snap = snapshot_due(now)
+            cur.execute("SELECT 1 FROM wp_plan_snapshot WHERE snap_dt = %s LIMIT 1", (snap,))
+            if cur.fetchone() is None:
+                cur.executemany("INSERT INTO wp_plan_snapshot (snap_dt, slot_dt, heat_kwh, elec_kwh, room_c, on_flag, "
+                                "tmin_c, price_eur_kwh, t_out_c) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                                [(snap,) + row for row in rows])
+                dbg("PLAN", f"snapshot van het plan bewaard voor {snap:%d-%m %H:%M} ({len(rows)} kwartieren)")
         c.commit(); cur.close(); c.close()
     except Exception as e:
         dbg("PLAN", f"write_plan faalde: {e}")
@@ -1145,6 +1173,7 @@ def write_plan(cfg, mode, dec=None, res=None, diag=None, now=None):
 
 HA_STATE_TOPIC = "wp_control/state"
 HA_PLAN_TOPIC  = "wp_control/plan"
+HA_HEATPLAN_TOPIC = "wp_control/heatplan"   # planner: the plan per quarter (state = heat now, attributes = series)
 # (sleutel, naam, eenheid). HA leidt de entity-id af van device + naam (sensor.wp_control_setpoint_pi5,
 # sensor.wp_control_aanvoer_curve_p_i, ...) — een naam wijzigen verandert dus niets aan een bestaande id.
 HA_SENSORS = [
@@ -1161,7 +1190,13 @@ HA_SENSORS = [
     ("p", "Room-comp P", "°C"),
     ("i", "Room-comp I", "°C"),
     ("heat", "Warmtevraag (pi5)", None),
+    # planner (2026-11-03); mode: 0 shadow, 1 live, 2 live but fell back to the rules
+    ("planner_mode", "Planner mode", None),
+    ("plan_q", "Planner heat", "kW"),
+    ("plan_room", "Planner room", "°C"),
+    ("plan_mass", "Building mass", "°C"),
 ]
+HA_DEVICE_CLASS = {"°C": "temperature", "min": "duration", "kW": "power"}
 
 
 def ha_discovery_msgs():
@@ -1173,7 +1208,7 @@ def ha_discovery_msgs():
                 "device": {"identifiers": ["wp_control"], "name": "wp_control"}}
         if unit:
             conf.update(unit_of_measurement=unit, state_class="measurement",
-                        device_class="temperature" if unit == "°C" else "duration")
+                        device_class=HA_DEVICE_CLASS[unit])
         msgs.append((f"homeassistant/sensor/wp_control/{key}/config", json.dumps(conf)))
     # het dagplan: state = het geplande setpoint nu, attributen = de hele dag per kwartier
     plan = {"name": "Dagplan setpoint", "unique_id": "wp_control_day_plan",
@@ -1184,7 +1219,26 @@ def ha_discovery_msgs():
             "unit_of_measurement": "°C", "device_class": "temperature",
             "device": {"identifiers": ["wp_control"], "name": "wp_control"}}
     msgs.append(("homeassistant/sensor/wp_control/day_plan/config", json.dumps(plan)))
+    heat = {"name": "Heat plan", "unique_id": "wp_control_heat_plan",
+            "state_topic": HA_HEATPLAN_TOPIC, "value_template": "{{ value_json.q_now }}",
+            "json_attributes_topic": HA_HEATPLAN_TOPIC,
+            "json_attributes_template": "{{ {'times': value_json.times, 'q': value_json.q, 'elec': value_json.elec, "
+                                        "'room': value_json.room, "
+                                        "'tmin': value_json.tmin, 'price': value_json.price, "
+                                        "'t_out': value_json.t_out, 'made': value_json.made} | tojson }}",
+            "unit_of_measurement": "kW", "device_class": "power",
+            "device": {"identifiers": ["wp_control"], "name": "wp_control"}}
+    msgs.append(("homeassistant/sensor/wp_control/heat_plan/config", json.dumps(heat)))
     return msgs
+
+
+def heatplan_payload(res, diag, now):
+    """PURE: the planner's plan per quarter for the HA chart (local ISO times, rounded)."""
+    r2 = lambda xs, n=2: [None if x is None else round(x, n) for x in xs]
+    return {"q_now": round(res["Q"][0], 2), "made": now.isoformat(timespec="minutes"),
+            "times": [t.isoformat(timespec="minutes") for t in diag["times"]],
+            "q": r2(res["Q"]), "elec": r2(res["elec"], 3), "room": r2(res["room"]), "tmin": r2(diag["inputs"]["tmin"], 1),
+            "price": r2(diag["inputs"]["price"], 3), "t_out": r2(diag["inputs"]["t_out"], 1)}
 
 
 def day_plan(now, cfg, price_win):
@@ -1209,7 +1263,8 @@ def bump_minutes_left(ovr_state, now, key="ovr_until"):
     return int(-(-(until - now).total_seconds() // 60))
 
 
-def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_left=0, lower_left=0):
+def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_left=0, lower_left=0, planned=None,
+             planner_mode=None):
     """PUUR: de regel-tussenstappen voor het HA-dashboard. flow_p/flow_pi = curve + P (+ I), vóór de
     begrenzing op [flow_min, flow_cap]; flow_target is wat er echt naar de WP gaat. sp_nominal = wat
     de software nu wil zonder bump of verlaging (schema + prijsvenster)."""
@@ -1222,10 +1277,14 @@ def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_le
             "flow_base": r(base),
             "flow_p": r(base + p) if has_base else None,
             "flow_pi": r(base + p + i) if has_base else None,
-            "flow_target": r(flow), "p": r(p), "i": r(i), "heat": int(bool(heat))}
+            "flow_target": r(flow), "p": r(p), "i": r(i), "heat": int(bool(heat)),
+            "planner_mode": planner_mode,
+            "plan_q": None if planned is None else round(planned["q"], 2),
+            "plan_room": None if planned is None else round(planned["room_next"], 2),
+            "plan_mass": None if planned is None else round(planned.get("mass", float("nan")), 2)}
 
 
-def publish_ha(cfg, state, with_discovery=False, plan=None):
+def publish_ha(cfg, state, with_discovery=False, plan=None, heatplan=None):
     """Telemetrie naar HA (geen sturing -> niet gated door dry-run). retain: HA heeft na een herstart
     meteen de laatste waarden."""
     if with_discovery:
@@ -1234,6 +1293,8 @@ def publish_ha(cfg, state, with_discovery=False, plan=None):
     _mqtt_publish(HA_STATE_TOPIC, json.dumps(state), cfg, False, retain=True)
     if plan is not None:
         _mqtt_publish(HA_PLAN_TOPIC, json.dumps(plan), cfg, False, retain=True)
+    if heatplan is not None:
+        _mqtt_publish(HA_HEATPLAN_TOPIC, json.dumps(heatplan), cfg, False, retain=True)
 
 
 def command_wp(cfg, heat, flow, sp=None):
@@ -1284,6 +1345,7 @@ def plan_cycle(cfg, now, room, ovr_state):
                 f"KNMI-bias={bias}K -> {act}"
                 f" | kamer over 1u {res['room'][3]:.2f} | OTThing-sp {dec['room_sp']} | 12u {on_next} | €{diag['cost']:.2f}/{diag['slots'] / 4:.0f}u")
     write_plan(cfg, mode, dec, res, diag, now)
+    dec = dict(dec, mass=diag["tm"], heatplan=heatplan_payload(res, diag, now))
     return dec
 
 
@@ -1423,10 +1485,12 @@ def main():
         save_state(ovr_state, heat_state, i_state, datetime.now())
         p_term = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"], cfg["rc_neg_max"])
         plan = day_plan(now, cfg, price_win)
+        pmode = None if cfg["planner"] not in ("shadow", "live") else \
+            (0 if cfg["planner"] == "shadow" else (1 if planned is not None else 2))
         publish_ha(cfg, ha_state(sp, room, ot, base, p_term, i_term, flow, heat,
                                  plan["now"], bump_minutes_left(ovr_state, now),
-                                 bump_minutes_left(ovr_state, now, "und_until")),
-                   not ha_announced, plan)
+                                 bump_minutes_left(ovr_state, now, "und_until"), planned, pmode),
+                   not ha_announced, plan, None if planned is None else planned["heatplan"])
         ha_announced = True
         dbg("CTRL", f"[REGEL {'LIVE' if cfg['control_live'] else 'DROOG'}] kamer={room} "
                     f"setpoint={sp} (Honeywell {sp_now}) buiten={ot} -> curve={base}+boost={boost}"

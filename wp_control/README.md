@@ -227,7 +227,7 @@ Not yet: buffer tank, irradiance (PV stands in), frost.
 | Setting | Default | Meaning |
 |---|---|---|
 | `WP_PLANNER` | `off` | `off` = rules only; `shadow` = the planner plans every cycle and logs (`energy.wp_plan_*`, table `wp_plan`, `[PLAN]` in the log) while the rules drive the heat pump; `live` = the plan drives it and the rules take over on any planner error (logged as mode 2). In live the OTThing room setpoint follows the planned room (its own suspend at setpoint+1.5 must not fight a deliberately warm house) |
-| `WP_COMFORT_MIN` | `07:00-09:00=20.8,09:00-13:00=21.3,13:00-17:30=21.7,17:30-01:00=20.5,01:00-07:00=18.0` | hard floor for the room per time band (`HH:MM-HH:MM=temp`, may cross midnight; no band = no requirement) |
+| `WP_COMFORT_MIN` | `07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=18.0` | hard floor for the room per time band (`HH:MM-HH:MM=temp`, may cross midnight; no band = no requirement) |
 
 The planner needs numpy/scipy (in the wp_control image since 2026-11-03); wp_control imports it only
 when `WP_PLANNER` is shadow or live, so the rules run without it. Fitting and backtests also run in
