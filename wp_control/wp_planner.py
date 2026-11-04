@@ -350,22 +350,61 @@ def quarter(t):
     return t.replace(minute=t.minute - t.minute % 15, second=0, microsecond=0)
 
 
-def read_run_state(db, now):
-    """(running, minutes since the compressor last ran, supply temperature now) from the last 3 h."""
-    conn = _db(db)
-    cur = conn.cursor()
-    cur.execute("""SELECT ts, sparrow_compressor_speed_rpm, sparrow_input_power_w, sparrow_water_outlet_temp_c
-                   FROM energy WHERE ts >= %s ORDER BY ts""", (now - timedelta(hours=3),))
-    rows = cur.fetchall()
-    conn.close()
-    run = lambda r: (r[1] or 0) > 0 or (r[2] or 0) > 150
+def run_state_from_rows(rows, now):
+    """PURE: (running, minutes since the compressor last ran, supply now, minutes the current run
+    has lasted, water temperature at the start of it) from energy rows (ts, flame, ot_flow, rpm,
+    input_w, sparrow_outlet), oldest first. on_min is None while not running; start_water is then
+    the water now (what a start would begin from), else the supply of the last row before the run.
+
+    The OTThing (local, live) leads: flame = compressor on (in Repeater the 'boiler' is the heat
+    pump; matches rpm>0 on 99.5 % of rows 10-27..11-03). The Sparrow fields come through the cloud
+    and HA's Weheat integration, which freezes after an HA restart (2026-11-03 17:20: the last
+    'heating' row repeated for 45 min, so the planner believed a stopped pump still ran and
+    modelled no restart lockout). They are only a fallback for a row without OTThing data.
+
+    A row with neither is skipped: it is the new 5-min row that another service has just opened,
+    before read_otthing and transfer_p60 fill it (~15 s past the bucket). Read as "not running" it
+    made the planner stop a running pump itself (2026-11-04 13:10:01 "stil 5 min" -> OFF, an hour
+    of lockout in the cheapest hour, then a restart at 50 °C); the cycle drifts ~2 s, so it lands
+    in that gap for half an hour roughly every 11 h."""
+    def has_data(r):
+        return r[1] is not None or r[3] is not None or r[4] is not None
+
+    def run(r):
+        if r[1] is not None:
+            return bool(r[1])
+        return (r[3] or 0) > 0 or (r[4] or 0) > 150
+
+    rows = [r for r in rows if has_data(r)]
     if not rows:
-        return False, 999.0, None
+        return False, 999.0, None, None, None
     running = run(rows[-1])
     last_run = next((r[0] for r in reversed(rows) if run(r)), None)
     off_min = 0.0 if running else ((now - last_run).total_seconds() / 60 if last_run else 999.0)
-    outlet = next((float(r[3]) for r in reversed(rows) if r[3] is not None), None)
-    return running, off_min, outlet
+    outlet = next((float(r[2] if r[2] is not None else r[5]) for r in reversed(rows)
+                   if r[2] is not None or r[5] is not None), None)
+    water = lambda r: r[2] if r[2] is not None else r[5]
+    on_min, start_water = None, outlet
+    if running:
+        i = len(rows) - 1
+        while i > 0 and run(rows[i - 1]):
+            i -= 1
+        on_min = max(0.0, (now - rows[i][0]).total_seconds() / 60)
+        before = [water(r) for r in rows[:i] if water(r) is not None]
+        start_water = float(before[-1]) if before else (float(water(rows[i])) if water(rows[i]) is not None else None)
+    return running, off_min, outlet, on_min, start_water
+
+
+def read_run_state(db, now):
+    """(running, minutes off, supply now, minutes on, water at start) from the last 3 h, see run_state_from_rows."""
+    conn = _db(db)
+    cur = conn.cursor()
+    cur.execute("""SELECT ts, honeywell_ot_boiler_flame, honeywell_ot_boiler_flow_t_c,
+                          sparrow_compressor_speed_rpm, sparrow_input_power_w, sparrow_water_outlet_temp_c
+                   FROM energy WHERE ts >= %s ORDER BY ts""", (now - timedelta(hours=3),))
+    rows = cur.fetchall()
+    conn.close()
+    return run_state_from_rows(rows, now)
 
 
 def build_live_inputs(rows, now, bands, recent, bump=None, lower=None):
@@ -407,9 +446,11 @@ def build_live_inputs(rows, now, bands, recent, bump=None, lower=None):
 def live_decision(params, res, room, outlet, running, flow_min, flow_cap):
     """PURE: what to send the heat pump for the current quarter of a plan.
 
-    on  -> heat with the supply the emitter needs for the planned Q; while the pump already runs,
-           never ask below (supply - 1.5 K): that is how the P60 stops itself (its supply overshoots
-           the target when the house needs less than its minimum), and a stop costs an hour
+    on  -> heat with the supply the emitter needs for the planned Q, nothing else. (A floor of
+           "measured supply - 1.5 K" to keep the P60 from stopping itself was tried on 2026-11-03
+           and ratcheted: the P60 runs ~1.5-2 K above its target, so the target chased the supply
+           up from 41.7 to 46.3 °C in 90 min while the plan asked less heat. Never feed the
+           measured supply back into the target.)
     off -> off.
     room_sp is sent as the OTThing room setpoint: the OTThing suspends heating above setpoint+1.5,
     so it must follow the PLANNED room (which may sit well above the comfort floor), not the floor."""
@@ -417,10 +458,7 @@ def live_decision(params, res, room, outlet, running, flow_min, flow_cap):
     on, q = bool(res["on"][0]), res["Q"][0]
     flow = None
     if on:
-        flow = hm.flow_for_heat(w, room, q)
-        if running and outlet is not None:
-            flow = max(flow, outlet - 1.5)
-        flow = round(min(max(flow, flow_min), flow_cap), 1)
+        flow = round(min(max(hm.flow_for_heat(w, room, q), flow_min), flow_cap), 1)
     room_sp = round(max(res["room"][:8]) * 2) / 2      # next 2 h, OTThing takes half degrees
     return {"heat": on, "flow": flow, "q": q, "elec": res["elec"][0], "room_next": res["room"][0],
             "room_sp": room_sp}
@@ -446,14 +484,14 @@ def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flo
     if any(x is None for x in rooms[-96:]) or room_now is None:
         raise RuntimeError("room history incomplete")
     tm = hm.observe_mass(p, rooms, outs, dt=DT)[-1]
-    running, off_min, outlet = read_run_state(db, now)
+    running, off_min, outlet, on_min, start_water = read_run_state(db, now)
     recent = [(r["t_out"], r["t_out_fc"]) for r in past[-BIAS_HOURS * 4:]]
     inp = build_live_inputs(fut, now, bands, recent, bump, lower)
     res = plan(params, room_now, tm, inp, on0=running, off_minutes=off_min)
     if "on" not in res:
         raise RuntimeError(f"solver: {res.get('message')}")
     dec = live_decision(params, res, room_now, outlet, running, flow_min, flow_cap)
-    diag = {"tm": tm, "running": running, "off_min": off_min, "outlet": outlet, "slots": n,
+    diag = {"tm": tm, "running": running, "off_min": off_min, "on_min": on_min, "start_water": start_water, "outlet": outlet, "slots": n,
             "bias": inp["t_out"][0] - fut[0]["t_out_fc"] if fut[0]["t_out_fc"] is not None else None,
             "cost": res["cost"], "times": [r["t"] for r in fut], "inputs": inp}
     return dec, res, diag

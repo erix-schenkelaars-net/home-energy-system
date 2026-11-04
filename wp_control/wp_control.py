@@ -254,6 +254,50 @@ def limit_flow_drop(flow, state, max_drop):
     return flow
 
 
+def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=None):
+    """PUUR: begrens het aanvoerdoel van de planner tijdens een (her)start.
+
+    Wat de P60 laat doorschieten is het GAT tussen doel en water bij de start, niet de hoogte van het
+    doel: 11-02 18:05 gat ~5 K -> 2,0 kW, geen doorschieten; 11-03 21:10 gat ~3 K -> 1,4 kW; 11-04
+    05:15 gat ~13 K -> 7,8 kW, aanvoer 4 K over het doel; 14:10 gat ~22 K -> 9,7 kW. Twee plafonds:
+
+    1. oploop (hele run): water bij de start + softstart_gap, daarna softstart_rate °C per 5 min
+       looptijd. Het water wordt één keer gemeten (bij de start, uit de DB) en daarna loopt het
+       plafond alleen met de tijd op: de aanvoer die de P60 maakt gaat niet terug in het doel (geen
+       ratel zoals 11-03). Zodra het plafond het planner-doel passeert doet het niets meer.
+    2. tekort (start + eerste softstart_min min): stooklijn(buiten) + softstart_kp * (gewenst -
+       kamer), gewenst = de kamer die de planner over een uur wil; hooguit softstart_neg °C onder de
+       stooklijn.
+    Vóór de start (WP nog uit) nooit onder water + gap, anders ziet de P60 geen vraag en start niet
+    (11-03 20:10: doel 29,5 bij water 34 -> een uur geen start). Nooit onder flow_min, nooit boven
+    het doel van de planner (dit kan alleen verlagen). Geeft (flow, toelichting of None)."""
+    if flow is None or room is None or cfg["softstart_min"] <= 0:
+        return flow, None
+    t = 0.0 if not running else (on_min if on_min is not None else 1e9)
+    caps, why = [], []
+    if start_water is not None:
+        # na een lange stilstand meet de OTThing het afgekoelde water in de buitenunit (13-15 °C,
+        # nachten 10-24/11-02/11-03), niet het radiatorwater binnen, dat niet onder de kamer zakt
+        start_water = max(start_water, room)
+        ramp = start_water + cfg["softstart_gap"] + cfg["softstart_rate"] * t / 5
+        caps.append(ramp)
+        why.append(f"oploop water {start_water} +{cfg['softstart_gap']:g} +{cfg['softstart_rate']:g}/5min = {ramp:.1f}")
+    if base is not None and want is not None and t < cfg["softstart_min"]:
+        boost = max(-cfg["softstart_neg"], cfg["softstart_kp"] * (want - room))
+        caps.append(base + boost)
+        why.append(f"stooklijn {base} {boost:+.1f} (gewenst {want:.2f} - kamer {room}) = {base + boost:.1f}")
+    if not caps:
+        return flow, None
+    cap = min(caps)
+    if not running and start_water is not None:
+        cap = max(cap, start_water + cfg["softstart_gap"])
+    cap = round(max(cfg["flow_min"], cap), 1)
+    if cap >= flow:
+        return flow, None
+    phase = "start" if not running else f"run {t:.0f} min"
+    return cap, f"zachte herstart ({phase}): {flow} -> {cap}°C | " + " | ".join(why)
+
+
 def build_cfg():
     base = os.environ.get("MQTT_OTTHING_TOPIC", "otthing/CE150C/state")
     base = base[:-len("/state")] if base.endswith("/state") else base
@@ -332,6 +376,12 @@ def build_cfg():
         "flow_min": float(os.environ.get("WP_FLOW_MIN", "28")),
         "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
         "flow_max_drop": float(os.environ.get("WP_FLOW_MAX_DROP", "1.0")),  # °C per cyclus omlaag
+        # zachte herstart (2026-11-04, alleen planner-live): zie soft_start_flow. 0 min = uit.
+        "softstart_min": float(os.environ.get("WP_SOFTSTART_MIN", "60")),
+        "softstart_kp":  float(os.environ.get("WP_SOFTSTART_KP", "4")),     # °C aanvoer per K tekort
+        "softstart_neg": float(os.environ.get("WP_SOFTSTART_NEG", "3")),    # max °C onder de stooklijn
+        "softstart_gap": float(os.environ.get("WP_SOFTSTART_GAP", "3")),    # startdoel = water + gap
+        "softstart_rate": float(os.environ.get("WP_SOFTSTART_RATE", "1")),  # °C oploop per 5 min looptijd
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
         "out_max":   float(os.environ.get("WP_OUTSIDE_MAX", "50")),
@@ -1345,7 +1395,9 @@ def plan_cycle(cfg, now, room, ovr_state):
                 f"KNMI-bias={bias}K -> {act}"
                 f" | kamer over 1u {res['room'][3]:.2f} | OTThing-sp {dec['room_sp']} | 12u {on_next} | €{diag['cost']:.2f}/{diag['slots'] / 4:.0f}u")
     write_plan(cfg, mode, dec, res, diag, now)
-    dec = dict(dec, mass=diag["tm"], heatplan=heatplan_payload(res, diag, now))
+    dec = dict(dec, mass=diag["tm"], heatplan=heatplan_payload(res, diag, now),
+               room_1h=res["room"][3], running=diag["running"], on_min=diag.get("on_min"),
+               start_water=diag.get("start_water"))
     return dec
 
 
@@ -1477,6 +1529,12 @@ def main():
             if cfg["planner"] == "live":
                 if planned is not None:
                     heat, flow, sp_cmd = planned["heat"], planned["flow"], planned["room_sp"]
+                    if heat:
+                        flow, why = soft_start_flow(flow, base, room, planned["room_1h"],
+                                                    planned["running"], planned["on_min"], cfg,
+                                                    planned["start_water"])
+                        if why:
+                            dbg("PLAN", why)
                     heat_state["heat"] = heat            # the rules resume from the real state on fallback
                     heat_state["flow"] = flow
                 else:

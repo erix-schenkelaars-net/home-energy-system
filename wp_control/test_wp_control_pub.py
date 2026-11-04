@@ -1091,9 +1091,94 @@ class TestPlannerFallback(unittest.TestCase):
         self.assertEqual({k: got[k] for k in dec}, dec)
         self.assertEqual(got["mass"], 20.8)
         self.assertEqual(got["heatplan"]["q_now"], 3.0)
+        # what the soft start needs: the planned room in 1 h and the run state
+        self.assertEqual((got["room_1h"], got["running"], got["on_min"], got["start_water"]), (21.2, True, None, None))
 
     def test_planner_default_is_off(self):
         self.assertEqual(wp.build_cfg()["planner"], "off")
+
+
+class TestSoftStart(unittest.TestCase):
+    """Na een stop: aanvoerdoel <= stooklijn + kp*(gewenst - kamer), zodat de P60 niet op vol
+    vermogen herstart (2026-11-04 14:05: doel 49,5 bij koud water -> 9,6 kW)."""
+
+    def _cfg(self, **over):
+        return dict(wp.build_cfg(), **over)
+
+    def test_restart_of_2026_11_04_1405(self):
+        # curve 37.8 at 10.2 °C outside, planner wants 21.84 in 1 h, room 21.6, about to start
+        flow, why = wp.soft_start_flow(49.5, 37.8, 21.6, 21.84, False, None, self._cfg())
+        self.assertAlmostEqual(flow, 38.8)            # 37.8 + 4 * 0.24 = 38.76
+        self.assertIn("zachte herstart", why)
+
+    def test_applies_during_the_first_hour_of_a_run(self):
+        flow, _ = wp.soft_start_flow(50.0, 38.0, 21.0, 21.5, True, 25.0, self._cfg())
+        self.assertEqual(flow, 40.0)
+
+    def test_ends_after_softstart_min(self):
+        self.assertEqual(wp.soft_start_flow(50.0, 38.0, 21.0, 21.5, True, 60.0, self._cfg()), (50.0, None))
+
+    def test_big_deficit_allows_more_but_never_above_the_plan(self):
+        # bump: 1.5 K short -> 38 + 6 = 44, under the plan's 50
+        self.assertEqual(wp.soft_start_flow(50.0, 38.0, 20.5, 22.0, False, None, self._cfg())[0], 44.0)
+        # the plan already asks less than the cap -> untouched
+        self.assertEqual(wp.soft_start_flow(36.0, 38.0, 20.5, 22.0, False, None, self._cfg()), (36.0, None))
+
+    def test_warm_house_stays_close_to_the_curve_so_the_pump_still_starts(self):
+        # room 1 K above the planned room: at most softstart_neg (3) under the curve, never below flow_min
+        self.assertEqual(wp.soft_start_flow(45.0, 38.0, 22.0, 21.0, False, None, self._cfg())[0], 35.0)
+        self.assertEqual(wp.soft_start_flow(45.0, 29.0, 22.0, 21.0, False, None, self._cfg())[0], 28.0)
+
+    def test_missing_inputs_or_disabled_leave_the_plan(self):
+        c = self._cfg()
+        self.assertEqual(wp.soft_start_flow(50.0, None, 21.0, 21.5, False, None, c), (50.0, None))
+        self.assertEqual(wp.soft_start_flow(50.0, 38.0, None, 21.5, False, None, c), (50.0, None))
+        self.assertEqual(wp.soft_start_flow(None, 38.0, 21.0, 21.5, False, None, c), (None, None))
+        self.assertEqual(wp.soft_start_flow(50.0, 38.0, 21.0, 21.5, False, None, self._cfg(softstart_min=0)),
+                         (50.0, None))
+
+    def test_defaults(self):
+        c = wp.build_cfg()
+        self.assertEqual((c["softstart_min"], c["softstart_kp"], c["softstart_neg"]), (60.0, 4.0, 3.0))
+        self.assertEqual((c["softstart_gap"], c["softstart_rate"]), (3.0, 1.0))
+
+    # ---- oploop vanaf het water bij de start
+    def test_start_begins_just_above_the_water(self):
+        # 14:05 case: water 28.2, plan 49.5, curve cap 38.8 -> start at 31.2 (3 K gap, ~1.4-2 kW)
+        flow, why = wp.soft_start_flow(49.5, 37.8, 21.6, 21.84, False, None, self._cfg(), 28.2)
+        self.assertEqual(flow, 31.2)
+        self.assertIn("oploop", why)
+
+    def test_ramp_rises_one_degree_per_five_minutes_until_the_curve_cap(self):
+        c = self._cfg()
+        seen = [wp.soft_start_flow(49.5, 37.8, 21.6, 21.84, True, m, c, 28.2)[0] for m in (0, 5, 20, 40, 55)]
+        self.assertEqual(seen, [31.2, 32.2, 35.2, 38.8, 38.8])
+
+    def test_ramp_keeps_limiting_after_the_deficit_window(self):
+        # 70 min in: curve cap gone, ramp 28.2 + 3 + 14 = 45.2 still under the plan's 49.5
+        self.assertEqual(wp.soft_start_flow(49.5, 37.8, 21.6, 21.84, True, 70.0, self._cfg(), 28.2)[0], 45.2)
+        # 100 min in: ramp past the plan -> the plan's own target
+        self.assertEqual(wp.soft_start_flow(49.5, 37.8, 21.6, 21.84, True, 100.0, self._cfg(), 28.2), (49.5, None))
+
+    def test_before_the_start_never_below_the_water(self):
+        # warm water (short stop), warm room: the curve cap (35) would sit under the water (38) and
+        # the P60 would see no demand -> at least water + gap before the start
+        self.assertEqual(wp.soft_start_flow(45.0, 38.0, 22.0, 21.0, False, None, self._cfg(), 38.0)[0], 41.0)
+
+    def test_cold_outdoor_water_after_a_long_stop_starts_from_the_room(self):
+        # 11-03 04:10: the OTThing read 15.1 °C after a night off; radiators indoors sit at the room.
+        # From 15.1 the target would sit at flow_min (28) for ~50 min; from the room (21.5) it climbs
+        c = self._cfg()
+        self.assertEqual(wp.soft_start_flow(41.6, 39.0, 21.5, 21.6, True, 20.0, c, 15.1)[0], 28.5)
+        self.assertEqual(wp.soft_start_flow(41.6, 39.0, 21.5, 21.6, True, 0.0, c, 15.1)[0], 28.0)
+
+    def test_never_above_the_plan(self):
+        c = self._cfg()
+        for water in (20.0, 25.0, 27.0, 35.0, 45.0):
+            for running, m in ((False, None), (True, 0.0), (True, 30.0), (True, 90.0)):
+                self.assertLessEqual(wp.soft_start_flow(30.0, 38.0, 21.0, 21.2, running, m, c, water)[0], 30.0)
+        # water 27 -> start cap exactly the plan's 30: untouched
+        self.assertEqual(wp.soft_start_flow(30.0, 38.0, 21.0, 21.2, False, None, c, 27.0), (30.0, None))
 
 
 if __name__ == "__main__":

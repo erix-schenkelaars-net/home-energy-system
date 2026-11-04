@@ -170,6 +170,77 @@ class TestLiveInputs(unittest.TestCase):
         self.assertEqual(low["tmin"][0], 19.0)
 
 
+class TestRunState(unittest.TestCase):
+    """Running / off-time / supply from energy rows: (ts, flame, ot_flow, rpm, input_w, sparrow_outlet)."""
+    NOW = datetime(2026, 11, 3, 18, 2)
+
+    def rows(self, spec):
+        # spec: list of (hh:mm, flame, ot_flow, rpm, input_w, sparrow_outlet)
+        return [(datetime(2026, 11, 3, int(t[:2]), int(t[3:])),) + tuple(r) for t, *r in spec]
+
+    def test_frozen_sparrow_feed_does_not_keep_the_pump_running(self):
+        # 2026-11-03: HA froze the Weheat feed at 'heating' 17:20..18:00; the OTThing saw the stop at 17:38
+        frozen = (5459, 2394, 44.1)
+        rows = self.rows([("17:30", 1, 46.3, *frozen), ("17:35", 1, 47.2, *frozen),
+                          ("17:40", 0, 45.8, *frozen), ("17:45", 0, 44.8, *frozen),
+                          ("17:50", 0, 43.8, *frozen), ("17:55", 0, 43.1, *frozen),
+                          ("18:00", 0, 42.3, *frozen)])
+        running, off_min, outlet, on_min, start_water = wpp.run_state_from_rows(rows, self.NOW)
+        self.assertFalse(running)
+        self.assertIsNone(on_min)
+        self.assertEqual(start_water, 42.3)             # not running: a start begins from the water now
+        self.assertAlmostEqual(off_min, 27.0)          # since the last flame row (17:35), not 0
+        self.assertEqual(outlet, 42.3)                  # OTThing supply, not the frozen 44.1
+
+    def test_running_follows_the_flame(self):
+        rows = self.rows([("17:55", 0, 30.0, 0, 6, 30.0), ("18:00", 1, 33.0, 0, 6, 30.0)])
+        self.assertEqual(wpp.run_state_from_rows(rows, self.NOW), (True, 0.0, 33.0, 2.0, 30.0))
+
+    def test_sparrow_is_the_fallback_when_the_otthing_row_is_missing(self):
+        # OTThing wifi drop: no flame / flow in the row -> the Sparrow fields decide
+        rows = self.rows([("17:55", 0, 30.0, 0, 6, 30.0), ("18:00", None, None, 4000, 1800, 38.5)])
+        self.assertEqual(wpp.run_state_from_rows(rows, self.NOW), (True, 0.0, 38.5, 2.0, 30.0))
+        rows = self.rows([("17:30", 1, 40.0, 4000, 1800, 40.0), ("18:00", None, None, 0, 6, 35.0)])
+        running, off_min, outlet, _, _ = wpp.run_state_from_rows(rows, self.NOW)
+        self.assertFalse(running)
+        self.assertAlmostEqual(off_min, 32.0)
+        self.assertEqual(outlet, 35.0)
+
+    def test_no_rows_and_never_ran(self):
+        self.assertEqual(wpp.run_state_from_rows([], self.NOW), (False, 999.0, None, None, None))
+        rows = self.rows([("17:00", 0, None, 0, 6, None), ("18:00", 0, None, 0, 6, None)])
+        self.assertEqual(wpp.run_state_from_rows(rows, self.NOW), (False, 999.0, None, None, None))
+
+    def test_fresh_empty_row_does_not_stop_a_running_pump(self):
+        # 2026-11-04 13:10:01: the 13:10 row existed (another service) but read_otthing and
+        # transfer_p60 only fill it at ~13:10:15. Read as "not running" -> "stil 5 min" -> OFF.
+        now = datetime(2026, 11, 4, 13, 10, 1)
+        rows = [(datetime(2026, 11, 4, 13, 0), 1, 38.0, 1100, 400, 38.0),
+                (datetime(2026, 11, 4, 13, 5), 1, 37.5, 1021, 384, 37.5),
+                (datetime(2026, 11, 4, 13, 10), None, None, None, None, None)]
+        running, off_min, outlet, on_min, _ = wpp.run_state_from_rows(rows, now)
+        self.assertTrue(running)
+        self.assertEqual(off_min, 0.0)
+        self.assertEqual(outlet, 37.5)
+        self.assertAlmostEqual(on_min, 10.0, places=1)    # run started in the 13:00 row
+
+    def test_on_min_counts_from_the_start_of_the_current_run(self):
+        rows = self.rows([("17:00", 1, 35, 0, 0, None), ("17:05", 0, 34, 0, 0, None),
+                          ("17:10", 1, 33, 0, 0, None), ("17:15", 1, 35, 0, 0, None)])
+        got = wpp.run_state_from_rows(rows, self.NOW)
+        self.assertAlmostEqual(got[3], 52.0)
+        self.assertEqual(got[4], 34)                    # water of the last row before this run
+
+    def test_start_water_of_the_1410_restart(self):
+        # 2026-11-04: off at 28-29 C, flame from the 14:10 row; the ramp starts from 28.2
+        rows = [(datetime(2026, 11, 4, 14, 0), 0, 29.1, 0, 6, 29.0), (datetime(2026, 11, 4, 14, 5), 0, 28.2, 0, 6, 28.0),
+                (datetime(2026, 11, 4, 14, 10), 1, 27.3, 0, 6, 27.0), (datetime(2026, 11, 4, 14, 15), 1, 38.0, 3000, 1700, 38.0)]
+        running, _, outlet, on_min, start_water = wpp.run_state_from_rows(rows, datetime(2026, 11, 4, 14, 15, 20))
+        self.assertTrue(running)
+        self.assertAlmostEqual(on_min, 5.3, places=1)
+        self.assertEqual((outlet, start_water), (38.0, 28.2))
+
+
 class TestRunLiveGuards(unittest.TestCase):
     def test_stalled_schedule_raises_so_the_rules_take_over(self):
         from datetime import timedelta
@@ -178,7 +249,7 @@ class TestRunLiveGuards(unittest.TestCase):
         hist = [{"t": now + timedelta(minutes=15 * k), "room": 21.0, "t_out": 9.0, "q": 0.0, "elec": 0.0, "pv": 0.0,
                  "price": 0.4, "t_out_fc": 9.0, "pv_fc": 0.0, "sched": k < 8}   # only 2 h of schedule ahead
                 for k in range(-384, 144)]
-        with patch.object(wpp, "load_quarters", return_value=hist), patch.object(wpp, "read_run_state", return_value=(False, 999, None)):
+        with patch.object(wpp, "load_quarters", return_value=hist), patch.object(wpp, "read_run_state", return_value=(False, 999, None, None, None)):
             with self.assertRaises(RuntimeError):
                 wpp.run_live({}, now, 21.0, wpp.parse_comfort(""))
 
@@ -191,7 +262,7 @@ class TestRunLiveSuccess(unittest.TestCase):
         hist = [{"t": now + timedelta(minutes=15 * k), "room": 21.0, "t_out": 9.0, "q": 0.0, "elec": 0.0, "pv": 0.0,
                  "price": 0.4, "t_out_fc": 9.0, "pv_fc": 0.0, "sched": True} for k in range(-384, 144)]
         with patch.object(wpp, "load_quarters", return_value=hist), \
-             patch.object(wpp, "read_run_state", return_value=(True, 0.0, 38.0)):
+             patch.object(wpp, "read_run_state", return_value=(True, 0.0, 38.0, 45.0, 29.0)):
             dec, res, diag = wpp.run_live({}, now, 21.0, wpp.parse_comfort("13:00-17:30=21.7"))
         self.assertTrue(dec["heat"])                 # 21.0 < 21.7: must heat
         self.assertEqual(diag["slots"], 144)
@@ -206,10 +277,13 @@ class TestLiveDecision(unittest.TestCase):
         self.assertTrue(d["heat"])
         self.assertAlmostEqual(d["flow"], round(hm.flow_for_heat(W, 21.0, 3.0), 1))
 
-    def test_running_never_asks_below_supply_minus_margin(self):
-        # the P60 stops itself when its supply overshoots the target: keep the target near the supply
-        d = wpp.live_decision(PARAMS, self.RES_ON, 21.0, 45.0, True, 28, 50)
-        self.assertGreaterEqual(d["flow"], 43.5)
+    def test_measured_supply_never_raises_the_target(self):
+        # 2026-11-03: a "supply - 1.5" floor ratcheted the target up 41.7 -> 46.3 °C (the P60 runs above
+        # its target). The target follows the planned heat only, whatever the supply reads.
+        hot = wpp.live_decision(PARAMS, self.RES_ON, 21.0, 47.5, True, 28, 50)
+        cold = wpp.live_decision(PARAMS, self.RES_ON, 21.0, 30.0, True, 28, 50)
+        self.assertEqual(hot["flow"], cold["flow"])
+        self.assertAlmostEqual(hot["flow"], round(hm.flow_for_heat(W, 21.0, 3.0), 1))
 
     def test_off_and_room_setpoint_follows_the_plan(self):
         res = {"on": [0], "Q": [0.0], "elec": [0.0], "room": [21.3, 21.2, 21.1, 21.0, 21.0, 20.9, 20.9, 20.8]}

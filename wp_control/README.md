@@ -197,7 +197,7 @@ them).
 `DB_*`, `MQTT_BROKER/PORT/USERNAME/PASSWORD`, `MQTT_OTTHING_TOPIC`, `HA_URL`, `HA_TOKEN`,
 `OTTHING_HOST` (only for `otthing_config.py`).
 
-## Planner (in development, not wired in yet)
+## Planner (live since 2026-11-03)
 
 The rules above react to the room once it is already too cold; with a house this slow they stay
 behind (room 0.4-0.8 °C under the setpoint for hours on 2026-11-03). The planner replaces them by
@@ -224,9 +224,27 @@ the planner keeps every comfort bound (actual control: 2.7 K·h under) at EUR 13
 EUR 14.89 actual, counting the heat it leaves stored in the house at the end of the day.
 Not yet: buffer tank, irradiance (PV stands in), frost.
 
+**Is the heat pump running?** The planner reads it from the OTThing flame bit (local, live), with
+the Sparrow fields only as a per-row fallback: HA's Weheat integration freezes after an HA restart
+and then repeats its last row (2026-11-03: "heating" for 45 min after the pump had stopped). A
+5-min row that has neither yet is skipped: it is the row another service has just opened, and read
+as "not running" it once made the planner stop a running pump itself (2026-11-04 13:10).
+
+**Soft restart.** The planner sends a supply temperature, not a heat output. After a stop the system
+is cold, so a high target makes the P60 run flat out until the supply gets there (2026-11-04: plan
+4.3 kW, measured 7.8; target 50 °C, 9.6 kW). While the pump starts and for the first
+`WP_SOFTSTART_MIN` minutes of a run, the target is therefore at most
+`curve(outside) + WP_SOFTSTART_KP × (planned room in 1 h − room)`, at most `WP_SOFTSTART_NEG` °C
+below the curve (so it stays above the cooled water and the P60 does start), never below
+`WP_FLOW_MIN` and never above the planner's own target. Logged as `[PLAN] zachte herstart ...`;
+`energy.wp_shadow_flow_target_c` holds what was sent, `wp_plan` what the planner asked.
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `WP_PLANNER` | `off` | `off` = rules only; `shadow` = the planner plans every cycle and logs (`energy.wp_plan_*`, table `wp_plan`, `[PLAN]` in the log) while the rules drive the heat pump; `live` = the plan drives it and the rules take over on any planner error (logged as mode 2). In live the OTThing room setpoint follows the planned room (its own suspend at setpoint+1.5 must not fight a deliberately warm house) |
+| `WP_SOFTSTART_MIN` | `60` | soft restart: minutes from the start of a run during which the target is capped (0 = off) |
+| `WP_SOFTSTART_KP` | `4` | soft restart: °C supply above the curve per K the room is below the planned room in 1 h |
+| `WP_SOFTSTART_NEG` | `3` | soft restart: at most this many °C below the curve |
 | `WP_COMFORT_MIN` | `07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=18.0` | hard floor for the room per time band (`HH:MM-HH:MM=temp`, may cross midnight; no band = no requirement) |
 
 The planner needs numpy/scipy (in the wp_control image since 2026-11-03); wp_control imports it only
