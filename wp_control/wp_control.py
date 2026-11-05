@@ -298,6 +298,23 @@ def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=No
     return cap, f"zachte herstart ({phase}): {flow} -> {cap}°C | " + " | ".join(why)
 
 
+def planner_flow_drop(flow, last_cmd, running, max_drop):
+    """PUUR: het aanvoerdoel van de planner zakt hooguit `max_drop` °C per cyclus onder het VORIGE
+    commando zolang de WP draait (stijgen mag direct).
+
+    De planner rekent het doel per cyclus vers uit de geplande warmte; als die zakt (zon, prijs)
+    springt het doel mee omlaag terwijl het water nog warm is. De P60 ziet de aanvoer dan ver boven
+    het doel, stopt zelf en staat een uur stil (2026-11-05 09:44-10:06: 38,5 -> 32,5 -> 31,2 bij
+    aanvoer ~35 -> stop; 11-04 15:13: 50 -> 36 bij 42). Dezelfde rem als limit_flow_drop in het
+    regel-pad. Gerekend vanaf ons eigen vorige commando, niet vanaf de gemeten aanvoer, dus geen
+    ratel (11-03). Niet vóór een start (dan geldt de zachte herstart) en niet als last_cmd ontbreekt.
+    Geeft (flow, toelichting of None)."""
+    if flow is None or last_cmd is None or not running or flow >= last_cmd - max_drop:
+        return flow, None
+    held = round(last_cmd - max_drop, 1)
+    return held, f"aanvoer-rem: plan {flow} -> {held}°C (vorig commando {last_cmd}, max -{max_drop:g}°C/cyclus)"
+
+
 def build_cfg():
     base = os.environ.get("MQTT_OTTHING_TOPIC", "otthing/CE150C/state")
     base = base[:-len("/state")] if base.endswith("/state") else base
@@ -1517,6 +1534,7 @@ def main():
         off_above = heat_off_above(now, sp, price_win, cfg, nominal)
         heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], off_above)
         flow_raw = regulated_flow(base, boost, cfg)
+        last_cmd = heat_state.get("flow")    # het commando van de vorige cyclus, vóór de regels het overschrijven
         if heat:
             flow = limit_flow_drop(flow_raw, heat_state, cfg["flow_max_drop"])
         else:
@@ -1533,6 +1551,9 @@ def main():
                         flow, why = soft_start_flow(flow, base, room, planned["room_1h"],
                                                     planned["running"], planned["on_min"], cfg,
                                                     planned["start_water"])
+                        if why:
+                            dbg("PLAN", why)
+                        flow, why = planner_flow_drop(flow, last_cmd, planned["running"], cfg["flow_max_drop"])
                         if why:
                             dbg("PLAN", why)
                     heat_state["heat"] = heat            # the rules resume from the real state on fallback

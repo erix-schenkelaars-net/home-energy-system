@@ -1181,6 +1181,35 @@ class TestSoftStart(unittest.TestCase):
         self.assertEqual(wp.soft_start_flow(30.0, 38.0, 21.0, 21.2, False, None, c, 27.0), (30.0, None))
 
 
+class TestPlannerFlowDrop(unittest.TestCase):
+    """Planner-pad: doel zakt hooguit 1 °C/cyclus onder het vorige commando zolang de WP draait.
+    2026-11-05 09:44-10:06: plan 38,5 -> 37,9 -> 32,5 -> 32,5 -> 31,2 bij aanvoer ~35 -> P60 stopte zelf."""
+
+    def test_morning_of_2026_11_05(self):
+        sent, last = [], 38.5
+        for plan in (37.9, 32.5, 32.5, 31.2, 31.2):
+            last, _ = wp.planner_flow_drop(plan, last, True, 1.0)
+            sent.append(last)
+        self.assertEqual(sent, [37.9, 36.9, 35.9, 34.9, 33.9])
+
+    def test_note_names_the_previous_command(self):
+        flow, why = wp.planner_flow_drop(32.5, 37.9, True, 1.0)
+        self.assertEqual(flow, 36.9)
+        self.assertIn("37.9", why)
+
+    def test_rise_and_small_drop_pass(self):
+        self.assertEqual(wp.planner_flow_drop(45.0, 38.0, True, 1.0), (45.0, None))
+        self.assertEqual(wp.planner_flow_drop(37.2, 38.0, True, 1.0), (37.2, None))
+
+    def test_not_while_stopped_or_starting(self):
+        # before a start the soft start governs; after a self-stop the old command is no reference
+        self.assertEqual(wp.planner_flow_drop(32.0, 45.0, False, 1.0), (32.0, None))
+
+    def test_no_previous_command_or_off(self):
+        self.assertEqual(wp.planner_flow_drop(32.0, None, True, 1.0), (32.0, None))
+        self.assertEqual(wp.planner_flow_drop(None, 38.0, True, 1.0), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -239,6 +239,12 @@ below the curve (so it stays above the cooled water and the P60 does start), nev
 `WP_FLOW_MIN` and never above the planner's own target. Logged as `[PLAN] zachte herstart ...`;
 `energy.wp_shadow_flow_target_c` holds what was sent, `wp_plan` what the planner asked.
 
+**Drop limit.** While the pump runs, the planner's target may fall at most `WP_FLOW_MAX_DROP` °C per
+cycle below the previous command (rising is immediate), the same brake the rules have. Without it a
+smaller planned heat dropped the target below the still-warm supply and the P60 stopped itself for
+an hour (2026-11-05 10:06: 38.5 -> 31.2 °C in 20 min at a supply of ~35 °C). It counts from our own
+previous command, never from the measured supply. Logged as `[PLAN] aanvoer-rem ...`.
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `WP_PLANNER` | `off` | `off` = rules only; `shadow` = the planner plans every cycle and logs (`energy.wp_plan_*`, table `wp_plan`, `[PLAN]` in the log) while the rules drive the heat pump; `live` = the plan drives it and the rules take over on any planner error (logged as mode 2). In live the OTThing room setpoint follows the planned room (its own suspend at setpoint+1.5 must not fight a deliberately warm house) |
