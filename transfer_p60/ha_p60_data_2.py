@@ -117,12 +117,15 @@ def format_number_string(value):
 # Weheat meldt bij het inschakelen kortstondig onzinnige COP's (tot 268 gezien): het
 # vermogen-in loopt nog op terwijl er al warmte uit het water komt. Boven COP_MAX is het geen
 # meting -> NULL, niet afkappen (een afgekapte 6 is net zo onecht en trekt gemiddeldes omhoog).
+# Bij ontdooien haalt de P60 warmte UIT het water (afgegeven vermogen negatief) en meldt dan een
+# negatieve COP (tot -390 gezien, 2026-11-07 03:40-09:35): ook geen meting -> NULL. 0 (stilstand) blijft.
 COP_MAX = 6.0
+COP_MIN = 0.0
 
 
 def format_cop(value):
     s = format_number_string(value)
-    if s is None or float(s) > COP_MAX:
+    if s is None or float(s) > COP_MAX or float(s) < COP_MIN:
         return None
     return s
 

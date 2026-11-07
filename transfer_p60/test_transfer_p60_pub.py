@@ -113,6 +113,12 @@ class TestFormatCop(unittest.TestCase):
 
     def test_missing_or_garbage_is_null(self):
         self.assertIsNone(mod.format_cop(None))
+
+    def test_negative_cop_during_defrost_is_not_stored(self):
+        # 2026-11-07: Weheat reported -153 .. -390 while defrosting (heat drawn from the water)
+        self.assertIsNone(mod.format_cop("-390"))
+        self.assertIsNone(mod.format_cop("-0.5"))
+        self.assertEqual(mod.format_cop("0"), mod.format_number_string("0"))      # standby stays 0
         self.assertIsNone(mod.format_cop("unavailable"))
 
 
