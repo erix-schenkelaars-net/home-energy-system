@@ -263,6 +263,15 @@ and the P60 stopped itself for an hour (2026-11-06 09:36).
 its ramp and only the curve cap applies: a restart with a comfort deficit starts at ~40 °C instead of
 water + 3 (2026-11-06 10:39: target 28.5 °C, the room fell to 20.9 at a floor of 21.3).
 
+**Bump cap.** During a Honeywell bump the planner's heat is capped at `WP_BUMP_QMAX` (default 5 kW). A
+bump lasts an hour; 10 kW at 50 °C does not reach 23 °C in that hour anyway and mostly buys a poor COP
+(2026-11-07: three bumps, 30-60 min at 7-8 kW each, ~EUR 1.50).
+
+**House model refit 2026-11-06** (UA 172 -> 262 W/K): fitted on 10-18..11-06, held out 11-06..11-07:
+RMSE 0.48 -> 0.31 K, 24 h ahead 0.40 -> 0.04 K. The old night term (-0.7 kW) was compensating a too-low
+UA. The model still has no water node (the 200 L vessel and the radiators), so after a long stop the
+room keeps falling for a while longer than predicted.
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `WP_PLANNER` | `off` | `off` = rules only; `shadow` = the planner plans every cycle and logs (`energy.wp_plan_*`, table `wp_plan`, `[PLAN]` in the log) while the rules drive the heat pump; `live` = the plan drives it and the rules take over on any planner error (logged as mode 2). In live the OTThing room setpoint follows the planned room (its own suspend at setpoint+1.5 must not fight a deliberately warm house) |

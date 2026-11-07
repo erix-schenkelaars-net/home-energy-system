@@ -161,6 +161,14 @@ class TestPlanner(unittest.TestCase):
             if on[k - 1] == 1 and on[k] == 0:
                 self.assertEqual(on[k:k + 4], [0] * len(on[k:k + 4]), f"restart within 60 min after stop at {k}")
 
+    def test_qmax_caps_the_heat_in_those_slots(self):
+        # a big deficit would normally pull q_max; capped slots stay at or under the cap
+        inp = _inputs(24, tmin=22.8)
+        inp["qmax"] = [5.0] * 4 + [None] * 20
+        res = wpp.plan(PARAMS, 21.0, 21.0, inp, on0=True)
+        self.assertTrue(all(q <= 5.0 + 1e-6 for q in res["Q"][:4]))
+        self.assertGreater(max(res["Q"][4:]), 5.0)              # free again after the cap
+
     def test_force_off_keeps_those_slots_off(self):
         res = wpp.plan(PARAMS, 20.5, 20.5, _inputs(24, tmin=21.0), on0=True, force_off=range(4, 8))
         self.assertEqual(res["on"][4:8], [0, 0, 0, 0])
@@ -195,6 +203,9 @@ class TestLiveInputs(unittest.TestCase):
         bump = wpp.build_live_inputs(rows, self.T0, bands, [], bump=(self.T0 + timedelta(hours=1), 22.5))
         self.assertAlmostEqual(bump["tmin"][0], 22.5 - wpp.MARGIN)
         self.assertEqual(bump["tmin"][4], 21.0)      # bump over after 1 h
+        # during the bump the heat is capped (11-07: 10 kW at 50 C for an hour, three times)
+        self.assertEqual(bump["qmax"][0], wpp.BUMP_QMAX)
+        self.assertIsNone(bump["qmax"][4])
         low = wpp.build_live_inputs(rows, self.T0, bands, [], lower=(self.T0 + timedelta(hours=1), 19.0))
         self.assertEqual(low["tmin"][0], 19.0)
 

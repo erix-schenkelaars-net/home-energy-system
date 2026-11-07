@@ -40,6 +40,9 @@ PENALTY_RAMP_SLOTS = 8       # first 2 h: comfort penalty AND margin ramp up fro
 BIAS_HOURS = 6               # forecast-vs-sensor offset measured over this many hours ...
 BIAS_DECAY_H = 12            # ... and faded out over the horizon with this time constant
 TANGENTS = tuple(x / 2 for x in range(3, 21))   # 1.5 .. 10 kW every 0.5: coarser lines made the plan stick to their kinks
+# During a Honeywell bump the heat is capped: a bump lasts an hour, 10 kW at 50 °C does not reach 23 °C
+# in that hour anyway, it mostly buys a poor COP (11-07: three bumps, 30-60 min at 7-8 kW, ~EUR 1.50).
+BUMP_QMAX = float(os.environ.get("WP_BUMP_QMAX", "5.0"))
 DEFAULT_COMFORT = "07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=18.0"
 
 
@@ -98,7 +101,8 @@ def elec_tangents(w, t_out, t_room):
 
 # ---------------------------------------------------------------- the MILP
 def plan(params, tr0, tm0, inputs, on0=False, off_minutes=999.0, comfort=None, force_off=()):
-    """inputs: dict of lists per slot -> price, t_out, pv_kw, hour, tmin (None = no bound).
+    """inputs: dict of lists per slot -> price, t_out, pv_kw, hour, tmin (None = no bound), and
+    optionally qmax (a lower heat cap than q_max for that slot, None = q_max).
     force_off: slot indices that must stay off (what-if analysis, or a manual "not now").
     Returns per-slot on, Q, electricity, room, mass, plus cost and solver status."""
     p, w = params["house"], params["heat_pump"]
@@ -134,12 +138,13 @@ def plan(params, tr0, tm0, inputs, on0=False, off_minutes=999.0, comfort=None, f
         c[idx(k, iSH)] = COMFORT_PENALTY * DT
         integrality[idx(k, iON)] = integrality[idx(k, iST)] = 1
         ub[idx(k, iON)] = ub[idx(k, iST)] = 1
-        ub[idx(k, iQ)] = w["q_max"]
+        qmax_k = min(w["q_max"], (inputs.get("qmax") or [None] * N)[k] or w["q_max"])
+        ub[idx(k, iQ)] = qmax_k
         if k < lock or k in force_off:
             ub[idx(k, iON)] = 0
         # q_min(outside)*on <= Q <= q_max*on: the P60 cannot run lower in the cold (house_model.q_min_at)
         con([(idx(k, iQ), 1), (idx(k, iON), -hm.q_min_at(w, to))], 0, np.inf)
-        con([(idx(k, iQ), 1), (idx(k, iON), -w["q_max"])], -np.inf, 0)
+        con([(idx(k, iQ), 1), (idx(k, iON), -qmax_k)], -np.inf, 0)
         # electricity above every tangent (zero when off)
         t_ref = inputs["tmin"][k] if inputs["tmin"][k] is not None else 20.5
         for s, b0 in elec_tangents(w, to, t_ref):
@@ -413,7 +418,8 @@ def build_live_inputs(rows, now, bands, recent, bump=None, lower=None):
     rows:   [{"t", "price", "t_out_fc", "pv_fc"}...]; a missing price takes the same quarter a day
             earlier (what the optimiser does before tomorrow's prices are out)
     recent: [(sensor, forecast)...] for the bias correction
-    bump:   (until, temp) -- a Honeywell bump: the room must reach `temp` until `until`
+    bump:   (until, temp) -- a Honeywell bump: the room must reach `temp` until `until`, with the heat
+            capped at BUMP_QMAX (WP_BUMP_QMAX) meanwhile
     lower:  (until, temp) -- a manual lowering: the comfort floor is capped at `temp` until `until`"""
     by_t = {r["t"]: r for r in rows}
     price, fc = [], []
@@ -431,16 +437,18 @@ def build_live_inputs(rows, now, bands, recent, bump=None, lower=None):
         last = x if x is not None else last
         fc_filled.append(last)
     t_out = corrected_outside(fc_filled, [m for m, _ in recent], [f for _, f in recent])
-    tmin = []
+    tmin, qmax = [], []
     for r in rows:
         tm = comfort_min(bands, r["t"])
         if lower and r["t"] < lower[0]:
             tm = None if tm is None else min(tm, lower[1])
-        if bump and r["t"] < bump[0]:
+        in_bump = bool(bump and r["t"] < bump[0])
+        if in_bump:
             tm = max(tm or 0.0, bump[1] - MARGIN)     # the bump temperature itself, margin included
         tmin.append(tm)
+        qmax.append(BUMP_QMAX if in_bump else None)
     return {"price": price, "t_out": t_out, "pv_kw": [r.get("pv_fc") or 0.0 for r in rows],
-            "hour": [r["t"].hour + r["t"].minute / 60 for r in rows], "tmin": tmin}
+            "hour": [r["t"].hour + r["t"].minute / 60 for r in rows], "tmin": tmin, "qmax": qmax}
 
 
 def live_decision(params, res, room, outlet, running, flow_min, flow_cap):
