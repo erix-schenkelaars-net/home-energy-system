@@ -1093,6 +1093,7 @@ class TestPlannerFallback(unittest.TestCase):
         self.assertEqual(got["heatplan"]["q_now"], 3.0)
         # what the soft start needs: the planned room in 1 h and the run state
         self.assertEqual((got["room_1h"], got["running"], got["on_min"], got["start_water"]), (21.2, True, None, None))
+        self.assertEqual(got["tmin_now"], 21.7)            # the comfort floor now, for the soft start
 
     def test_planner_default_is_off(self):
         self.assertEqual(wp.build_cfg()["planner"], "off")
@@ -1172,6 +1173,15 @@ class TestSoftStart(unittest.TestCase):
         self.assertEqual(wp.soft_start_flow(41.6, 39.0, 21.5, 21.6, True, 20.0, c, 15.1)[0], 28.5)
         self.assertEqual(wp.soft_start_flow(41.6, 39.0, 21.5, 21.6, True, 0.0, c, 15.1)[0], 28.0)
 
+    def test_no_ramp_below_the_comfort_floor(self):
+        # 11-06 10:39: room 21.2 under the 21.3 floor, water 25.5 -> ramp gave 28.5; below the floor only
+        # the curve cap applies: 39.9 + 4 * (21.45 - 21.2) = 40.9
+        c = self._cfg()
+        with_ramp = wp.soft_start_flow(44.6, 39.9, 21.2, 21.45, False, None, c, 25.5)[0]
+        no_ramp = wp.soft_start_flow(44.6, 39.9, 21.2, 21.45, False, None, c, 25.5, below_floor=True)[0]
+        self.assertEqual(with_ramp, 28.5)
+        self.assertEqual(no_ramp, 40.9)
+
     def test_never_above_the_plan(self):
         c = self._cfg()
         for water in (20.0, 25.0, 27.0, 35.0, 45.0):
@@ -1208,6 +1218,73 @@ class TestPlannerFlowDrop(unittest.TestCase):
     def test_no_previous_command_or_off(self):
         self.assertEqual(wp.planner_flow_drop(32.0, None, True, 1.0), (32.0, None))
         self.assertEqual(wp.planner_flow_drop(None, 38.0, True, 1.0), (None, None))
+
+
+class TestEnableTrace(unittest.TestCase):
+    """[OTHR]: 10 min fijnlog na groen licht (m_ch_en uit -> aan), alleen loggen."""
+    T0 = datetime(2026, 11, 5, 15, 48, 17)
+
+    def snap(self, en, flow=30.6, ret=31.5, flame=False):
+        return {"m_ch_en": en, "flow": flow, "ret": ret, "flame": flame, "ch_mode": False,
+                "rel_mod": 0, "slave_status": 100}
+
+    def test_green_light_opens_window_and_logs_each_message(self):
+        st = {}
+        first = wp.enable_trace_line(self.snap(False), self.snap(True), st, self.T0)
+        self.assertIn("groen licht", first)
+        line = wp.enable_trace_line(self.snap(True), self.snap(True, flow=35.2), st, self.T0 + timedelta(seconds=10))
+        self.assertIn("+  10s aanvoer=35.2", line)
+
+    def test_window_ends_after_ten_minutes(self):
+        st = {}
+        wp.enable_trace_line(self.snap(False), self.snap(True), st, self.T0)
+        end = wp.enable_trace_line(self.snap(True), self.snap(True), st, self.T0 + timedelta(seconds=605))
+        self.assertIn("einde", end)
+        self.assertIsNone(wp.enable_trace_line(self.snap(True), self.snap(True), st, self.T0 + timedelta(seconds=610)))
+
+    def test_window_ends_when_enable_goes_off(self):
+        st = {}
+        wp.enable_trace_line(self.snap(False), self.snap(True), st, self.T0)
+        self.assertIn("einde", wp.enable_trace_line(self.snap(True), self.snap(False), st, self.T0 + timedelta(seconds=60)))
+
+    def test_nothing_without_green_light(self):
+        st = {}
+        self.assertIsNone(wp.enable_trace_line({}, self.snap(True), st, self.T0))          # first message
+        self.assertIsNone(wp.enable_trace_line(self.snap(True), self.snap(True), st, self.T0))
+        self.assertIsNone(wp.enable_trace_line(self.snap(False), self.snap(False), st, self.T0))
+
+
+class TestStartKick(unittest.TestCase):
+    """Planner zegt HEAT, compressor draait niet: doel >= water + 3, anders start de P60 niet
+    (200 L-vat in serie houdt het circuit-water warm; 11-05 15:48-16:40 geen start bij doel 29,7-31 / water 31-32)."""
+
+    def test_afternoon_of_2026_11_05(self):
+        flow, why = wp.start_kick_flow(29.7, False, 31.3, 3.0, 50.0)
+        self.assertEqual(flow, 34.3)
+        self.assertIn("start-duw", why)
+
+    def test_never_while_running(self):
+        self.assertEqual(wp.start_kick_flow(29.7, True, 35.0, 3.0, 50.0), (29.7, None))
+
+    def test_target_already_high_enough(self):
+        self.assertEqual(wp.start_kick_flow(40.0, False, 31.0, 3.0, 50.0), (40.0, None))
+
+    def test_capped(self):
+        self.assertEqual(wp.start_kick_flow(45.0, False, 48.5, 3.0, 50.0)[0], 50.0)
+
+    def test_no_water_or_off(self):
+        self.assertEqual(wp.start_kick_flow(30.0, False, None, 3.0, 50.0), (30.0, None))
+        self.assertEqual(wp.start_kick_flow(None, False, 31.0, 3.0, 50.0), (None, None))
+
+    def test_live_water_takes_the_higher_of_supply_and_return(self):
+        saved = dict(wp._otev_prev)
+        try:
+            wp._otev_prev.clear(); wp._otev_prev.update({"flow": 31.3, "ret": 29.6})
+            self.assertEqual(wp.live_water(), 31.3)
+            wp._otev_prev.clear()
+            self.assertIsNone(wp.live_water())
+        finally:
+            wp._otev_prev.clear(); wp._otev_prev.update(saved)
 
 
 if __name__ == "__main__":

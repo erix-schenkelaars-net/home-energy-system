@@ -245,6 +245,24 @@ smaller planned heat dropped the target below the still-warm supply and the P60 
 an hour (2026-11-05 10:06: 38.5 -> 31.2 °C in 20 min at a supply of ~35 °C). It counts from our own
 previous command, never from the measured supply. Logged as `[PLAN] aanvoer-rem ...`.
 
+**Start kick.** A 200 L vessel without sensor sits in series behind the heat pump (heat pump -> vessel
+-> pump -> gas boiler -> buffer valve -> radiators). It stays warm after a stop; at a green light the P60
+first runs its pump, measures that water, and does not start while our target is below it (2026-11-05
+15:48-16:40: no heat for almost two hours at a target of 29.7-31 °C with water at 31-32 °C). While the
+planner wants heat and the compressor is not running, the target is therefore at least the water now
+(the higher of supply and return in the latest OTThing message) + `WP_SOFTSTART_GAP`, capped at
+`WP_FLOW_CAP`. Never while running, so no feedback. Logged as `[PLAN] start-duw ...`.
+
+**Minimum heat in the cold.** The P60's lowest compressor speed gives more heat when it is cold: ~2.4 kW
+at 3-5 °C against ~1.4 kW at 6-8 °C (p10 of running output). The planner's lower bound per quarter is
+`house_model.q_min_at` (`q_min_cold` at or below `q_min_cold_c`, `q_min` at or above `q_min_warm_c`,
+in `house_model_params.json`). Planning 1.5 kW at 3 °C sent a target of 30.8 °C at a supply of 34.6 °C,
+and the P60 stopped itself for an hour (2026-11-06 09:36).
+
+**No ramp below the comfort floor.** When the room is under the comfort floor, the soft restart skips
+its ramp and only the curve cap applies: a restart with a comfort deficit starts at ~40 °C instead of
+water + 3 (2026-11-06 10:39: target 28.5 °C, the room fell to 20.9 at a floor of 21.3).
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `WP_PLANNER` | `off` | `off` = rules only; `shadow` = the planner plans every cycle and logs (`energy.wp_plan_*`, table `wp_plan`, `[PLAN]` in the log) while the rules drive the heat pump; `live` = the plan drives it and the rules take over on any planner error (logged as mode 2). In live the OTThing room setpoint follows the planned room (its own suspend at setpoint+1.5 must not fight a deliberately warm house) |

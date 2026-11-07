@@ -22,6 +22,9 @@
   "q_min": 1.5,
   "q_max": 10.0,
   "min_off_min": 60,
-  "_notes": "COP linear in outside and supply temperature (resid sd 0.38); q_min = p5 of running output; restart lockout ~60 min after every stop (34 stops since 10-23)"
+  "_notes": "COP linear in outside and supply temperature (resid sd 0.38); q_min = p5 of running output; restart lockout ~60 min after every stop (34 stops since 10-23); q_min_cold 2.4 kW at <=5 C to q_min at >=8 C (p10 of running output 10-23..11-06: ~2.4 kW at 3-5 C, ~1.4 at 6-8 C; house_model.q_min_at)",
+  "q_min_cold": 2.4,
+  "q_min_cold_c": 5.0,
+  "q_min_warm_c": 8.0
  }
 }

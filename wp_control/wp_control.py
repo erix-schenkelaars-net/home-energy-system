@@ -254,7 +254,7 @@ def limit_flow_drop(flow, state, max_drop):
     return flow
 
 
-def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=None):
+def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=None, below_floor=False):
     """PUUR: begrens het aanvoerdoel van de planner tijdens een (her)start.
 
     Wat de P60 laat doorschieten is het GAT tussen doel en water bij de start, niet de hoogte van het
@@ -270,12 +270,16 @@ def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=No
        stooklijn.
     Vóór de start (WP nog uit) nooit onder water + gap, anders ziet de P60 geen vraag en start niet
     (11-03 20:10: doel 29,5 bij water 34 -> een uur geen start). Nooit onder flow_min, nooit boven
-    het doel van de planner (dit kan alleen verlagen). Geeft (flow, toelichting of None)."""
+    het doel van de planner (dit kan alleen verlagen). Geeft (flow, toelichting of None).
+
+    below_floor: de kamer zit ONDER de comfortgrens -> geen oploop (alleen plafond 2). De oploop is
+    tegen doorschieten bij een herstart zonder haast; met een tekort werkte hij tegen het comfort in
+    (11-06 10:39: water 25 -> doel 28,5 en 1 °C/5 min, kamer zakte tot 20,9 bij grens 21,3)."""
     if flow is None or room is None or cfg["softstart_min"] <= 0:
         return flow, None
     t = 0.0 if not running else (on_min if on_min is not None else 1e9)
     caps, why = [], []
-    if start_water is not None:
+    if start_water is not None and not below_floor:
         # na een lange stilstand meet de OTThing het afgekoelde water in de buitenunit (13-15 °C,
         # nachten 10-24/11-02/11-03), niet het radiatorwater binnen, dat niet onder de kamer zakt
         start_water = max(start_water, room)
@@ -313,6 +317,31 @@ def planner_flow_drop(flow, last_cmd, running, max_drop):
         return flow, None
     held = round(last_cmd - max_drop, 1)
     return held, f"aanvoer-rem: plan {flow} -> {held}°C (vorig commando {last_cmd}, max -{max_drop:g}°C/cyclus)"
+
+
+def start_kick_flow(flow, running, water, gap, cap):
+    """PUUR: zolang de planner wil stoken maar de compressor niet draait, ligt het doel minstens
+    `gap` boven het water dat de P60 nu meet, anders ziet hij geen vraag en start hij niet.
+
+    In serie achter de WP zit een 200 L-vat zonder sensor (WP -> vat -> pomp -> CV -> klep ->
+    radiatoren). Na een stop blijft dat warm; bij groen licht laat de P60 eerst zijn pomp draaien
+    en meet dan dat vat-water. Lag ons doel daaronder, dan wachtte hij tot het vat via de
+    radiatoren was afgekoeld: 11-03 20:11 en 11-04 19:17 ~50 min, 11-05 15:48-16:40 bijna 2 uur
+    zonder warmte terwijl de planner dacht 1,5-2,75 kW te leveren. De meting telt alleen vóór de
+    compressor draait (dan stookt de P60 niet, dus geen terugkoppeling/ratel als op 11-03); daarna
+    nemen de oploop en de daalrem het over. Geeft (flow, toelichting of None)."""
+    if flow is None or running or water is None:
+        return flow, None
+    need = round(min(water + gap, cap), 1)
+    if flow >= need:
+        return flow, None
+    return need, f"start-duw: {flow} -> {need}°C (water nu {water}°C + {gap:g}, WP start anders niet)"
+
+
+def live_water():
+    """De hoogste van aanvoer en retour uit het laatste OTThing-bericht (~5 s oud), of None."""
+    vals = [v for v in (_otev_prev.get("flow"), _otev_prev.get("ret")) if isinstance(v, (int, float))]
+    return max(vals) if vals else None
 
 
 def build_cfg():
@@ -1024,6 +1053,34 @@ def ot_event_changes(prev, cur):
     return out
 
 
+OT_TRACE_S = 600          # na groen licht (CH-enable naar de P60 uit -> aan) 10 min fijn loggen
+_ottrace = {}
+
+
+def enable_trace_line(prev, cur, state, now, window_s=OT_TRACE_S):
+    """PUUR: een [OTHR]-regel voor elk OTThing-bericht (~5 s) in de eerste window_s na groen licht,
+    anders None. Alleen loggen, de regeling gebruikt dit niet.
+
+    Waarom (2026-11-05): bij groen licht springt de P60-aanvoer binnen 5 min van ~20-31 naar
+    34-37 °C zonder compressor, gas of buffer (klep dicht, leiding koud). Een scherpe sprong die
+    langzaam uitzakt = een warme prop in de leidingen die de pomp doortrekt; een geleidelijke
+    stijging = er warmt iets actief op. De 5-min-rijen kunnen dat niet scheiden."""
+    if not prev:
+        return None
+    if prev.get("m_ch_en") is False and cur.get("m_ch_en") is True:
+        state["since"] = now
+        return f"groen licht: start {window_s // 60:.0f} min fijnlog | aanvoer={cur.get('flow')} retour={cur.get('ret')}"
+    since = state.get("since")
+    if since is None:
+        return None
+    t = (now - since).total_seconds()
+    if t > window_s or cur.get("m_ch_en") is False:
+        state["since"] = None
+        return f"einde fijnlog na {t:.0f} s"
+    return (f"+{t:4.0f}s aanvoer={cur.get('flow')} retour={cur.get('ret')} vlam={cur.get('flame')} "
+            f"ch={cur.get('ch_mode')} mod={cur.get('rel_mod')} status={cur.get('slave_status')}")
+
+
 def log_ot_events(payload):
     """Vergelijk dit bericht met het vorige en log de veranderingen. ru_ch_set wordt alleen bij een
     gelogde sprong als nieuwe referentie genomen, zodat langzaam kruipen geen sprong maskeert."""
@@ -1031,6 +1088,9 @@ def log_ot_events(payload):
     if cur is None:
         return
     changes = ot_event_changes(_otev_prev, cur)
+    trace = enable_trace_line(_otev_prev, cur, _ottrace, datetime.now())
+    if trace:
+        dbg("OTHR", trace)
     snap = " ".join(f"{k}={v}" for k, v in cur.items())
     if not _otev_prev:
         dbg("OTEV", f"beginstand | {snap}")
@@ -1414,7 +1474,7 @@ def plan_cycle(cfg, now, room, ovr_state):
     write_plan(cfg, mode, dec, res, diag, now)
     dec = dict(dec, mass=diag["tm"], heatplan=heatplan_payload(res, diag, now),
                room_1h=res["room"][3], running=diag["running"], on_min=diag.get("on_min"),
-               start_water=diag.get("start_water"))
+               start_water=diag.get("start_water"), tmin_now=(diag.get("inputs") or {}).get("tmin", [None])[0])
     return dec
 
 
@@ -1548,12 +1608,21 @@ def main():
                 if planned is not None:
                     heat, flow, sp_cmd = planned["heat"], planned["flow"], planned["room_sp"]
                     if heat:
+                        tmin_now = planned.get("tmin_now")
                         flow, why = soft_start_flow(flow, base, room, planned["room_1h"],
                                                     planned["running"], planned["on_min"], cfg,
-                                                    planned["start_water"])
+                                                    planned["start_water"],
+                                                    below_floor=(tmin_now is not None and room is not None
+                                                                 and room < tmin_now))
                         if why:
                             dbg("PLAN", why)
                         flow, why = planner_flow_drop(flow, last_cmd, planned["running"], cfg["flow_max_drop"])
+                        if why:
+                            dbg("PLAN", why)
+                        water = live_water()
+                        flow, why = start_kick_flow(flow, planned["running"],
+                                                    water if water is not None else planned["start_water"],
+                                                    cfg["softstart_gap"], cfg["flow_cap"])
                         if why:
                             dbg("PLAN", why)
                     heat_state["heat"] = heat            # the rules resume from the real state on fallback

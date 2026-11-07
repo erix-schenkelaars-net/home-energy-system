@@ -101,6 +101,35 @@ class TestForecastBias(unittest.TestCase):
         self.assertEqual(wpp.corrected_outside([7.0, 8.0], [None], [None]), [7.0, 8.0])
 
 
+class TestQMinCold(unittest.TestCase):
+    """The P60's minimum heat rises in the cold (11-06 09:36: plan 1.5 kW at 3 C -> self-stop)."""
+
+    def test_values(self):
+        self.assertEqual(hm.q_min_at(W, 3.0), W["q_min_cold"])
+        self.assertEqual(hm.q_min_at(W, 5.0), W["q_min_cold"])
+        self.assertEqual(hm.q_min_at(W, 10.0), W["q_min"])
+        mid = hm.q_min_at(W, 6.5)
+        self.assertAlmostEqual(mid, (W["q_min_cold"] + W["q_min"]) / 2)
+
+    def test_without_cold_keys_it_is_the_old_minimum(self):
+        w = {k: v for k, v in W.items() if not k.startswith("q_min_")}
+        self.assertEqual(hm.q_min_at(w, -5.0), W["q_min"])
+        self.assertEqual(hm.q_min_at(W, None), W["q_min"])
+
+    def test_planner_never_plans_below_it_in_the_cold(self):
+        res = wpp.plan(PARAMS, 21.3, 21.0, _inputs(48, t_out=3.0, tmin=21.0), on0=True)
+        for on, q in zip(res["on"], res["Q"]):
+            if on:
+                self.assertGreaterEqual(q, W["q_min_cold"] - 1e-6)
+
+    def test_morning_of_2026_11_06_target_stays_near_the_supply(self):
+        # room 21.5 at 3.3 C: with q_min 1.5 the target went to 30.1 (supply 34.6, P60 stopped);
+        # with the cold minimum the lowest target the planner can send is ~34.2
+        lowest = round(hm.flow_for_heat(W, 21.5, hm.q_min_at(W, 3.3)), 1)
+        self.assertGreaterEqual(lowest, 34.0)
+        self.assertLess(round(hm.flow_for_heat(W, 21.5, W["q_min"]), 1), 31.0)
+
+
 class TestPlanner(unittest.TestCase):
     def test_small_deficit_now_is_not_fixed_with_full_power(self):
         res = wpp.plan(PARAMS, 20.6, 20.6, _inputs(16, tmin=20.5))        # 0.1 K under bound+margin

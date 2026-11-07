@@ -5,7 +5,7 @@ Per quarter it decides on/off and the heat Q (kW) on top of house_model:
   * house dynamics (room + mass, exact for the linear model at 5-min sub-steps)
   * electricity = Q / COP(outside, supply), supply rising with Q (emitter), so heat costs more per kWh
     the harder the heat pump runs -- a convex curve, modelled with tangent lines
-  * Q between q_min and q_max while on; a start costs START_COST (efficiency lost on short runs)
+  * Q between q_min (higher in the cold, house_model.q_min_at) and q_max while on; a start costs START_COST (efficiency lost on short runs)
   * after every stop the P60 refuses to restart for ~60 min (measured 2026-11-03): modelled as a hard
     minimum off-time, including a lockout still running at the start of the plan
   * comfort: room >= WP_COMFORT_MIN band + MARGIN, soft with a high penalty so the plan stays feasible
@@ -137,8 +137,8 @@ def plan(params, tr0, tm0, inputs, on0=False, off_minutes=999.0, comfort=None, f
         ub[idx(k, iQ)] = w["q_max"]
         if k < lock or k in force_off:
             ub[idx(k, iON)] = 0
-        # q_min*on <= Q <= q_max*on
-        con([(idx(k, iQ), 1), (idx(k, iON), -w["q_min"])], 0, np.inf)
+        # q_min(outside)*on <= Q <= q_max*on: the P60 cannot run lower in the cold (house_model.q_min_at)
+        con([(idx(k, iQ), 1), (idx(k, iON), -hm.q_min_at(w, to))], 0, np.inf)
         con([(idx(k, iQ), 1), (idx(k, iON), -w["q_max"])], -np.inf, 0)
         # electricity above every tangent (zero when off)
         t_ref = inputs["tmin"][k] if inputs["tmin"][k] is not None else 20.5

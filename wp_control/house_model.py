@@ -78,6 +78,25 @@ def flow_for_heat(w, room, q):
     return room + q / w["k_emitter"] + w["spread"] / 2
 
 
+def q_min_at(w, t_out):
+    """Lowest heat (kW) the P60 can sustain while running, at an outside temperature.
+
+    Its minimum compressor speed gives more heat in the cold: p10 of running output 2026-10-23..11-06
+    was ~2.4 kW at 3-5 °C and ~1.4 kW at 6-8 °C. Planning below that makes the P60 overshoot the
+    target and stop itself for an hour (11-06 09:36: plan 1.5 kW -> target 30.8 at a supply of 34.6).
+    q_min_cold at or below q_min_cold_c, q_min at or above q_min_warm_c, linear in between; without
+    the cold keys just q_min."""
+    lo, hi = w.get("q_min_cold_c"), w.get("q_min_warm_c")
+    cold = w.get("q_min_cold")
+    if cold is None or lo is None or hi is None or t_out is None or hi <= lo:
+        return w["q_min"]
+    if t_out <= lo:
+        return cold
+    if t_out >= hi:
+        return w["q_min"]
+    return cold + (w["q_min"] - cold) * (t_out - lo) / (hi - lo)
+
+
 def cop(w, t_out, t_flow):
     """COP at an outside and supply temperature, kept in a sane range."""
     return min(max(w["cop_c0"] + w["cop_cto"] * t_out + w["cop_ctw"] * t_flow, 1.5), 7.0)
