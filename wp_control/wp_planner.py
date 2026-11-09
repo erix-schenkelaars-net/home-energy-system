@@ -43,6 +43,10 @@ TANGENTS = tuple(x / 2 for x in range(3, 21))   # 1.5 .. 10 kW every 0.5: coarse
 # During a Honeywell bump the heat is capped: a bump lasts an hour, 10 kW at 50 °C does not reach 23 °C
 # in that hour anyway, it mostly buys a poor COP (11-07: three bumps, 30-60 min at 7-8 kW, ~EUR 1.50).
 BUMP_QMAX = float(os.environ.get("WP_BUMP_QMAX", "5.0"))
+# A bump needs at least this long after the restart lockout, else it is left out of the plan. 11-08: stop
+# at 16:00, bump at 16:09 until 17:09: the only quarter it could still act on was 17:00, so the plan
+# bought 5 kW at EUR 0.50 for a 22.8 floor it could never reach.
+BUMP_MIN_USABLE_MIN = float(os.environ.get("WP_BUMP_MIN_USABLE_MIN", "30"))
 DEFAULT_COMFORT = "07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=18.0"
 
 
@@ -100,6 +104,11 @@ def elec_tangents(w, t_out, t_room):
 
 
 # ---------------------------------------------------------------- the MILP
+def lockout_slots(min_off_min, on0, off_minutes):
+    """PURE: how many quarters from the plan's start the P60 still refuses to restart."""
+    return max(0, math.ceil((min_off_min - off_minutes) / 15)) if not on0 else 0
+
+
 def plan(params, tr0, tm0, inputs, on0=False, off_minutes=999.0, comfort=None, force_off=()):
     """inputs: dict of lists per slot -> price, t_out, pv_kw, hour, tmin (None = no bound), and
     optionally qmax (a lower heat cap than q_max for that slot, None = q_max).
@@ -127,7 +136,7 @@ def plan(params, tr0, tm0, inputs, on0=False, off_minutes=999.0, comfort=None, f
             r[j] += v
         rows.append(r); lo.append(l); hi.append(u)
 
-    lock = max(0, math.ceil((w["min_off_min"] - off_minutes) / 15)) if not on0 else 0
+    lock = lockout_slots(w["min_off_min"], on0, off_minutes)
     L = int(round(w["min_off_min"] / 15))
     for k in range(N):
         pr, to = inputs["price"][k], inputs["t_out"][k]
@@ -451,6 +460,19 @@ def build_live_inputs(rows, now, bands, recent, bump=None, lower=None):
             "hour": [r["t"].hour + r["t"].minute / 60 for r in rows], "tmin": tmin, "qmax": qmax}
 
 
+def usable_bump(bump, first_slot, running, off_min, min_off_min):
+    """PURE: the bump to plan with, or None when the restart lockout leaves it no useful time.
+
+    Only a running lockout can drop a bump: with the heat pump running or free to start, the bump
+    stands however short it is. `first_slot` is the start of the plan's first quarter."""
+    lock = lockout_slots(min_off_min, running, off_min)
+    if not bump or lock == 0:
+        return bump
+    free_from = first_slot + timedelta(minutes=15 * lock)
+    usable_min = (bump[0] - free_from).total_seconds() / 60
+    return bump if usable_min >= BUMP_MIN_USABLE_MIN else None
+
+
 def live_decision(params, res, room, outlet, running, flow_min, flow_cap):
     """PURE: what to send the heat pump for the current quarter of a plan.
 
@@ -494,14 +516,15 @@ def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flo
     tm = hm.observe_mass(p, rooms, outs, dt=DT)[-1]
     running, off_min, outlet, on_min, start_water = read_run_state(db, now)
     recent = [(r["t_out"], r["t_out_fc"]) for r in past[-BIAS_HOURS * 4:]]
-    inp = build_live_inputs(fut, now, bands, recent, bump, lower)
+    bump_used = usable_bump(bump, fut[0]["t"], running, off_min, params["heat_pump"]["min_off_min"])
+    inp = build_live_inputs(fut, now, bands, recent, bump_used, lower)
     res = plan(params, room_now, tm, inp, on0=running, off_minutes=off_min)
     if "on" not in res:
         raise RuntimeError(f"solver: {res.get('message')}")
     dec = live_decision(params, res, room_now, outlet, running, flow_min, flow_cap)
     diag = {"tm": tm, "running": running, "off_min": off_min, "on_min": on_min, "start_water": start_water, "outlet": outlet, "slots": n,
             "bias": inp["t_out"][0] - fut[0]["t_out_fc"] if fut[0]["t_out_fc"] is not None else None,
-            "cost": res["cost"], "times": [r["t"] for r in fut], "inputs": inp}
+            "cost": res["cost"], "times": [r["t"] for r in fut], "inputs": inp, "bump_skipped": bool(bump and not bump_used)}
     return dec, res, diag
 
 

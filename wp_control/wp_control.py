@@ -302,7 +302,7 @@ def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=No
     return cap, f"zachte herstart ({phase}): {flow} -> {cap}°C | " + " | ".join(why)
 
 
-def planner_flow_drop(flow, last_cmd, running, max_drop):
+def planner_flow_drop(flow, last_cmd, running, max_drop, land_below=None, land_step=None, land_floor=None):
     """PUUR: het aanvoerdoel van de planner zakt hooguit `max_drop` °C per cyclus onder het VORIGE
     commando zolang de WP draait (stijgen mag direct).
 
@@ -312,11 +312,22 @@ def planner_flow_drop(flow, last_cmd, running, max_drop):
     aanvoer ~35 -> stop; 11-04 15:13: 50 -> 36 bij 42). Dezelfde rem als limit_flow_drop in het
     regel-pad. Gerekend vanaf ons eigen vorige commando, niet vanaf de gemeten aanvoer, dus geen
     ratel (11-03). Niet vóór een start (dan geldt de zachte herstart) en niet als last_cmd ontbreekt.
-    Geeft (flow, toelichting of None)."""
-    if flow is None or last_cmd is None or not running or flow >= last_cmd - max_drop:
+
+    Zachte landing: vanaf `land_below` zakt het doel met `land_step`, en nooit onder `land_floor`.
+    De P60 draait daar al op minimum en stopt als het doel ~3 °C onder het water ligt; zo stopte hij
+    5 keer van 11-05 t/m 11-08 (900 rpm, water 3,1-4,1 °C boven het doel). De planner vraagt bij 1,5 kW
+    ~30 °C, terwijl het water bij minimumvermogen op ~32,5 °C blijft: zonder bodem stopt hij alsnog.
+    Een doel dat al onder de bodem ligt wordt niet opgetild. Geeft (flow, toelichting of None)."""
+    if flow is None or last_cmd is None or not running:
         return flow, None
-    held = round(last_cmd - max_drop, 1)
-    return held, f"aanvoer-rem: plan {flow} -> {held}°C (vorig commando {last_cmd}, max -{max_drop:g}°C/cyclus)"
+    landing = land_below is not None and land_step is not None and last_cmd <= land_below
+    step = land_step if landing else max_drop
+    held = flow if flow >= last_cmd - step else round(last_cmd - step, 1)
+    if land_floor is not None:
+        held = max(held, round(min(land_floor, last_cmd), 1))
+    if held == flow:
+        return flow, None
+    return held, f"aanvoer-rem: plan {flow} -> {held}°C (vorig commando {last_cmd}, max -{step:g}°C/cyclus)"
 
 
 def start_kick_flow(flow, running, water, gap, cap):
@@ -422,6 +433,9 @@ def build_cfg():
         "flow_min": float(os.environ.get("WP_FLOW_MIN", "28")),
         "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
         "flow_max_drop": float(os.environ.get("WP_FLOW_MAX_DROP", "1.0")),  # °C per cyclus omlaag
+        "flow_land_below": float(os.environ.get("WP_FLOW_LAND_BELOW", "37")),  # zachte landing vanaf dit doel
+        "flow_land_step":  float(os.environ.get("WP_FLOW_LAND_STEP", "0.5")),  # °C per cyclus omlaag tijdens de landing
+        "flow_land_floor": float(os.environ.get("WP_FLOW_LAND_FLOOR", "32")),  # bodem van het doel zolang de WP draait
         # zachte herstart (2026-11-04, alleen planner-live): zie soft_start_flow. 0 min = uit.
         "softstart_min": float(os.environ.get("WP_SOFTSTART_MIN", "60")),
         "softstart_kp":  float(os.environ.get("WP_SOFTSTART_KP", "4")),     # °C aanvoer per K tekort
@@ -1469,7 +1483,7 @@ def plan_cycle(cfg, now, room, ovr_state):
     bias = "?" if diag["bias"] is None else f"{diag['bias']:+.1f}"
     act = f"HEAT Q={dec['q']:.2f}kW aanvoer {dec['flow']}°C" if dec["heat"] else "OFF"
     dbg("PLAN", f"[{'LIVE' if mode else 'SCHADUW'}] kamer={room} massa={diag['tm']:.2f} {run_txt} "
-                f"KNMI-bias={bias}K -> {act}"
+                f"KNMI-bias={bias}K -> {act}{' | bump genegeerd (herstartblokkade)' if diag.get('bump_skipped') else ''}"
                 f" | kamer over 1u {res['room'][3]:.2f} | OTThing-sp {dec['room_sp']} | 12u {on_next} | €{diag['cost']:.2f}/{diag['slots'] / 4:.0f}u")
     write_plan(cfg, mode, dec, res, diag, now)
     dec = dict(dec, mass=diag["tm"], heatplan=heatplan_payload(res, diag, now),
@@ -1616,7 +1630,8 @@ def main():
                                                                  and room < tmin_now))
                         if why:
                             dbg("PLAN", why)
-                        flow, why = planner_flow_drop(flow, last_cmd, planned["running"], cfg["flow_max_drop"])
+                        flow, why = planner_flow_drop(flow, last_cmd, planned["running"], cfg["flow_max_drop"],
+                                                      cfg["flow_land_below"], cfg["flow_land_step"], cfg["flow_land_floor"])
                         if why:
                             dbg("PLAN", why)
                         water = live_water()

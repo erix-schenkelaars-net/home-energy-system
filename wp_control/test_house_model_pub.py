@@ -210,6 +210,58 @@ class TestLiveInputs(unittest.TestCase):
         self.assertEqual(low["tmin"][0], 19.0)
 
 
+class TestUsableBump(unittest.TestCase):
+    """A bump the restart lockout leaves no time for must not drive the plan (2026-11-08 17:00 peak)."""
+    Q0 = datetime(2026, 11, 8, 16, 0)
+
+    def _until(self, minutes):
+        from datetime import timedelta
+        return (self.Q0 + timedelta(minutes=minutes), 23.0)
+
+    def test_bump_ending_just_after_the_lockout_is_dropped(self):
+        # stopped at 16:00, seen at 16:09: free from 17:00, bump until 17:09
+        self.assertIsNone(wpp.usable_bump(self._until(69), self.Q0, False, 9.0, 60))
+
+    def test_bump_with_enough_time_after_the_lockout_stays(self):
+        bump = self._until(90)                       # exactly 30 min after the lockout
+        self.assertEqual(wpp.usable_bump(bump, self.Q0, False, 9.0, 60), bump)
+
+    def test_just_under_the_limit_is_dropped(self):
+        self.assertIsNone(wpp.usable_bump(self._until(89), self.Q0, False, 9.0, 60))
+
+    def test_running_heat_pump_keeps_even_a_short_bump(self):
+        bump = self._until(10)
+        self.assertEqual(wpp.usable_bump(bump, self.Q0, True, 0.0, 60), bump)
+
+    def test_no_lockout_keeps_even_a_short_bump(self):
+        bump = self._until(10)
+        self.assertEqual(wpp.usable_bump(bump, self.Q0, False, 90.0, 60), bump)
+
+    def test_no_bump_stays_none(self):
+        self.assertIsNone(wpp.usable_bump(None, self.Q0, False, 9.0, 60))
+
+    def _run(self, bump_minutes):
+        from datetime import timedelta
+        from unittest.mock import patch
+        now = datetime(2026, 11, 8, 16, 9)
+        hist = [{"t": self.Q0 + timedelta(minutes=15 * k), "room": 21.8, "t_out": 10.0, "q": 0.0, "elec": 0.0, "pv": 0.0,
+                 "price": 0.5, "t_out_fc": 10.0, "pv_fc": 0.0, "sched": True} for k in range(-384, 144)]
+        with patch.object(wpp, "load_quarters", return_value=hist), \
+             patch.object(wpp, "read_run_state", return_value=(False, 9.0, None, None, None)):
+            return wpp.run_live({}, now, 21.8, wpp.parse_comfort("00:00-23:59=20.5"), bump=self._until(bump_minutes))
+
+    def test_full_path_no_peak_after_the_lockout(self):
+        _, res, diag = self._run(69)
+        self.assertTrue(diag["bump_skipped"])
+        self.assertEqual(diag["inputs"]["tmin"][0], 20.5)
+        self.assertLess(res["Q"][4], 0.01)           # 17:00, the quarter of the 5 kW peak
+
+    def test_full_path_usable_bump_still_counts(self):
+        _, _, diag = self._run(120)
+        self.assertFalse(diag["bump_skipped"])
+        self.assertAlmostEqual(diag["inputs"]["tmin"][0], 23.0 - wpp.MARGIN)
+
+
 class TestRunState(unittest.TestCase):
     """Running / off-time / supply from energy rows: (ts, flame, ot_flow, rpm, input_w, sparrow_outlet)."""
     NOW = datetime(2026, 11, 3, 18, 2)

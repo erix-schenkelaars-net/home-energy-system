@@ -1191,6 +1191,47 @@ class TestSoftStart(unittest.TestCase):
         self.assertEqual(wp.soft_start_flow(30.0, 38.0, 21.0, 21.2, False, None, c, 27.0), (30.0, None))
 
 
+class TestSoftLanding(unittest.TestCase):
+    """Bij minimumvermogen stopt de P60 als het doel ~3 °C onder het water ligt (5 stops 11-05..11-08)."""
+    LAND = (37.0, 0.5, 32.0)
+
+    def drop(self, plan, last, running=True):
+        return wp.planner_flow_drop(plan, last, running, 1.0, *self.LAND)
+
+    def test_evening_of_2026_11_08(self):
+        # plan 30.5 from 38.9: without landing 32.9 at 16:03 against water ~36 -> stop
+        sent, last = [], 38.9
+        for _ in range(7):
+            last, _why = self.drop(30.5, last)
+            sent.append(last)
+        self.assertEqual(sent, [37.9, 36.9, 36.4, 35.9, 35.4, 34.9, 34.4])
+
+    def test_full_speed_above_the_knee(self):
+        self.assertEqual(self.drop(30.0, 40.0)[0], 39.0)
+
+    def test_half_speed_at_the_knee(self):
+        self.assertEqual(self.drop(30.0, 37.0)[0], 36.5)
+
+    def test_note_names_the_landing_step(self):
+        self.assertIn("-0.5", self.drop(30.0, 36.0)[1])
+
+    def test_stops_at_the_floor_and_stays_there(self):
+        self.assertEqual(self.drop(30.0, 32.4)[0], 32.0)
+        self.assertEqual(self.drop(30.0, 32.0)[0], 32.0)
+
+    def test_target_already_below_the_floor_is_not_raised(self):
+        # e.g. a soft start running at 30: the floor must not push the heat up
+        self.assertEqual(self.drop(30.0, 30.0), (30.0, None))
+        self.assertEqual(self.drop(29.0, 31.0)[0], 31.0)
+
+    def test_small_drop_and_rise_pass_untouched(self):
+        self.assertEqual(self.drop(35.8, 36.0), (35.8, None))
+        self.assertEqual(self.drop(45.0, 36.0), (45.0, None))
+
+    def test_not_while_stopped(self):
+        self.assertEqual(self.drop(30.0, 36.0, running=False), (30.0, None))
+
+
 class TestPlannerFlowDrop(unittest.TestCase):
     """Planner-pad: doel zakt hooguit 1 °C/cyclus onder het vorige commando zolang de WP draait.
     2026-11-05 09:44-10:06: plan 38,5 -> 37,9 -> 32,5 -> 32,5 -> 31,2 bij aanvoer ~35 -> P60 stopte zelf."""

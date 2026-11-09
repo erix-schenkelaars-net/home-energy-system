@@ -156,6 +156,9 @@ them).
 | `WP_FLOW_CURVE` | `20:28,10:38,0:42,-10:48,-25:50,-30:50` | weather curve `outside:flow`, linearly interpolated. The 10 °C point went 35 → 38 on 2026-11-02: on the first day without the I ratchet the room stayed 0.4–0.6 °C under the setpoint around 10 °C outside (the old high I had been hiding that gap) |
 | `WP_FLOW_MIN` | `28` | flow floor (also with negative compensation) |
 | `WP_FLOW_CAP` | `50` | flow ceiling |
+| `WP_FLOW_LAND_BELOW` | `37` | soft landing: from this target down, the planner's target falls by `WP_FLOW_LAND_STEP` per cycle |
+| `WP_FLOW_LAND_STEP` | `0.5` | °C per cycle during the soft landing |
+| `WP_FLOW_LAND_FLOOR` | `32` | lowest planner target while the heat pump runs (a target already below it is not raised) |
 | `WP_FLOW_MAX_DROP` | `1.0` | the flow target falls by at most this many °C per cycle (rises immediately); a sudden drop below the return temperature makes the heat pump stop and then sit idle for 60 min |
 | `WP_ROOMCOMP_KP` | `4` | P: °C of flow per °C the room is short |
 | `WP_ROOMCOMP_MAX` | `10` | maximum positive compensation |
@@ -239,6 +242,12 @@ below the curve (so it stays above the cooled water and the P60 does start), nev
 `WP_FLOW_MIN` and never above the planner's own target. Logged as `[PLAN] zachte herstart ...`;
 `energy.wp_shadow_flow_target_c` holds what was sent, `wp_plan` what the planner asked.
 
+**Soft landing.** At minimum compressor speed the P60 stops itself once its target is ~3 °C below the
+water. Five self-stops from 2026-11-05 to 11-08 happened that way, at 900 rpm with the water 3.1-4.1 °C
+above the target. So from `WP_FLOW_LAND_BELOW` the target falls half as fast, and it stays at or above
+`WP_FLOW_LAND_FLOOR` while the pump runs: the planner asks ~30 °C for 1.5 kW, while the water holds at
+~32.5 °C at minimum power. Both are fixed values, not the measured supply, so the 11-03 ratchet cannot return.
+
 **Drop limit.** While the pump runs, the planner's target may fall at most `WP_FLOW_MAX_DROP` °C per
 cycle below the previous command (rising is immediate), the same brake the rules have. Without it a
 smaller planned heat dropped the target below the still-warm supply and the P60 stopped itself for
@@ -266,6 +275,12 @@ water + 3 (2026-11-06 10:39: target 28.5 °C, the room fell to 20.9 at a floor o
 **Bump cap.** During a Honeywell bump the planner's heat is capped at `WP_BUMP_QMAX` (default 5 kW). A
 bump lasts an hour; 10 kW at 50 °C does not reach 23 °C in that hour anyway and mostly buys a poor COP
 (2026-11-07: three bumps, 30-60 min at 7-8 kW each, ~EUR 1.50).
+
+**Bump during the restart lockout.** A bump that leaves less than `WP_BUMP_MIN_USABLE_MIN` (default 30)
+after the ~60 min restart lockout is left out of the plan: normal comfort floor, no heat cap, and
+`bump genegeerd` in the `[PLAN]` log. On 2026-11-08 a bump at 16:09 until 17:09, just after a stop at
+16:00, made the plan buy 5 kW at EUR 0.50 in the one quarter it could still act on, for a floor it could
+not reach. The knob and the setpoint shown stay as they are; only the plan ignores it.
 
 **House model refit 2026-11-06** (UA 172 -> 262 W/K): fitted on 10-18..11-06, held out 11-06..11-07:
 RMSE 0.48 -> 0.31 K, 24 h ahead 0.40 -> 0.04 K. The old night term (-0.7 kW) was compensating a too-low
