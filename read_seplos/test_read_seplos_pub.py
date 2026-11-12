@@ -218,6 +218,22 @@ class TestCalculateDynamicLimits(unittest.TestCase):
         chg, dis = mod.calculate_dynamic_limits(**self.NORMAL)
         self.assertEqual(dis, mod.MAX_DISCHARGE_LIMIT)
 
+    def test_discharge_tapers_scale_from_the_discharge_limit(self):
+        """The vdelta and high-temp tapers limit DISCHARGE, so they must start from
+        MAX_DISCHARGE_LIMIT, not MAX_CHARGE_LIMIT. With the two different, halfway down
+        each taper the discharge limit is half the discharge maximum."""
+        from unittest.mock import patch as _patch
+        with _patch.object(mod, "MAX_CHARGE_LIMIT", 60), _patch.object(mod, "MAX_DISCHARGE_LIMIT", 40):
+            mid_vd = (mod.VDELTA_TAPER_START_MV + mod.VDELTA_TAPER_END_MV) / 2
+            _, dis = mod.calculate_dynamic_limits(soc=60, vmin_mv=3300, vmax_mv=3350,
+                                                  vdiff_mv=mid_vd, tmax=25, tmin=20)
+            self.assertEqual(dis, 20)
+            mid_t = (mod.TMAX_TAPER_START + mod.TMAX_CUTOFF) / 2
+            chg, dis = mod.calculate_dynamic_limits(soc=60, vmin_mv=3300, vmax_mv=3350,
+                                                    vdiff_mv=5, tmax=mid_t, tmin=20)
+            self.assertEqual(dis, 20)
+            self.assertEqual(chg, 30)
+
     def test_overtemperature_cutoff_returns_zero(self):
         chg, dis = mod.calculate_dynamic_limits(
             soc=60, vmin_mv=3300, vmax_mv=3350, vdiff_mv=5,

@@ -21,7 +21,7 @@ HA REST API     ──► EV plug power (Antela smart plug)
   192 quarter-slots × variables per slot:
     charge_on      (binary)
     charge_kw      (continuous, 0–3 kW)
-    bat_discharge  (continuous, 0–3 kW)
+    bat_discharge  (continuous, 0–2.8 kW)
     passive_charge (PV-only, 0–3 kW)
     grid_import    (continuous)
     grid_export    (continuous)
@@ -54,7 +54,7 @@ The `pv_charge_reward` (€0.40/kWh) incentivises storing PV surplus even when t
 |-------|-----------------|
 | **SoC continuity** | `soc[t+1] = soc[t] + charge_eff × charge_kw[t] × SLOT_H − discharge_kw[t] / discharge_eff × SLOT_H` |
 | **SoC limits** | `3.2 kWh ≤ soc[t] ≤ 14.32 kWh` (20–89.5 %) — hard, never violated |
-| **Power limits** | `0 ≤ charge_kw ≤ 3.0`, `0 ≤ discharge_kw ≤ 3.0` |
+| **Power limits** | `0 ≤ charge_kw ≤ 3.0`, `0 ≤ discharge_kw ≤ 2.8` (`BAT_MAX_DISCHARGE_KW`: keeps the pack at ~55 A, where the cell-reading artefact of cells 10-16 does not occur) |
 | **Min charge** | `charge_kw ≥ BAT_MIN_CHARGE_KW (0.3)` when `charge_on = 1` |
 | **Export gate** | grid_export = 0 in MINIMIZE_EXPORT mode |
 | **LOAD_FIRST drain (A/B/C)** | Ensures passive battery drain matches the inverter's autonomous behaviour |

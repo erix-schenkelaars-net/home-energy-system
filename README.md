@@ -169,7 +169,8 @@ breaks the schedule pipeline.
 Battery safety always overrides the optimiser.
 
 - Battery SoC: **20 % hard floor**, **89.5 % max** (the Seplos BMS trips at 89.8 %)
-- Charge/discharge rate: **≤ 3.0 kW**
+- Charge rate: **≤ 3.0 kW**; discharge: **≤ 2.8 kW** (~55 A, `BAT_MAX_DISCHARGE_KW`; the pack shows a
+  cell-reading artefact only at ~60 A discharge)
 - Cell protection: dynamic current tapering on cell voltage, cell imbalance and temperature,
   written straight to the Seplos PCS registers by `read_seplos`
 - Guards run independently of the optimiser and can override any schedule

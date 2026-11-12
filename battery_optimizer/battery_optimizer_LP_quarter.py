@@ -2757,7 +2757,7 @@ def optimise(  # noqa: C901
     ub_vars = np.full(total_vars, np.inf)
     ub_vars[co_base : co_base + n] = 1.0              # charge_on: binary [0,1]
     ub_vars[ck_base : ck_base + n] = BAT_MAX_CHARGE_KW  # charge_kw: [0, 3 kW]
-    ub_vars[bd_base : bd_base + n] = BAT_MAX_DISCHARGE_KW  # bat_discharge: [0, 3 kW]
+    ub_vars[bd_base : bd_base + n] = BAT_MAX_DISCHARGE_KW  # bat_discharge: [0, BAT_MAX_DISCHARGE_KW]
     for t in range(n + 1):
         lb_vars[soc_base + t] = soc_lb[t]
         ub_vars[soc_base + t] = soc_ub[t]

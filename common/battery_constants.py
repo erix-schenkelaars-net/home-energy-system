@@ -24,7 +24,13 @@ SPH5000 truncation note:
 BAT_CAPACITY_KWH     = 16.0   # usable capacity (16 × 314 Ah × 3.2 V = 16.08 nameplate)
 BAT_MAX_CHARGE_KW    = 3.0    # SPH5000 hardware charge limit
 BAT_MIN_CHARGE_KW    = 0.3    # minimum meaningful charge power
-BAT_MAX_DISCHARGE_KW = 3.0    # SPH5000 hardware discharge limit
+BAT_MAX_DISCHARGE_KW = 2.8    # SPH5000 can do 3.0; capped so the pack stays at ~55 A (2.8 kW → 93 %
+                              # of BAT_RATED_W ≈ 2.84 kW DC). Since Sep 2026 cells 10-16 have read
+                              # ~160 mV low for ~20 s five times, only ever at ~60 A discharge (0 in
+                              # 398 h of ≥55 A charging) — a measurement artefact that trips the vdelta
+                              # taper. The BMS limit stays 60 A (read_seplos), so the inverter no longer
+                              # runs against it. Costs ~€10-20/yr of peak discharge. Back to 3.0 if the
+                              # artefact also shows at 55 A.
 BAT_RATED_W          = 3000   # same as BAT_MAX_CHARGE_KW, in watts (controller uses W)
 
 # Efficiency: inverter AC↔DC (~96%) × battery cell (~95%)

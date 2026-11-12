@@ -50,8 +50,8 @@ BAUD = 19200
 PARITY = 'N'
 TIMEOUT = 1.5
 
-REG_PCS_CHG_LIMIT = 0x1366  # positive value = max charge current (A); 0 = no limit
-REG_PCS_DIS_LIMIT = 0x1367  # negative value = max discharge current (A); 0 = no limit
+REG_PCS_CHG_LIMIT = 0x1366  # positive value = max charge current (A); 0 = 0 A (charging stopped)
+REG_PCS_DIS_LIMIT = 0x1367  # negative value = max discharge current (A); 0 = 0 A (discharge stopped)
 
 MAX_CHARGE_LIMIT = 60
 MAX_DISCHARGE_LIMIT = 60   # writing -60 to discharge register means 60 A discharge limit
@@ -433,15 +433,20 @@ def calculate_dynamic_limits(soc, vmin_mv, vmax_mv, vdiff_mv, tmax, tmin):
     # 4. High temperature taper (linear, both directions)
     # ----------------------------------------------------------------
     if tmax >= TMAX_TAPER_START:
-        temp_hi_limit = linear_taper(
+        max_charge = min(max_charge, linear_taper(
             tmax,
             start=TMAX_TAPER_START,
             end=TMAX_CUTOFF,
             limit_high=MAX_CHARGE_LIMIT,
             limit_low=0.0
-        )
-        max_charge = min(max_charge, temp_hi_limit)
-        max_discharge = min(max_discharge, temp_hi_limit)
+        ))
+        max_discharge = min(max_discharge, linear_taper(
+            tmax,
+            start=TMAX_TAPER_START,
+            end=TMAX_CUTOFF,
+            limit_high=MAX_DISCHARGE_LIMIT,
+            limit_low=0.0
+        ))
 
     # ----------------------------------------------------------------
     # 5. Cold temperature taper (charge only — never discharge-limit on cold)
@@ -468,7 +473,7 @@ def calculate_dynamic_limits(soc, vmin_mv, vmax_mv, vdiff_mv, tmax, tmin):
             vdiff_mv,
             start=VDELTA_TAPER_START_MV,
             end=VDELTA_TAPER_END_MV,
-            limit_high=MAX_CHARGE_LIMIT,
+            limit_high=MAX_DISCHARGE_LIMIT,
             limit_low=0.0
         )
         max_discharge = min(max_discharge, vdelta_limit)

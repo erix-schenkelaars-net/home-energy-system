@@ -214,8 +214,9 @@ vmin_glob: Optional[int] = None  # latest min cell voltage in mV from seplos DB;
 # max battery charge = max battery discharge = 3000 W -> 100%.
 # --------------------------------------------------
 BAT_RATED_W               = bc.BAT_RATED_W   # 3000 W max battery charge/discharge
-DB_SCHEDULE_DISCHARGE_PCT = 100              # % for DISCHARGE action (full 3000 W)
-DB_SCHEDULE_EXPORT_PCT    = 100              # % for EXPORT action   (full 3000 W)
+# Full-rate fallback when a slot carries no bat_kwh: the discharge cap, not a blind 100 %.
+DB_SCHEDULE_DISCHARGE_PCT = int(bc.BAT_MAX_DISCHARGE_KW * 1000 / (BAT_RATED_W / 100))  # 2.8 kW -> 93
+DB_SCHEDULE_EXPORT_PCT    = DB_SCHEDULE_DISCHARGE_PCT
 
 # --------------------------------------------------
 # BASE SOC GUARDS — sourced from common/battery_constants.py

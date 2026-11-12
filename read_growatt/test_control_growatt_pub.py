@@ -1101,8 +1101,10 @@ class TestDischargePowerFromPlan(unittest.TestCase):
         slot.setdefault("action", "BATTERY_FIRST+DISCHARGE")
         return ctrl.slot_to_conf(slot, self.now, self.base).power
 
-    def test_full_rate_is_100pct(self):
-        self.assertEqual(self._power(bat_kwh=-0.75), -100)      # 3 kW
+    def test_full_rate_is_capped_at_max_discharge(self):
+        # 3 kW planned -> clamped to BAT_MAX_DISCHARGE_KW (2.8 kW = 93 %, keeps the pack at ~55 A)
+        self.assertEqual(self._power(bat_kwh=-0.75), -93)
+        self.assertEqual(ctrl.DB_SCHEDULE_DISCHARGE_PCT, 93)
 
     def test_half_rate_is_50pct(self):
         self.assertEqual(self._power(bat_kwh=-0.375), -50)      # 1.5 kW
@@ -1110,14 +1112,15 @@ class TestDischargePowerFromPlan(unittest.TestCase):
     def test_small_near_floor_discharge_is_gentle(self):
         self.assertEqual(self._power(bat_kwh=-0.30), -40)       # 1.2 kW, far below a 3 kW burst
 
-    def test_missing_bat_kwh_falls_back_to_full(self):
+    def test_missing_bat_kwh_falls_back_to_the_cap(self):
         self.assertEqual(self._power(), -ctrl.DB_SCHEDULE_EXPORT_PCT)
+        self.assertEqual(self._power(), -93)                    # not a blind 100 %
 
     def test_export_action_also_follows_the_plan(self):
         self.assertEqual(self._power(action="EXPORT", bat_kwh=-0.375), -50)
 
-    def test_over_3kw_is_clamped_to_full(self):
-        self.assertEqual(self._power(bat_kwh=-1.0), -100)       # 4 kW clamps to 100%
+    def test_over_cap_is_clamped(self):
+        self.assertEqual(self._power(bat_kwh=-1.0), -93)        # 4 kW clamps to 2.8 kW
 
 
 # ─────────────────────────────────────────────────────────────────────────────
