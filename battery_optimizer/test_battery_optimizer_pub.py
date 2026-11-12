@@ -2172,5 +2172,47 @@ class TestWpPlanInLoad(unittest.TestCase):
         conn = MagicMock(); conn.cursor.side_effect = RuntimeError("down")
         self.assertEqual(mod.load_wp_plan(conn, datetime(2026, 11, 3, 13)), {})
 
+class TestEnergyZeroFetch(unittest.TestCase):
+    """Price fetch edge cases seen live on 2026-11-12."""
+
+    @staticmethod
+    def _resp(status, payload):
+        r = MagicMock()
+        r.status_code = status
+        r.json.return_value = payload
+        if status >= 400:
+            r.raise_for_status.side_effect = Exception(f"{status} Client Error")
+        return r
+
+    def test_not_yet_published_is_empty_not_an_error(self):
+        r = self._resp(404, {"code": 5, "message": "prices do not span the whole requested date"})
+        with patch.object(mod.requests, "get", return_value=r):
+            self.assertEqual(mod._fetch_quarter_prices_public(date(2026, 11, 13)), {})
+
+    def test_other_404_still_raises(self):
+        r = self._resp(404, {"code": 9, "message": "something else"})
+        with patch.object(mod.requests, "get", return_value=r):
+            with self.assertRaises(Exception):
+                mod._fetch_quarter_prices_public(date(2026, 11, 13))
+
+    def test_hourly_fallback_asks_the_local_day(self):
+        r = self._resp(200, {"Prices": []})
+        with patch.object(mod.requests, "get", return_value=r) as g:
+            mod._fetch_hourly_expanded(date(2026, 11, 13))
+        params = g.call_args.kwargs["params"]
+        want = datetime(2026, 11, 13).astimezone(mod.timezone.utc)
+        self.assertEqual(params["fromDate"], want.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+
+    def test_hourly_fallback_fills_all_96_quarters_of_the_local_day(self):
+        start = datetime(2026, 11, 13).astimezone(mod.timezone.utc)
+        prices = [{"readingDate": (start + timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "price": 0.20 + h / 100} for h in range(25)]   # one hour into the next day
+        with patch.object(mod.requests, "get", return_value=self._resp(200, {"Prices": prices})):
+            got = mod._fetch_hourly_expanded(date(2026, 11, 13))
+        self.assertEqual(sorted(got), list(range(96)))
+        self.assertAlmostEqual(got[0], 0.20)        # local 00:00, not tomorrow's midnight
+        self.assertAlmostEqual(got[95], 0.43)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -433,6 +433,14 @@ ENERGYZERO_URL        = "https://api.energyzero.nl/v1/energyprices"
 ENERGYZERO_PUBLIC_URL = "https://public.api.energyzero.nl/public/v1/prices"
 
 
+def _ez_not_yet_published(r) -> bool:
+    """True for the public API's 404 that means "no (complete) prices for this date yet"."""
+    try:
+        return r.json().get("code") == 5
+    except Exception:
+        return False
+
+
 def _fetch_quarter_prices_public(target_date: date) -> dict[int, float]:
     """Fetch quarter prices from EnergyZero public API (96 prices/day).
     Returns {0..95}: key = hour*4 + minute//15 (local time)."""
@@ -442,6 +450,12 @@ def _fetch_quarter_prices_public(target_date: date) -> dict[int, float]:
         "interval":   "INTERVAL_QUARTER",
     }
     r = requests.get(ENERGYZERO_PUBLIC_URL, params=params, timeout=15)
+    if r.status_code == 404 and _ez_not_yet_published(r):
+        # The normal state for tomorrow until the day-ahead prices are out (~13:30-14:30):
+        # the API answers 404 code 5 "prices do not span the whole requested date".
+        # Not a failure, so no warning; the caller falls back / uses today as proxy.
+        dbg(2, DEBUG_PRICES, "PRICES", f"Public API: {target_date} not published yet")
+        return {}
     r.raise_for_status()
     # base_with_vat = EPEX spot + 21% VAT, excl. energy tax; same as old API inclBtw=true.
     prices = {}
@@ -459,10 +473,15 @@ def _fetch_quarter_prices_public(target_date: date) -> dict[int, float]:
 
 
 def _fetch_hourly_expanded(target_date: date) -> dict[int, float]:
-    """Fallback: old API interval=4 (hourly prices) expanded to 4 identical quarters."""
-    start = datetime(target_date.year, target_date.month, target_date.day,
-                     0, 0, 0, tzinfo=timezone.utc)
-    end   = start + timedelta(hours=23, minutes=59)
+    """Fallback: old API interval=4 (hourly prices) expanded to 4 identical quarters.
+
+    The window is the LOCAL day, sent in UTC: local midnight is 23:00Z (22:00Z in summer) of
+    the day before. Asking 00:00Z-23:59Z instead (as until 2026-11-12) returned 23 hours and
+    lost 00:00-01:00, which then fell to the DB backfill or the 0.15 last resort."""
+    nxt   = target_date + timedelta(days=1)
+    start = datetime(target_date.year, target_date.month, target_date.day).astimezone(timezone.utc)
+    end   = (datetime(nxt.year, nxt.month, nxt.day).astimezone(timezone.utc)
+             - timedelta(minutes=1))
     params = {
         "fromDate":  start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         "tillDate":  end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
@@ -477,6 +496,8 @@ def _fetch_hourly_expanded(target_date: date) -> dict[int, float]:
         try:
             dt_utc   = datetime.fromisoformat(entry["readingDate"].replace("Z", "+00:00"))
             dt_local = dt_utc.astimezone().replace(tzinfo=None)
+            if dt_local.date() != target_date:
+                continue
             h        = dt_local.hour
             p        = float(entry["price"])
             for q in range(4):
