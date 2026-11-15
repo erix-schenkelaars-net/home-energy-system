@@ -8,7 +8,9 @@ Per quarter it decides on/off and the heat Q (kW) on top of house_model:
   * Q between q_min (higher in the cold, house_model.q_min_at) and q_max while on; a start costs START_COST (efficiency lost on short runs)
   * after every stop the P60 refuses to restart for ~60 min (measured 2026-11-03): modelled as a hard
     minimum off-time, including a lockout still running at the start of the plan
-  * comfort: room >= WP_COMFORT_MIN band + MARGIN, soft with a high penalty so the plan stays feasible
+  * comfort: room >= WP_COMFORT_MIN band + MARGIN, soft with a high penalty so the plan stays feasible;
+    upward band steps are ramps (comfort_floors) and the floor is briefly lowered after a defrost
+    (defrost_relax), so neither forces heat into the last quarters before a deadline
 Objective: sum(price * electricity) + start costs + comfort penalties.
 
 Needs numpy/scipy. Not wired into wp_control yet: run `backtest` to see what it would have done.
@@ -47,7 +49,24 @@ BUMP_QMAX = float(os.environ.get("WP_BUMP_QMAX", "5.0"))
 # at 16:00, bump at 16:09 until 17:09: the only quarter it could still act on was 17:00, so the plan
 # bought 5 kW at EUR 0.50 for a 22.8 floor it could never reach.
 BUMP_MIN_USABLE_MIN = float(os.environ.get("WP_BUMP_MIN_USABLE_MIN", "30"))
-DEFAULT_COMFORT = "07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=18.0"
+DEFAULT_COMFORT = "07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=19.5"
+# An upward step in the comfort bands becomes a staircase of COMFORT_STEP_K per quarter, centred on the
+# step: at the moment of the step half of it is made, the rest in the quarters after. If that takes
+# longer than COMFORT_RAMP_MAX_MIN, the stairs are COMFORT_STEP_MAX_K high; if even that is too long
+# (18.0 -> 20.8 in the morning), the staircase starts higher so it still fits. The 0.5 K steps were the
+# Honeywell clock's; as a hard floor at 09:00 they made the plan cram heat into the last quarters before
+# the step, whatever the price (2026-11-14: 6.8 kW at 50 °C in 08:15-08:45). COMFORT_STEP_K 0 = hard steps.
+COMFORT_STEP_K = float(os.environ.get("WP_COMFORT_STEP_K", "0.1"))
+COMFORT_STEP_MAX_K = float(os.environ.get("WP_COMFORT_STEP_MAX_K", "0.2"))
+COMFORT_RAMP_MAX_MIN = float(os.environ.get("WP_COMFORT_RAMP_MAX_MIN", "120"))
+# After a defrost the floor is lowered by DEFROST_RELAX_K for DEFROST_RELAX_H hours after its end (then
+# back by COMFORT_STEP_K per quarter), so the heat a defrost missed (~1-1.5 kWh, ~0.1 K room) is made up in
+# the cheapest hours instead of right away at full power. Not cumulative: repeated defrosts only extend
+# the window, the floor is never more than DEFROST_RELAX_K lower. 0 = off.
+DEFROST_RELAX_K = float(os.environ.get("WP_DEFROST_RELAX_K", "0.2"))
+DEFROST_RELAX_H = float(os.environ.get("WP_DEFROST_RELAX_H", "4"))
+DEFROST_GAP_K = 2.0          # flow this much below return with the compressor on = defrost (see defrost_from_rows)
+DEFROST_MIN_ROWS = 2         # in at least this many consecutive 5-min rows
 
 
 # ---------------------------------------------------------------- comfort bands
@@ -72,6 +91,109 @@ def comfort_min(bands, when):
         if (a <= mm < b) if a < b else (mm >= a or mm < b):
             return t
     return None
+
+
+def comfort_staircase(lo, hi, step=None, step_max=None, max_q=None):
+    """PURE: the stairs for an upward step lo -> hi: (start, stair height, number of stairs n, stairs
+    already made at the moment of the step). Stairs of `step`; if more than max_q quarters, of
+    `step_max`; if still too many, it starts at hi - max_q * step_max instead of lo."""
+    step = COMFORT_STEP_K if step is None else step
+    step_max = COMFORT_STEP_MAX_K if step_max is None else step_max
+    max_q = int(COMFORT_RAMP_MAX_MIN // 15) if max_q is None else max_q
+    n = math.ceil((hi - lo) / step - 1e-9)
+    if n > max_q:
+        step = step_max
+        n = math.ceil((hi - lo) / step - 1e-9)
+    if n > max_q:
+        n, lo = max_q, hi - max_q * step
+    return lo, step, n, math.ceil(n / 2)
+
+
+def comfort_floors(bands, times, step=None, step_max=None, max_q=None):
+    """PURE: the comfort floor per time in `times` (consecutive quarters). Every upward step at T
+    (lo -> hi) becomes a staircase (comfort_staircase) centred on T: at T half of it is made (rounded
+    up), it starts `half` quarters before T and reaches hi n - half quarters after. Downward steps and
+    the end of a band apply at once (they never ask for heat). A band that starts after a period
+    without one is a step from 0.5 K below it. step <= 0 -> the bands as they are."""
+    step = COMFORT_STEP_K if step is None else step
+    max_q = int(COMFORT_RAMP_MAX_MIN // 15) if max_q is None else max_q
+    if step <= 0 or not times:
+        return [comfort_min(bands, t) for t in times]
+    q = timedelta(minutes=15)
+    grid = [times[0] + q * j for j in range(-max_q - 1, len(times) + max_q + 1)]
+    base = [comfort_min(bands, t) for t in grid]
+    off = max_q + 1                                  # grid index of times[0]
+    out = list(base[off:off + len(times)])
+    for i in range(1, len(grid)):
+        hi, prev = base[i], base[i - 1]
+        if hi is None or (prev is not None and hi <= prev):
+            continue                                 # not an upward step
+        lo, s, n, half = comfort_staircase(hi - 0.5 if prev is None else prev, hi, step, step_max, max_q)
+        for j in range(max(0, i - half - off), min(len(times), i + n - half - off)):
+            k = j + off - i                          # quarters relative to the step
+            v = round(min(hi, lo + s * (half + k)), 2)
+            if k < 0:                                # before the step: raise towards it
+                out[j] = v if out[j] is None else max(out[j], v)
+            elif out[j] is not None:                 # after it: hold back (a band that ended stays ended)
+                out[j] = min(out[j], v)
+    return [None if f is None else round(f, 2) for f in out]
+
+
+def defrost_relax(t, defrost_end, k=None, hold_h=None, rate=None):
+    """PURE: how much the comfort floor at time t is lowered after a defrost that ended at
+    defrost_end: k until hold_h hours after it, then back to 0 at `rate` K/h (at once if rate <= 0)."""
+    k = DEFROST_RELAX_K if k is None else k
+    hold_h = DEFROST_RELAX_H if hold_h is None else hold_h
+    rate = COMFORT_STEP_K / DT if rate is None else rate
+    if defrost_end is None or k <= 0:
+        return 0.0
+    over_h = (t - defrost_end).total_seconds() / 3600 - hold_h
+    if over_h < 0:
+        return k
+    return max(0.0, k - rate * over_h) if rate > 0 else 0.0
+
+
+def defrost_from_rows(rows, gap=DEFROST_GAP_K, min_rows=DEFROST_MIN_ROWS):
+    """PURE: the most recent defrost in energy rows (ts, flame, ot_flow, ot_return, flow_cmd), oldest
+    first -> {"start", "end", "flow_before"} or None.
+
+    Read from the OTThing (local OpenTherm), not from the Sparrow status: that comes through the cloud
+    and HA's Weheat integration and freezes now and then -- its negative output power with it. During
+    a defrost the P60 pulls heat back out of the water, so the flow runs colder than the return while
+    the compressor runs; while heating it is always warmer. 10-20..11-14: every defrost the Sparrow
+    reported has >= 2 consecutive rows with return - flow >= 2 K, plus one on 11-10 11:35 that the
+    frozen feed reported as 'heating'; the only row outside a defrost was a single one (11-04 14:10).
+    flow_before = our last flow command before the defrost (for the shadow cap in wp_control)."""
+    def hit(r):
+        return bool(r[1]) and r[2] is not None and r[3] is not None and r[3] - r[2] >= gap
+    best, run = None, []
+    for i, r in enumerate(rows):
+        if hit(r) and (not run or (r[0] - rows[run[-1]][0]).total_seconds() <= 360):
+            run.append(i)
+        else:
+            if len(run) >= min_rows:
+                best = (run[0], run[-1])
+            run = [i] if hit(r) else []
+    if len(run) >= min_rows:
+        best = (run[0], run[-1])
+    if best is None:
+        return None
+    before = [r[4] for r in rows[:best[0]] if r[4] is not None]
+    return {"start": rows[best[0]][0], "end": rows[best[1]][0],
+            "flow_before": float(before[-1]) if before else None}
+
+
+def read_defrost(db, now, hours=None):
+    """The most recent defrost in the last DEFROST_RELAX_H + 2 hours (defrost_from_rows), or None."""
+    hours = DEFROST_RELAX_H + 2 if hours is None else hours
+    conn = _db(db)
+    cur = conn.cursor()
+    cur.execute("""SELECT ts, honeywell_ot_boiler_flame, honeywell_ot_boiler_flow_t_c,
+                          honeywell_ot_boiler_return_t_c, wp_shadow_flow_target_c
+                   FROM energy WHERE ts >= %s AND ts <= %s ORDER BY ts""", (now - timedelta(hours=hours), now))
+    rows = cur.fetchall()
+    conn.close()
+    return defrost_from_rows(rows)
 
 
 # ---------------------------------------------------------------- model matrices
@@ -294,7 +416,7 @@ def backtest(day, horizon_h=36, quiet=False, realistic=False, out_json=None):
             inp = {"price": [r["price"] for r in seg], "t_out": [r["t_out"] for r in seg], "pv_kw": [r["pv"] for r in seg]}
         inp.update({
                "hour": [r["t"].hour + r["t"].minute / 60 for r in seg],
-               "tmin": [comfort_min(bands, r["t"]) for r in seg]})
+               "tmin": comfort_floors(bands, [r["t"] for r in seg])})
         res = plan(params, tr, tm, inp, on0=on, off_minutes=off_min)
         if "on" not in res:
             print("solver failed at", seg[0]["t"], res.get("message")); return
@@ -421,15 +543,18 @@ def read_run_state(db, now):
     return run_state_from_rows(rows, now)
 
 
-def build_live_inputs(rows, now, bands, recent, bump=None, lower=None):
+def build_live_inputs(rows, now, bands, recent, bump=None, lower=None, defrost_end=None):
     """PURE: planner inputs from per-quarter rows starting at the current quarter.
 
     rows:   [{"t", "price", "t_out_fc", "pv_fc"}...]; a missing price takes the same quarter a day
             earlier (what the optimiser does before tomorrow's prices are out)
     recent: [(sensor, forecast)...] for the bias correction
-    bump:   (until, temp) -- a Honeywell bump: the room must reach `temp` until `until`, with the heat
-            capped at BUMP_QMAX (WP_BUMP_QMAX) meanwhile
-    lower:  (until, temp) -- a manual lowering: the comfort floor is capped at `temp` until `until`"""
+    bump:   (until, temp[, q_before]) -- a Honeywell bump: the room must reach `temp` until `until`, with
+            the heat capped meanwhile at bump_qmax(q_before), see there
+    lower:  (until, temp) -- a manual lowering: the comfort floor is capped at `temp` until `until`
+    defrost_end: end of the last defrost -> the floor is lowered by defrost_relax (not during a bump:
+            that is an explicit request)
+    The floor itself comes from comfort_floors: upward band steps are ramps."""
     by_t = {r["t"]: r for r in rows}
     price, fc = [], []
     for r in rows:
@@ -447,17 +572,29 @@ def build_live_inputs(rows, now, bands, recent, bump=None, lower=None):
         fc_filled.append(last)
     t_out = corrected_outside(fc_filled, [m for m, _ in recent], [f for _, f in recent])
     tmin, qmax = [], []
-    for r in rows:
-        tm = comfort_min(bands, r["t"])
+    floors = comfort_floors(bands, [r["t"] for r in rows])
+    for r, tm in zip(rows, floors):
+        if tm is not None:
+            tm = round(tm - defrost_relax(r["t"], defrost_end), 2)
         if lower and r["t"] < lower[0]:
             tm = None if tm is None else min(tm, lower[1])
         in_bump = bool(bump and r["t"] < bump[0])
         if in_bump:
             tm = max(tm or 0.0, bump[1] - MARGIN)     # the bump temperature itself, margin included
         tmin.append(tm)
-        qmax.append(BUMP_QMAX if in_bump else None)
+        qmax.append(bump_qmax(bump[2] if len(bump) > 2 else None) if in_bump else None)
     return {"price": price, "t_out": t_out, "pv_kw": [r.get("pv_fc") or 0.0 for r in rows],
             "hour": [r["t"].hour + r["t"].minute / 60 for r in rows], "tmin": tmin, "qmax": qmax}
+
+
+def bump_qmax(q_before):
+    """PURE: the heat cap during a bump: BUMP_QMAX, but never below `q_before`, the heat the planner
+    was already delivering when the bump started (None/0 when it was off or unknown).
+
+    The cap is there so a bump cannot ask the heat pump for 8 kW. It must not make a bump turn the heat
+    DOWN: on 2026-11-15 the planner ran 5.25 kW (price charging), the bump capped it to 5.0 and the
+    flow target fell 1 K -- turning the dial up made the house get less heat."""
+    return max(BUMP_QMAX, q_before or 0.0)
 
 
 def usable_bump(bump, first_slot, running, off_min, min_off_min):
@@ -517,14 +654,19 @@ def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flo
     running, off_min, outlet, on_min, start_water = read_run_state(db, now)
     recent = [(r["t_out"], r["t_out_fc"]) for r in past[-BIAS_HOURS * 4:]]
     bump_used = usable_bump(bump, fut[0]["t"], running, off_min, params["heat_pump"]["min_off_min"])
-    inp = build_live_inputs(fut, now, bands, recent, bump_used, lower)
+    try:
+        defrost = read_defrost(db, now)
+    except Exception:            # without it the floor is simply not relaxed: the behaviour before 11-14
+        defrost = None
+    inp = build_live_inputs(fut, now, bands, recent, bump_used, lower, defrost and defrost["end"])
     res = plan(params, room_now, tm, inp, on0=running, off_minutes=off_min)
     if "on" not in res:
         raise RuntimeError(f"solver: {res.get('message')}")
     dec = live_decision(params, res, room_now, outlet, running, flow_min, flow_cap)
     diag = {"tm": tm, "running": running, "off_min": off_min, "on_min": on_min, "start_water": start_water, "outlet": outlet, "slots": n,
             "bias": inp["t_out"][0] - fut[0]["t_out_fc"] if fut[0]["t_out_fc"] is not None else None,
-            "cost": res["cost"], "times": [r["t"] for r in fut], "inputs": inp, "bump_skipped": bool(bump and not bump_used)}
+            "cost": res["cost"], "times": [r["t"] for r in fut], "inputs": inp, "bump_skipped": bool(bump and not bump_used),
+            "defrost": defrost, "relax": defrost_relax(fut[0]["t"], defrost and defrost["end"])}
     return dec, res, diag
 
 

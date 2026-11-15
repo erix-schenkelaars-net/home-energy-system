@@ -233,6 +233,33 @@ and then repeats its last row (2026-11-03: "heating" for 45 min after the pump h
 5-min row that has neither yet is skipped: it is the row another service has just opened, and read
 as "not running" it once made the planner stop a running pump itself (2026-11-04 13:10).
 
+**Ramped comfort steps and defrosts** (2026-11-14). The bands came from the Honeywell clock in 0.5 K
+steps. As a hard floor a step at 09:00 made the plan cram heat into the last cheap quarters before
+it, and a defrost just before (15 min without heat) made it worse: 08:15-08:45 the plan went from
+3.75 to 6.76 kW at a 50 °C supply, the P60 ran at 98 % for 70 min, and the room ended 0.3 K over.
+Now an upward step is a staircase of 0.1 K per quarter centred on the step, half made at the moment
+itself: 09:00 20.8 → 21.3 reads 20.9 / 21.0 at 08:30 / 08:45, 21.1 at 09:00, 21.3 at 09:30; 13:00
+21.3 → 21.7 is 21.5 at 13:00. A step that would take more than 2 h gets 0.2 K stairs (night 19.5 →
+20.8: 19.5 at 06:00, 20.3 at 07:00, 20.8 at 07:45). After a defrost the floor is 0.2 K lower for 4 h,
+so the planner makes up the missed heat (~1-1.5 kWh, ~0.1 K of room) in the cheapest hours. Replayed
+on that morning with a defrost relax and the first (trailing) ramp, 08:47: 2.99 kW instead of 6.76.
+The log shows `ontdooid HH:MM -> grens -0.20K`. The heat-pump chart's blue "Comfortgrens" line is
+`wp_plan.tmin_c`, so it shows the stairs and the relax as the planner used them.
+
+The defrost is read from the OTThing, not from the Sparrow status: that comes through the cloud and
+freezes now and then, its negative output power with it. During a defrost the flow runs colder than
+the return while the compressor runs; two consecutive 5-min rows with return − flow ≥ 2 K found
+every defrost 10-20..11-14, plus one the frozen feed reported as "heating" (11-10 11:35), with no
+false alarm. If the OTThing rows are missing, the floor is simply not relaxed.
+
+`[SCHADUW ontdooi-kap]` in the log (only a log line, it steers nothing): what a cap at the
+pre-defrost supply target would have sent in the hour after a defrost. Whether that would stop the
+P60 going to 98 % after a defrost is unproven (the gap to the ~35 °C water may drive it anyway).
+
+Not done on purpose: dropping the target faster while the compressor runs high. On 2026-11-04 the
+P60 ran at 98 % when the target fell from 50 to 36 °C with water at 52 °C; within 10 min it was at
+16 % and stopped, followed by an hour of restart lockout. The 1 °C/cycle limit stays.
+
 **Soft restart.** The planner sends a supply temperature, not a heat output. After a stop the system
 is cold, so a high target makes the P60 run flat out until the supply gets there (2026-11-04: plan
 4.3 kW, measured 7.8; target 50 °C, 9.6 kW). While the pump starts and for the first
@@ -254,7 +281,7 @@ smaller planned heat dropped the target below the still-warm supply and the P60 
 an hour (2026-11-05 10:06: 38.5 -> 31.2 °C in 20 min at a supply of ~35 °C). It counts from our own
 previous command, never from the measured supply. Logged as `[PLAN] aanvoer-rem ...`.
 
-**Start kick.** A 200 L vessel without sensor sits in series behind the heat pump (heat pump -> vessel
+**Start kick.** A 50 L vessel (Weheat WBF50) without sensor sits in series behind the heat pump (heat pump -> vessel
 -> pump -> gas boiler -> buffer valve -> radiators). It stays warm after a stop; at a green light the P60
 first runs its pump, measures that water, and does not start while our target is below it (2026-11-05
 15:48-16:40: no heat for almost two hours at a target of 29.7-31 °C with water at 31-32 °C). While the
@@ -274,7 +301,11 @@ water + 3 (2026-11-06 10:39: target 28.5 °C, the room fell to 20.9 at a floor o
 
 **Bump cap.** During a Honeywell bump the planner's heat is capped at `WP_BUMP_QMAX` (default 5 kW). A
 bump lasts an hour; 10 kW at 50 °C does not reach 23 °C in that hour anyway and mostly buys a poor COP
-(2026-11-07: three bumps, 30-60 min at 7-8 kW each, ~EUR 1.50).
+(2026-11-07: three bumps, 30-60 min at 7-8 kW each, ~EUR 1.50). The cap never goes below the heat the
+planner was already delivering when the bump started (`ovr_q`, kept across a restart): on 2026-11-15 the
+planner ran 5.25 kW during price charging, the bump capped it to 5.0 and the flow target fell 1 K, so
+turning the dial up gave less heat. `.env` sets `WP_BUMP_QMAX=7.0` since then (about +0.5 K/h at 6 °C
+outside, against +0.2). The `[PLAN]` log shows `bump-cap X.XXkW` while a bump is active.
 
 **Bump during the restart lockout.** A bump that leaves less than `WP_BUMP_MIN_USABLE_MIN` (default 30)
 after the ~60 min restart lockout is left out of the plan: normal comfort floor, no heat cap, and
@@ -284,7 +315,7 @@ not reach. The knob and the setpoint shown stay as they are; only the plan ignor
 
 **House model refit 2026-11-06** (UA 172 -> 262 W/K): fitted on 10-18..11-06, held out 11-06..11-07:
 RMSE 0.48 -> 0.31 K, 24 h ahead 0.40 -> 0.04 K. The old night term (-0.7 kW) was compensating a too-low
-UA. The model still has no water node (the 200 L vessel and the radiators), so after a long stop the
+UA. The model still has no water node (the 50 L vessel and the radiators), so after a long stop the
 room keeps falling for a while longer than predicted.
 
 | Setting | Default | Meaning |
@@ -293,7 +324,12 @@ room keeps falling for a while longer than predicted.
 | `WP_SOFTSTART_MIN` | `60` | soft restart: minutes from the start of a run during which the target is capped (0 = off) |
 | `WP_SOFTSTART_KP` | `4` | soft restart: °C supply above the curve per K the room is below the planned room in 1 h |
 | `WP_SOFTSTART_NEG` | `3` | soft restart: at most this many °C below the curve |
-| `WP_COMFORT_MIN` | `07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=18.0` | hard floor for the room per time band (`HH:MM-HH:MM=temp`, may cross midnight; no band = no requirement) |
+| `WP_COMFORT_MIN` | `07:00-09:00=20.8,09:00-13:00=21.3,13:00-16:00=21.7,16:00-01:00=20.5,01:00-07:00=19.5` | floor for the room per time band (`HH:MM-HH:MM=temp`, may cross midnight; no band = no requirement); upward steps become staircases, see the next three. Night 19.5 (was 18.0, 11-14): the room never got near 18, and the morning staircase is shorter from 19.5 |
+| `WP_COMFORT_STEP_K` | `0.1` | an upward step becomes stairs of this height per quarter, centred on the step: at the moment of the step half of it is made (rounded up), the rest after. Downward steps apply at once. 0 = hard steps |
+| `WP_COMFORT_STEP_MAX_K` | `0.2` | stair height when `WP_COMFORT_STEP_K` would take longer than `WP_COMFORT_RAMP_MAX_MIN` |
+| `WP_COMFORT_RAMP_MAX_MIN` | `120` | longest staircase; if even `WP_COMFORT_STEP_MAX_K` takes longer, the staircase starts higher (18.0 → 20.8 would start at 19.2) |
+| `WP_DEFROST_RELAX_K` | `0.2` | after a defrost the floor is this much lower, so the missed heat is made up in cheap hours (0 = off) |
+| `WP_DEFROST_RELAX_H` | `4` | ... for this many hours after the defrost ended, then back by `WP_COMFORT_STEP_K` per quarter; a new defrost extends it, it never adds up |
 
 The planner needs numpy/scipy (in the wp_control image since 2026-11-03); wp_control imports it only
 when `WP_PLANNER` is shadow or live, so the rules run without it. Fitting and backtests also run in

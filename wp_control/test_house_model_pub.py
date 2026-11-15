@@ -81,7 +81,116 @@ class TestComfortBands(unittest.TestCase):
     def test_default_matches_the_agreed_bands(self):
         b = wpp.parse_comfort(wpp.DEFAULT_COMFORT)
         self.assertEqual(wpp.comfort_min(b, datetime(2026, 11, 3, 14)), 21.7)
-        self.assertEqual(wpp.comfort_min(b, datetime(2026, 11, 3, 3)), 18.0)
+        self.assertEqual(wpp.comfort_min(b, datetime(2026, 11, 3, 3)), 19.5)
+
+
+def _quarters(h0, m0, n):
+    from datetime import timedelta
+    t0 = datetime(2026, 11, 14, h0, m0)
+    return [t0 + timedelta(minutes=15 * k) for k in range(n)]
+
+
+class TestComfortFloors(unittest.TestCase):
+    """Upward band steps become a staircase of 0.1 K per quarter centred on the step: at the moment of
+    the step half of it is made (user 11-14). Longer than 2 h -> 0.2 K stairs; still too long -> it
+    starts higher. 2026-11-14: the hard 20.8 -> 21.3 step at 09:00 made the plan buy 6.8 kW in 08:45."""
+    BANDS = wpp.parse_comfort("01:00-07:00=18.0,07:00-09:00=20.8,09:00-13:00=21.3,13:00-17:00=21.7,17:00-01:00=20.5")
+
+    def floors(self, h, m, n):
+        return wpp.comfort_floors(self.BANDS, _quarters(h, m, n), 0.1, 0.2, 8)
+
+    def test_half_degree_step_is_half_made_at_the_moment_itself(self):
+        # 08:00 .. 09:45 around the 09:00 step 20.8 -> 21.3
+        self.assertEqual(self.floors(8, 0, 8), [20.8, 20.8, 20.9, 21.0, 21.1, 21.2, 21.3, 21.3])
+
+    def test_even_step_is_exactly_half_at_the_moment(self):
+        # 13:00 step 21.3 -> 21.7: 21.5 at 13:00
+        self.assertEqual(self.floors(12, 30, 6), [21.3, 21.4, 21.5, 21.6, 21.7, 21.7])
+
+    def test_long_step_takes_bigger_stairs_and_fits_in_two_hours(self):
+        # 18.0 -> 20.8 at 07:00: 0.1 K stairs would take 7 h, 0.2 K still 3.5 h -> 8 stairs of 0.2
+        # from 19.2, half (20.0) at 07:00, 20.8 at 08:00
+        self.assertEqual(self.floors(5, 45, 10), [18.0, 19.2, 19.4, 19.6, 19.8, 20.0, 20.2, 20.4, 20.6, 20.8])
+
+    def test_one_degree_step_uses_point_two_stairs(self):
+        self.assertEqual(wpp.comfort_staircase(20.0, 21.0, 0.1, 0.2, 8), (20.0, 0.2, 5, 3))
+        self.assertEqual(wpp.comfort_staircase(20.8, 21.3, 0.1, 0.2, 8), (20.8, 0.1, 5, 3))
+
+    def test_downward_step_applies_at_once(self):
+        self.assertEqual(self.floors(16, 45, 3), [21.7, 20.5, 20.5])
+
+    def test_result_is_independent_of_where_the_list_starts(self):
+        whole = self.floors(8, 0, 12)
+        self.assertEqual(self.floors(9, 0, 5), whole[4:9])
+        self.assertEqual(self.floors(8, 30, 2), whole[2:4])
+
+    def test_band_after_no_band_is_a_half_degree_step(self):
+        f = wpp.comfort_floors(wpp.parse_comfort("12:00-18:00=21.0"), _quarters(11, 0, 8), 0.1, 0.2, 8)
+        self.assertEqual(f, [None, 20.5, 20.6, 20.7, 20.8, 20.9, 21.0, 21.0])
+
+    def test_band_that_ends_stays_ended(self):
+        f = wpp.comfort_floors(wpp.parse_comfort("12:00-12:30=21.0"), _quarters(12, 0, 4), 0.1, 0.2, 8)
+        self.assertEqual(f, [20.8, 20.9, None, None])
+
+    def test_step_zero_keeps_the_hard_steps(self):
+        times = _quarters(8, 45, 3)
+        self.assertEqual(wpp.comfort_floors(self.BANDS, times, 0.0),
+                         [wpp.comfort_min(self.BANDS, t) for t in times])
+
+
+class TestDefrostRelax(unittest.TestCase):
+    END = datetime(2026, 11, 14, 8, 15)
+
+    def at(self, h, m):
+        return wpp.defrost_relax(datetime(2026, 11, 14, h, m), self.END, 0.2, 4.0, 0.4)
+
+    def test_full_relax_during_the_hold_then_back_at_the_ramp_rate(self):
+        self.assertEqual(self.at(8, 30), 0.2)
+        self.assertEqual(self.at(12, 14), 0.2)
+        self.assertAlmostEqual(self.at(12, 30), 0.1)      # 15 min past the hold at 0.4 K/h
+        self.assertEqual(self.at(12, 45), 0.0)
+
+    def test_off_without_defrost_or_with_zero(self):
+        self.assertEqual(wpp.defrost_relax(self.END, None, 0.2, 4.0, 0.4), 0.0)
+        self.assertEqual(wpp.defrost_relax(self.END, self.END, 0.0, 4.0, 0.4), 0.0)
+
+
+class TestDefrostFromRows(unittest.TestCase):
+    """Rows (ts, flame, ot_flow, ot_return, flow_cmd); the values are 2026-11-14 08:00-08:25."""
+    @staticmethod
+    def rows(spec):
+        from datetime import timedelta
+        t0 = datetime(2026, 11, 14, 8, 0)
+        return [(t0 + timedelta(minutes=5 * k), fl, f, r, c) for k, (fl, f, r, c) in enumerate(spec)]
+
+    MORNING = [(1, 42.9, 41.8, 42.4), (1, 39.7, 41.0, 41.4), (1, 35.5, 38.1, 40.4),
+               (1, 32.0, 35.8, 40.2), (1, 37.4, 35.2, 42.4), (1, 39.3, 36.3, 42.4)]
+
+    def test_finds_the_defrost_and_the_command_before_it(self):
+        d = wpp.defrost_from_rows(self.rows(self.MORNING))
+        self.assertEqual(d["start"], datetime(2026, 11, 14, 8, 10))
+        self.assertEqual(d["end"], datetime(2026, 11, 14, 8, 15))
+        self.assertEqual(d["flow_before"], 41.4)
+
+    def test_a_single_row_is_not_a_defrost(self):
+        # 11-04 14:10: one row with return 2.4 K above flow, no defrost
+        self.assertIsNone(wpp.defrost_from_rows(self.rows([(1, 30.0, 30.5, 35), (1, 27.3, 29.7, 35), (1, 30.0, 29.0, 35)])))
+
+    def test_compressor_off_or_missing_temperatures_do_not_count(self):
+        self.assertIsNone(wpp.defrost_from_rows(self.rows([(0, 30.0, 33.0, None), (0, 29.0, 32.0, None)])))
+        self.assertIsNone(wpp.defrost_from_rows(self.rows([(1, None, 33.0, 40), (1, 29.0, None, 40)])))
+
+    def test_rows_with_a_time_gap_are_not_consecutive(self):
+        rows = self.rows([(1, 32.0, 35.0, 40), (1, 32.0, 35.0, 40)])
+        from datetime import timedelta
+        rows[1] = (rows[1][0] + timedelta(minutes=10),) + rows[1][1:]
+        self.assertIsNone(wpp.defrost_from_rows(rows))
+
+    def test_the_latest_of_two_defrosts_wins(self):
+        spec = [(1, 35.0, 38.0, 40), (1, 33.0, 36.0, 40), (1, 40.0, 37.0, 44), (1, 35.0, 38.0, 45), (1, 33.0, 36.0, 45)]
+        d = wpp.defrost_from_rows(self.rows(spec))
+        self.assertEqual(d["start"], datetime(2026, 11, 14, 8, 15))
+        self.assertEqual(d["flow_before"], 44)
 
 
 def _inputs(n, price=0.40, t_out=8.0, tmin=None):
@@ -208,6 +317,56 @@ class TestLiveInputs(unittest.TestCase):
         self.assertIsNone(bump["qmax"][4])
         low = wpp.build_live_inputs(rows, self.T0, bands, [], lower=(self.T0 + timedelta(hours=1), 19.0))
         self.assertEqual(low["tmin"][0], 19.0)
+
+    def test_bump_cap_never_below_the_heat_already_delivered(self):
+        # 2026-11-15: planner at 5.25 kW (price charging), bump 22.5 -> 23.0 capped it to 5.0 and the
+        # flow target fell 1 K. The cap may limit a bump, never turn the heat down.
+        from datetime import timedelta
+        rows = self._rows(16)
+        until = self.T0 + timedelta(hours=1)
+        above = wpp.BUMP_QMAX + 0.25
+        inp = wpp.build_live_inputs(rows, self.T0, wpp.parse_comfort(""), [], bump=(until, 23.0, above))
+        self.assertEqual(inp["qmax"][0], above)
+        self.assertIsNone(inp["qmax"][4])
+        for q_before in (None, 0.0, wpp.BUMP_QMAX - 1.0):   # off / unknown / below: the plain cap
+            inp = wpp.build_live_inputs(rows, self.T0, wpp.parse_comfort(""), [], bump=(until, 23.0, q_before))
+            self.assertEqual(inp["qmax"][0], wpp.BUMP_QMAX)
+
+    def test_defrost_lowers_the_floor_but_not_a_bump(self):
+        from datetime import timedelta
+        from unittest.mock import patch
+        bands = wpp.parse_comfort("00:00-23:59=21.0")
+        rows = self._rows(24)
+        with patch.object(wpp, "DEFROST_RELAX_K", 0.2), patch.object(wpp, "DEFROST_RELAX_H", 4.0), \
+             patch.object(wpp, "COMFORT_STEP_K", 0.1):
+            plain = wpp.build_live_inputs(rows, self.T0, bands, [])
+            relaxed = wpp.build_live_inputs(rows, self.T0, bands, [], defrost_end=self.T0)
+            bump = wpp.build_live_inputs(rows, self.T0, bands, [], bump=(self.T0 + timedelta(hours=1), 22.5),
+                                         defrost_end=self.T0)
+        self.assertEqual(plain["tmin"][0], 21.0)
+        self.assertEqual(relaxed["tmin"][0], 20.8)
+        self.assertEqual(relaxed["tmin"][15], 20.8)   # 3 h 45 later: still inside the 4 h hold
+        self.assertAlmostEqual(bump["tmin"][0], 22.5 - wpp.MARGIN)
+
+
+class TestComfortRampSavesTheMorningPeak(unittest.TestCase):
+    """The behaviour the ramp is for, on the real planner: a cheap quarter just before a +0.5 K step
+    and an expensive one at it. With the hard step the plan crams heat into the cheap quarter; with
+    the ramp it does not have to (2026-11-14 08:45: 6.76 kW)."""
+    def test_peak_before_the_step_is_lower_with_the_ramp(self):
+        from datetime import timedelta
+        bands = wpp.parse_comfort("07:00-09:00=20.8,09:00-13:00=21.3")
+        t0 = datetime(2026, 11, 14, 8, 0)
+        times = [t0 + timedelta(minutes=15 * k) for k in range(32)]
+        price = [0.375 if t.hour == 8 else (0.43 if t.hour == 9 else 0.32) for t in times]
+        peaks = {}
+        for rate in (0.0, 0.1):
+            inp = {"price": price, "t_out": [3.0] * 32, "pv_kw": [0.0] * 32,
+                   "hour": [t.hour + t.minute / 60 for t in times],
+                   "tmin": wpp.comfort_floors(bands, times, rate)}
+            res = wpp.plan(PARAMS, 21.1, 20.0, inp, on0=True, off_minutes=0.0)
+            peaks[rate] = max(res["Q"][:4])
+        self.assertLess(peaks[0.1], peaks[0.0])
 
 
 class TestUsableBump(unittest.TestCase):

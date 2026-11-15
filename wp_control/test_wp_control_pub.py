@@ -1261,6 +1261,25 @@ class TestPlannerFlowDrop(unittest.TestCase):
         self.assertEqual(wp.planner_flow_drop(None, 38.0, True, 1.0), (None, None))
 
 
+class TestDefrostCapShadow(unittest.TestCase):
+    """Alleen een logregel: wat een kap op het doel van vóór het ontdooien zou sturen (11-14 08:15)."""
+    DEF = {"start": datetime(2026, 11, 14, 8, 10), "end": datetime(2026, 11, 14, 8, 15), "flow_before": 42.4}
+
+    def test_logs_when_the_plan_asks_more_than_before_the_defrost(self):
+        line = wp.defrost_cap_shadow({"heat": True, "flow": 49.1}, self.DEF, datetime(2026, 11, 14, 8, 32))
+        self.assertIn("SCHADUW", line)
+        self.assertIn("42.4", line)
+        self.assertIn("49.1", line)
+
+    def test_silent_when_not_higher_too_late_off_or_unknown(self):
+        t = datetime(2026, 11, 14, 8, 32)
+        self.assertIsNone(wp.defrost_cap_shadow({"heat": True, "flow": 41.0}, self.DEF, t))
+        self.assertIsNone(wp.defrost_cap_shadow({"heat": True, "flow": 49.1}, self.DEF, datetime(2026, 11, 14, 9, 20)))
+        self.assertIsNone(wp.defrost_cap_shadow({"heat": False, "flow": None}, self.DEF, t))
+        self.assertIsNone(wp.defrost_cap_shadow({"heat": True, "flow": 49.1}, None, t))
+        self.assertIsNone(wp.defrost_cap_shadow({"heat": True, "flow": 49.1}, dict(self.DEF, flow_before=None), t))
+
+
 class TestEnableTrace(unittest.TestCase):
     """[OTHR]: 10 min fijnlog na groen licht (m_ch_en uit -> aan), alleen loggen."""
     T0 = datetime(2026, 11, 5, 15, 48, 17)
@@ -1297,7 +1316,7 @@ class TestEnableTrace(unittest.TestCase):
 
 class TestStartKick(unittest.TestCase):
     """Planner zegt HEAT, compressor draait niet: doel >= water + 3, anders start de P60 niet
-    (200 L-vat in serie houdt het circuit-water warm; 11-05 15:48-16:40 geen start bij doel 29,7-31 / water 31-32)."""
+    (50 L-vat WBF50 + radiatorwater in serie houdt het circuit-water warm; 11-05 15:48-16:40 geen start bij doel 29,7-31 / water 31-32)."""
 
     def test_afternoon_of_2026_11_05(self):
         flow, why = wp.start_kick_flow(29.7, False, 31.3, 3.0, 50.0)
@@ -1471,9 +1490,17 @@ class TestRuntimeState(unittest.TestCase):
         until = self.now + timedelta(minutes=30)
         self._save(until, 23.0)
         ovr, heat, i = wp.load_state(self.now + timedelta(minutes=1), self.path)
-        self.assertEqual(ovr, {"ovr_until": until, "ovr_target": 23.0})
+        self.assertEqual(ovr, {"ovr_until": until, "ovr_target": 23.0, "ovr_q": None})
         self.assertEqual(heat, {"heat": True})
         self.assertEqual(i, {"i": 1.2})
+
+    def test_bump_q_before_survives_a_restart(self):
+        # the bump cap's floor (what the planner delivered at bump start) must outlive a restart
+        until = self.now + timedelta(minutes=30)
+        wp.save_state({"ovr_until": until, "ovr_target": 23.0, "ovr_q": 5.25}, {"heat": True}, {"i": 0.0},
+                      self.now, self.path)
+        ovr, _, _ = wp.load_state(self.now + timedelta(minutes=1), self.path)
+        self.assertEqual(ovr["ovr_q"], 5.25)
 
     def test_expired_bump_is_dropped(self):
         self._save(self.now + timedelta(minutes=5), 23.0)
@@ -1509,6 +1536,18 @@ class TestRuntimeState(unittest.TestCase):
         self.assertEqual(sp, 23.0)
         sp, _ = wp.decide_with_override(self.now, 20.0, st, cfg())     # teruggedraaid
         self.assertNotEqual(sp, 23.0)
+
+    def test_bump_start_remembers_the_heat_already_delivered(self):
+        # 2026-11-15: planner at 5.25 kW, dial 22.5 -> 23.0. The bump must carry that 5.25 along, so the
+        # planner's bump cap does not pull the heat down to WP_BUMP_QMAX.
+        st = {"ovr_until": None, "ovr_target": None, "last_setp": 21.0, "last_q": 5.25}
+        wp.decide_with_override(self.now, 23.0, st, cfg())
+        self.assertEqual(st["ovr_q"], 5.25)
+        st["last_q"] = 5.0                                   # later cycles do not move it
+        wp.decide_with_override(self.now + timedelta(minutes=5), 23.0, st, cfg())
+        self.assertEqual(st["ovr_q"], 5.25)
+        wp.decide_with_override(self.now + timedelta(minutes=10), 20.0, st, cfg())   # turned back
+        self.assertIsNone(st["ovr_q"])
 
     def test_none_reading_keeps_reference_for_next_bump(self):
         # listener even stil (None) -> daarna 21 -> 23 moet nog steeds als bump tellen

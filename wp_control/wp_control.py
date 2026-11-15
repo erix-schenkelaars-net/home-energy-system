@@ -330,11 +330,31 @@ def planner_flow_drop(flow, last_cmd, running, max_drop, land_below=None, land_s
     return held, f"aanvoer-rem: plan {flow} -> {held}°C (vorig commando {last_cmd}, max -{step:g}°C/cyclus)"
 
 
+DEFROST_CAP_MIN = 60     # schaduw-kap: zo lang na het einde van een ontdooiing
+
+
+def defrost_cap_shadow(dec, defrost, now, window_min=DEFROST_CAP_MIN):
+    """PUUR, ALLEEN LOGGEN: wat een kap 'aanvoerdoel na ontdooien niet boven het doel van vóór het
+    ontdooien' zou hebben gedaan. Na een ontdooiing is het water ~35 °C; met een doel van 47-50 °C gaat
+    de P60 naar 98 % en schiet ~5 K door (2026-11-14 06:25-07:35 en 08:25-09:35). Of zo'n kap dat
+    voorkomt is onbewezen — het gat met het koude water drijft de P60 misschien evengoed — dus eerst
+    schaduw. Geeft de logregel of None."""
+    if not defrost or not dec.get("heat") or dec.get("flow") is None:
+        return None
+    before = defrost.get("flow_before")
+    if before is None or (now - defrost["end"]).total_seconds() > window_min * 60:
+        return None
+    if dec["flow"] <= before:
+        return None
+    return (f"[SCHADUW ontdooi-kap] ontdooid {defrost['start']:%H:%M}-{defrost['end']:%H:%M}: "
+            f"zou aanvoer {before}°C sturen i.p.v. {dec['flow']}°C (doel van vóór het ontdooien)")
+
+
 def start_kick_flow(flow, running, water, gap, cap):
     """PUUR: zolang de planner wil stoken maar de compressor niet draait, ligt het doel minstens
     `gap` boven het water dat de P60 nu meet, anders ziet hij geen vraag en start hij niet.
 
-    In serie achter de WP zit een 200 L-vat zonder sensor (WP -> vat -> pomp -> CV -> klep ->
+    In serie achter de WP zit een 50 L-vat (Weheat WBF50) zonder sensor (WP -> vat -> pomp -> CV -> klep ->
     radiatoren). Na een stop blijft dat warm; bij groen licht laat de P60 eerst zijn pomp draaien
     en meet dan dat vat-water. Lag ons doel daaronder, dan wachtte hij tot het vat via de
     radiatoren was afgekoeld: 11-03 20:11 en 11-04 19:17 ~50 min, 11-05 15:48-16:40 bijna 2 uur
@@ -605,6 +625,7 @@ def save_state(ovr_state, heat_state, i_state, now, path=STATE_FILE):
     d = {"saved": now.isoformat(timespec="seconds"),
          "ovr_until": until.isoformat(timespec="seconds") if until else None,
          "ovr_target": ovr_state.get("ovr_target") if until else None,
+         "ovr_q": ovr_state.get("ovr_q") if until else None,
          "und_until": und.isoformat(timespec="seconds") if und else None,
          "und_target": ovr_state.get("und_target") if und else None,
          "heat": heat_state.get("heat"), "flow": heat_state.get("flow"), "i": i_state.get("i")}
@@ -629,7 +650,8 @@ def load_state(now, path=STATE_FILE, max_age_s=STATE_MAX_AGE_S):
     if d.get("ovr_until"):
         until = datetime.fromisoformat(d["ovr_until"])
         if until > now:
-            ovr = {"ovr_until": until, "ovr_target": float(d["ovr_target"])}
+            ovr = {"ovr_until": until, "ovr_target": float(d["ovr_target"]),
+                   "ovr_q": None if d.get("ovr_q") is None else float(d["ovr_q"])}
     if d.get("und_until"):
         und = datetime.fromisoformat(d["und_until"])
         if und > now:
@@ -664,7 +686,11 @@ def decide_with_override(now, thermostat_setp, state, cfg, price_win=None):
     tweede geprogrammeerde verlaging in de Honeywell is NIET ondersteund: die zou als handmatige
     draai gelden.
 
-    `state` = mutabele dict {ovr_until, ovr_target, und_until, und_target, last_setp} die tussen
+    Bij het openen van een bump-venster gaat `last_q` (de planner-warmte van de vorige cyclus, kW)
+    mee als `ovr_q`: de bump-cap van de planner zakt nooit onder wat er al geleverd werd (zie
+    wp_planner.bump_qmax).
+
+    `state` = mutabele dict {ovr_until, ovr_target, ovr_q, und_until, und_target, last_setp, last_q} die tussen
     cycli bewaard blijft. Bump en verlaging gaan vóór het prijsvenster (price_win, zie
     price_overlay). Returnt (sp, reason)."""
     thr, mx, hold = cfg["ovr_threshold"], cfg["ovr_max"], cfg["ovr_hold_s"]
@@ -682,11 +708,13 @@ def decide_with_override(now, thermostat_setp, state, cfg, price_win=None):
             and prev is not None and abs(thermostat_setp - prev) > 0.05):
         state["ovr_until"]  = now + timedelta(seconds=hold)
         state["ovr_target"] = round(min(thermostat_setp, mx), 1)
+        state["ovr_q"]      = state.get("last_q")   # wat de planner al leverde: de bump-cap zakt daar niet onder
     elif thermostat_setp is not None and thermostat_setp <= thr:
         # knop terug op (of onder) de baseline → de gebruiker is klaar met de boost → direct nominaal.
         # (een None-lezing wist het venster NIET: een transiënte read-fout mag een boost niet afbreken.)
         state["ovr_until"] = None
         state["ovr_target"] = None
+        state["ovr_q"] = None
     if thermostat_setp is not None:      # een gemiste lezing wist het referentiepunt niet
         state["last_setp"] = thermostat_setp
 
@@ -1471,7 +1499,8 @@ def plan_cycle(cfg, now, room, ovr_state):
         import wp_planner
         bands = wp_planner.parse_comfort(cfg["comfort"] or wp_planner.DEFAULT_COMFORT)
         active = lambda u: u is not None and u > now
-        bump = (ovr_state["ovr_until"], ovr_state["ovr_target"]) if active(ovr_state.get("ovr_until")) else None
+        bump = ((ovr_state["ovr_until"], ovr_state["ovr_target"], ovr_state.get("ovr_q"))
+                if active(ovr_state.get("ovr_until")) else None)
         lower = (ovr_state["und_until"], ovr_state["und_target"]) if active(ovr_state.get("und_until")) else None
         dec, res, diag = wp_planner.run_live(cfg["db"], now, room, bands, bump, lower, cfg["flow_min"], cfg["flow_cap"])
     except Exception as e:
@@ -1482,9 +1511,19 @@ def plan_cycle(cfg, now, room, ovr_state):
     run_txt = "draait" if diag["running"] else f"stil {diag['off_min']:.0f} min"
     bias = "?" if diag["bias"] is None else f"{diag['bias']:+.1f}"
     act = f"HEAT Q={dec['q']:.2f}kW aanvoer {dec['flow']}°C" if dec["heat"] else "OFF"
+    defrost = diag.get("defrost")
+    relax_txt = (f" | ontdooid {defrost['end']:%H:%M} -> grens -{diag['relax']:.2f}K"
+                 if defrost and diag.get("relax") else "")
+    cap_now = ((diag.get("inputs") or {}).get("qmax") or [None])[0]
+    if cap_now is not None:
+        relax_txt += f" | bump-cap {cap_now:.2f}kW"
     dbg("PLAN", f"[{'LIVE' if mode else 'SCHADUW'}] kamer={room} massa={diag['tm']:.2f} {run_txt} "
                 f"KNMI-bias={bias}K -> {act}{' | bump genegeerd (herstartblokkade)' if diag.get('bump_skipped') else ''}"
+                f"{relax_txt}"
                 f" | kamer over 1u {res['room'][3]:.2f} | OTThing-sp {dec['room_sp']} | 12u {on_next} | €{diag['cost']:.2f}/{diag['slots'] / 4:.0f}u")
+    shadow = defrost_cap_shadow(dec, defrost, now)
+    if shadow:
+        dbg("PLAN", shadow)
     write_plan(cfg, mode, dec, res, diag, now)
     dec = dict(dec, mass=diag["tm"], heatplan=heatplan_payload(res, diag, now),
                room_1h=res["room"][3], running=diag["running"], on_min=diag.get("on_min"),
@@ -1536,8 +1575,8 @@ def main():
         if live_setpoint(cfg) is not None:
             break
         sleep(1)
-    ovr_state = {"ovr_until": None, "ovr_target": None, "und_until": None, "und_target": None,
-                 "last_setp": None}
+    ovr_state = {"ovr_until": None, "ovr_target": None, "ovr_q": None, "und_until": None, "und_target": None,
+                 "last_setp": None, "last_q": None}
     heat_state = {}                      # stateful hysterese voor de aan/uit-beslissing
     i_state = {"i": 0.0}                 # gedempte-I integrator voor de room-comp
     r_ovr, r_heat, r_i = load_state(datetime.now())   # een herstart verandert het gedrag niet
@@ -1645,6 +1684,8 @@ def main():
                 else:
                     dbg("PLAN", "-> TERUGVAL: regel-gebaseerde beslissing")
         command_wp(cfg, heat, flow, sp_cmd)
+        # de planner-warmte van deze cyclus: opent de volgende cyclus een bump, dan zakt de cap hier niet onder
+        ovr_state["last_q"] = None if planned is None else (planned["q"] if planned["heat"] else 0.0)
         save_state(ovr_state, heat_state, i_state, datetime.now())
         p_term = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"], cfg["rc_neg_max"])
         plan = day_plan(now, cfg, price_win)

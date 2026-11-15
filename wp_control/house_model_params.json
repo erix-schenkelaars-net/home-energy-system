@@ -1,5 +1,5 @@
 {
- "_fitted": "2026-11-06 on erix_db.energy 2026-10-18..11-06 12:00 (10-20 12:00..10-22 18:00 skipped; frozen P60 feed 11-03 17:15-18:10 corrected), UA 262 W/K (was 172). Held-out 11-06 12:00..11-07 20:30: RMSE 0.31 K (old 0.48), 24 h ahead 0.04 (old 0.40), 1-h cooling with the pump off 0.02 K/h too slow (old 0.10). The old night term (-0.7 kW, read as an open window) was the model compensating a too-low UA. Still no water node (200 L vessel + radiators).",
+ "_fitted": "2026-11-06 on erix_db.energy 2026-10-18..11-06 12:00 (10-20 12:00..10-22 18:00 skipped; frozen P60 feed 11-03 17:15-18:10 corrected), UA 262 W/K (was 172). Held-out 11-06 12:00..11-07 20:30: RMSE 0.31 K (old 0.48), 24 h ahead 0.04 (old 0.40), 1-h cooling with the pump off 0.02 K/h too slow (old 0.10). The old night term (-0.7 kW, read as an open window) was the model compensating a too-low UA. Still no water node (50 L vessel + radiators).",
  "house": {
   "Cr": 9.204,
   "Cm": 23.969,
