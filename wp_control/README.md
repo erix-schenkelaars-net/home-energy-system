@@ -258,7 +258,7 @@ the room gets about 0.5 K above it, even while we still ask for heat, followed b
 lockout. 11-05 14:50, 11-09 04:10 and 11-12 15:07, each time with the knob below 22.5; all other stops
 in that period were flow overshoot. Until the OTThing can replace ID16 (feature request
 [OT-Thing #72](https://github.com/Phunkafizer/OT-Thing/issues/72)), the remedy is to leave the knob at
-`WP_OVERRIDE_THRESHOLD`; `hw_setpoint_low` asks for it (see `WP_HW_LOW_ALERT`). Not during a manual
+`WP_OVERRIDE_THRESHOLD`; `wp_hw_setpoint_low` asks for it (see `WP_HW_LOW_ALERT`). Not during a manual
 lowering: then the user wants it cooler and a stop does no harm.
 
 **Soft restart after a defrost** (2026-11-15, replaces the `[SCHADUW ontdooi-kap]` log line). A
@@ -361,7 +361,7 @@ room keeps falling for a while longer than predicted.
 | `WP_DEFROST_RELAX_H` | `4` | ... for this many hours after the defrost ended, then back by `WP_COMFORT_STEP_K` per quarter; a new defrost extends it, it never adds up |
 | `WP_DEFROST_SOFTSTART` | `1` | after a defrost the target ramps up from the water like a soft restart (`ontdooi-oploop` in the log); `0` = off |
 | `WP_QMAX` | `6.0` | heat cap (kW) for every quarter of the plan, bumps included; lifted per quarter to the steady heat loss in frost, and during a bump never below the heat already delivered. Replaces `WP_BUMP_QMAX` (2026-11-15) |
-| `WP_HW_LOW_ALERT` | `1` | alert `hw_setpoint_low` (WordPress banner + HA push via `battery/alert`) when the Honeywell knob is below `WP_OVERRIDE_THRESHOLD` and the room is at least `WP_HW_LOW_MARGIN` above it for `WP_HW_LOW_HOLD_S`, outside a manual lowering; cleared once the knob is back. `0` = off |
+| `WP_HW_LOW_ALERT` | `1` | alert `wp_hw_setpoint_low` (WordPress banner + HA push via `battery/alert`) when the Honeywell knob is below `WP_OVERRIDE_THRESHOLD` and the room is at least `WP_HW_LOW_MARGIN` above it for `WP_HW_LOW_HOLD_S`, outside a manual lowering; cleared once the knob is back. `0` = off |
 | `WP_HW_LOW_MARGIN` / `WP_HW_LOW_HOLD_S` | `0.2` / `600` | see above; the P60 stops itself at about knob + 0.5 |
 
 The planner needs numpy/scipy (in the wp_control image since 2026-11-03); wp_control imports it only

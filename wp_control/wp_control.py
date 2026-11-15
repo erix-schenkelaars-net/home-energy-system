@@ -691,7 +691,7 @@ def load_state(now, path=STATE_FILE, max_age_s=STATE_MAX_AGE_S):
     return ovr, heat, i
 
 
-HW_LOW_KEY = "hw_setpoint_low"     # alert_latch-sleutel: Honeywell-knop te laag (WordPress-banner + HA-push)
+HW_LOW_KEY = "wp_hw_setpoint_low"     # alert_latch-sleutel; voorvoegsel wp_ = warmtepomptegel in WordPress (pv_ = PV, rest = accu)
 
 
 def honeywell_low_step(knob, room, threshold, margin, lowering_active, since, latched, now, hold_s):
