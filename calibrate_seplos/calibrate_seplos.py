@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # the passive balancer starts at cell > 3400 mV and spread > 50 mV, stops < 30 mV.
 CELL_TARGET_MV         = int(os.environ.get("CAL_CELL_TARGET_MV", "3600"))    # hold-/laaddoel per cel (CV 57,6V = 3,60V)
 CELL_WARN_MV           = int(os.environ.get("CAL_CELL_WARN_MV", "3620"))      # ONDER BMS-OVP(3650): vroege waarschuwing
-CELL_HARDSTOP_MV       = int(os.environ.get("CAL_CELL_HARDSTOP_MV", "3645"))  # nét onder BMS-OVP(3650): cut de Wanptek vóór de BMS
+CELL_HARDSTOP_MV       = int(os.environ.get("CAL_CELL_HARDSTOP_MV", "3645"))  # just below the BMS OVP (3650): cut the Wanptek before the BMS does
 BALANCE_START_MV       = int(os.environ.get("CAL_BALANCE_START_MV", "3400"))  # Seplos balancer-startspanning
 BALANCE_DONE_DELTA_MV  = int(os.environ.get("CAL_BALANCE_DONE_DELTA_MV", "8"))
 BALANCE_DONE_CURRENT_A = float(os.environ.get("CAL_BALANCE_DONE_CURRENT_A", "2.0"))
@@ -345,7 +345,7 @@ def run_db_mode():
 
 
 def main():
-    """Kies de modus: 'db' (stap a, read-only DB) of 'bus' (stap b, directe RS485)."""
+    """Choose the mode: 'db' (step a, read-only DB) or 'bus' (step b, direct RS485)."""
     mode = os.environ.get("CAL_MODE", "db").lower()
     if len(sys.argv) > 1 and sys.argv[1] in ("db", "bus"):
         mode = sys.argv[1]

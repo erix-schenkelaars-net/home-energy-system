@@ -116,7 +116,7 @@ def read_state_fields(state):
         return d
 
     return {
-        "ch_set_t": deep(master, "ch_set_t", "data"),   # commando-setpoint op de bus
+        "ch_set_t": deep(master, "ch_set_t", "data"),   # command setpoint on the bus
         "flow_t": slave.get("flow_t"),                   # REAL flow the boiler makes
         "return_t": slave.get("return_t"),
         "ch_mode": ss.get("ch_mode"),                    # verwarmt de slave?

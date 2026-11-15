@@ -396,7 +396,7 @@ class TestRoomunit(unittest.TestCase):
 
     def test_honeywell_setpoint(self):
         d = mod.parse_payload(self._payload())
-        self.assertEqual(d["otthing_roomunit_set_t_c"], 21.0)    # DE comfort-dial van de mens
+        self.assertEqual(d["otthing_roomunit_set_t_c"], 21.0)    # THE comfort dial a person turns
 
     def test_honeywell_room_temp(self):
         d = mod.parse_payload(self._payload())

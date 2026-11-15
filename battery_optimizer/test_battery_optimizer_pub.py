@@ -2174,7 +2174,7 @@ class TestWpPlanInLoad(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PV-schaduwmasker: fit (pv_shade_fit) en koppeling in de optimizer
+# PV shade mask: fit (pv_shade_fit) and its use in the optimizer
 # ══════════════════════════════════════════════════════════════════════════════
 import pv_shade_fit as psf                    # noqa: E402
 from common import pv_shade as ps             # noqa: E402

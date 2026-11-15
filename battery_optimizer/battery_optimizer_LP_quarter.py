@@ -40,15 +40,15 @@ from typing import Optional
 
 import mysql.connector
 import numpy as np
-# common/ wordt read-only gemount in de container (/app/common) en ligt op de host in de repo-root;
-# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+# common/ is mounted read-only in the container (/app/common) and sits in the repo root on the host;
+# add both the script dir and its parent so the import works in both places (tests included).
 for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from common import energy_cost as ec          # gedeelde, canonieke kostenberekening
-from common import battery_constants as bc    # gedeelde accu/omvormer constanten
+from common import battery_constants as bc    # shared battery/inverter constants
 from common import pv_shade as ps             # schaduwmasker per zonrichting x hoogte
-import pv_shade_fit                           # fit van dat masker (wekelijks, vanuit main)
+import pv_shade_fit                           # fit of that mask (weekly, from main)
 from scipy.optimize import milp, LinearConstraint, Bounds
 import paho.mqtt.client as paho_mqtt
 import requests
@@ -81,7 +81,7 @@ PANEL_EAST_KWP  = 3.12
 PANEL_WEST_KWP  = 3.12
 PANEL_EAST_AZI  = 88
 PANEL_WEST_AZI  = 272
-PANEL_TILT      = 24.16   # gemeten dakhoek (0=horizontaal); was 35
+PANEL_TILT      = 24.16   # measured roof tilt (0 = horizontal); was 35
 PANEL_EFF       = 0.963
 PANEL_EFF_CAL   = 0.70  # calibrated on clear days (GHI-based fallback)
 PEAK_MEASURED_KW = 5.2
@@ -118,13 +118,13 @@ SLOT_H = 0.25  # slot duration: 15 minutes = 0.25 hours
 
 BAT_CAPACITY_KWH     = bc.BAT_CAPACITY_KWH
 BAT_MIN_SOC_PCT      = float(os.getenv("BAT_MIN_SOC_PCT", str(bc.BAT_MIN_SOC_PCT)))  # LP floor; env-overridable (replay/tuning), default bc=20.0%
-# Adaptieve SoC-vloer: ratchet omhoog bij een bodem-taper (vmin/vdelta), handmatig
-# terug na top-balancering. Basis wordt bij import vastgelegd; BAT_MIN_SOC_PCT zelf
-# wordt per run in main() herzet naar de DB-vloer.
+# Adaptive SoC floor: ratchets up on a bottom taper (vmin/vdelta), back by hand after a top
+# balance. The base is fixed at import; BAT_MIN_SOC_PCT itself is reset to the DB floor on every
+# run in main().
 SOC_FLOOR_BASE_PCT       = BAT_MIN_SOC_PCT
 SOC_FLOOR_STEP_PCT       = float(os.getenv("SOC_FLOOR_STEP_PCT", "2.0"))
 SOC_FLOOR_CAP_PCT        = float(os.getenv("SOC_FLOOR_CAP_PCT", "30.0"))
-SOC_FLOOR_PROX_PCT       = float(os.getenv("SOC_FLOOR_PROX_PCT", "2.0"))   # taper geldt als bodem-event binnen deze marge van de vloer
+SOC_FLOOR_PROX_PCT       = float(os.getenv("SOC_FLOOR_PROX_PCT", "2.0"))   # a taper counts as a bottom event within this margin of the floor
 SOC_FLOOR_MIN_INTERVAL_H = float(os.getenv("SOC_FLOOR_MIN_INTERVAL_H", "8"))  # snelheidsbegrenzer: max ~1 stap per 8u
 BAT_WEAR_EUR_KWH     = float(os.getenv("BAT_WEAR_EUR_KWH", str(bc.BAT_WEAR_EUR_KWH)))  # cell wear per kWh discharged; env-overridable (replay/tuning), default bc=0.009375
 BAT_MIN_SOC_DISCHARGE_PCT = bc.BAT_MIN_SOC_DISCHARGE_PCT  # 18.0% — DISCHARGE floor (doc)
@@ -193,13 +193,13 @@ LP_STANDBY_ENABLED  = True
 # Loaded once from the DB at startup via load_tariffs_from_db(); the fallback
 # below mirrors the table and is only used if that read fails.
 # ---------------------------------------------------------------------------
-# Tarieven + de all-in/saldering-formule komen uit de gedeelde module common/energy_cost.py
-# (zelfde berekening als read_p1 en het dashboard). Geladen in load_tariffs_from_db().
+# Tariffs + the all-in/net-metering formula come from the shared module common/energy_cost.py
+# (the same calculation as read_p1 and the dashboard). Loaded in load_tariffs_from_db().
 _TARIFFS: list = list(ec._FALLBACK_TARIFFS)
 
 
 def load_tariffs_from_db(conn) -> None:
-    """Laad datum-versie tarieven uit energy_tariffs via de gedeelde module."""
+    """Load the date-versioned tariffs from energy_tariffs through the shared module."""
     global _TARIFFS
     _TARIFFS = ec.load_tariffs(conn)
     log.info("Loaded %d tariff period(s) from energy_tariffs (latest valid_from %s, saldering=%s)",
@@ -207,7 +207,7 @@ def load_tariffs_from_db(conn) -> None:
 
 
 def tariff_for(d: date):
-    """Tariefperiode actief op datum d (delegeert naar de gedeelde module)."""
+    """The tariff period active on date d (delegates to the shared module)."""
     return ec.tariff_for(_TARIFFS, d)
 
 
@@ -271,36 +271,36 @@ HISTORY_DAYS  = 4
 HISTORY_HOURS = 72
 
 # Load-forecast tuning (Predbat-geïnspireerd; zie build_load_profile / compute_inday_load_factor)
-LOAD_LOOKBACK_DAYS      = 14    # #5: venster lang genoeg voor zowel weekdagen als weekend
-LOAD_RECENCY_HALFLIFE_D = 7.0   # #5: recente dagen tellen zwaarder (exponentieel verval)
+LOAD_LOOKBACK_DAYS      = 14    # #5: window long enough for both weekdays and weekends
+LOAD_RECENCY_HALFLIFE_D = 7.0   # #5: recent days weigh more (exponential decay)
 LOAD_DROP_LOWEST_DAY    = True  # #2: laagste-verbruiksdag (outlier, bv. vakantie) negeren
-LOAD_PESSIMISM          = 1.10  # #2: 10% conservatieve opslag op de base-load forecast
-INDAY_ADJUST            = True  # #1: rest van vandaag schalen o.b.v. werkelijk vs voorspeld verbruik
-INDAY_MIN_ELAPSED_H     = 2.0   # #1: pas toe na 2 u verstreken (ochtend-ruis vermijden)
+LOAD_PESSIMISM          = 1.10  # #2: 10% conservative margin on the base-load forecast
+INDAY_ADJUST            = True  # #1: scale the rest of today by actual vs forecast consumption
+INDAY_MIN_ELAPSED_H     = 2.0   # #1: apply after 2 h have passed (avoid morning noise)
 INDAY_FACTOR_MIN        = 0.7   # #1: clamp ondergrens
 INDAY_FACTOR_MAX        = 1.4   # #1: clamp bovengrens
-INDAY_DAMPING           = 0.7   # #1: demping richting 1.0 (0=geen correctie, 1=volledig)
+INDAY_DAMPING           = 0.7   # #1: damping towards 1.0 (0 = no correction, 1 = full)
 
-# Cooling (airco) load forecast — APPLIED with bounds (was dry-run 2026-07-08..21). Dagverbruik
-# is ~71% temp-gedreven; een cooling-degree-hours regressie op de laatste 14 dagen scheelt in een
-# backtest 37% MAE (5.8->3.7 kWh) t.o.v. temp-blind — de winst zit bij hittegolven en hun nasleep,
-# waar het na-ijlende gemiddelde de temp-swing niet volgt.
+# Cooling (air conditioning) load forecast -- APPLIED with bounds (was a dry run 2026-07-08..21).
+# Daily consumption is ~71% temperature driven; a cooling-degree-hours regression on the last 14
+# days cuts the MAE by 37% in a backtest (5.8 -> 3.7 kWh) vs temperature-blind -- the gain is in
+# heat waves and their aftermath, where the lagging average does not follow the temperature swing.
 #
-# BEGRENZING (waarom): de rauwe regressie kan bij een degeneratieve fit onzin geven — op 16-06 gaf
-# hij -1,1 kWh (negatieve dagload), wat de LP-planning zou verzieken. Daarom een FACTOR op het
-# temp-blinde profiel, geklemd op [MIN,MAX], en bij elke twijfel (te weinig data, geen spreiding,
-# negatieve helling) terugval naar factor 1.0 = exact het huidige temp-blinde gedrag.
-COOLING_APPLY           = True  # False => factor altijd 1.0 (temp-blind, oude gedrag)
-COOLING_CDH_THRESHOLD_C = 21.0  # graden waarboven koellast telt (cooling-degree-hours)
-COOLING_EWMA_ALPHA      = 0.5   # thermische-massa decay per dag (0.5 = half-life ~1 dag)
-COOLING_FACTOR_MIN      = 0.7   # onder-clamp op de temp-aware/temp-blind schaal (vangt -1,1 af)
-COOLING_FACTOR_MAX      = 1.4   # boven-clamp; symmetrisch met de in-day factor
+# BOUNDS (why): the raw regression can give nonsense on a degenerate fit -- on 16-06 it gave
+# -1.1 kWh (a negative day load), which would spoil the LP plan. Hence a FACTOR on the
+# temperature-blind profile, clamped to [MIN, MAX], and on any doubt (too little data, no spread,
+# negative slope) a fallback to factor 1.0 = exactly the current temperature-blind behaviour.
+COOLING_APPLY           = True  # False => factor always 1.0 (temperature-blind, old behaviour)
+COOLING_CDH_THRESHOLD_C = 21.0  # degrees above which cooling load counts (cooling degree hours)
+COOLING_EWMA_ALPHA      = 0.5   # thermal mass decay per day (0.5 = half-life ~1 day)
+COOLING_FACTOR_MIN      = 0.7   # lower clamp on the temperature-aware/blind scale (catches the -1.1)
+COOLING_FACTOR_MAX      = 1.4   # upper clamp; symmetric with the in-day factor
 
-# Seizoensgate — één drempel splitst verwarmen en koelen zodat ze elkaars complement zijn i.p.v.
-# elkaar te overlappen. Komt de dag-MAX voorspeltemperatuur niet boven deze waarde, dan is het een
-# stookdag: warmtepomp-correctie aan, airco uit. Erboven: warmtepomp uit (geen spookverwarming in
-# de zomer — het UA-model rekent anders koellast <20C als 'stoken'), airco-factor aan. 16C zit onder
-# het 20C-setpunt met ruimte voor zon en interne warmte.
+# Season gate -- one threshold splits heating and cooling so they complement each other instead of
+# overlapping. If the day's MAX forecast temperature does not exceed this value, it is a heating
+# day: heat pump correction on, air conditioning off. Above it: heat pump off (no phantom heating in
+# summer -- the UA model would otherwise count cooling load < 20 C as 'heating'), air conditioning
+# factor on. 16 C is below the 20 C setpoint, with room for sun and internal heat.
 HEATING_MAX_TEMP_C      = 16.0
 
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER", "YOUR_MQTT_BROKER_IP")
@@ -406,11 +406,11 @@ class HourSlot:
     gti_west_wm2: float = 0.0     # raw KNMI GTI west string (W/m²)
     pv_source: str = ""           # 'KNMI_GTI' | 'OM_GHI' | 'FORECAST_SOLAR' | 'CACHE'
     hp_correction_kwh: float = 0.0       # verwarmings-delta (warmtepomp) t.o.v. referentietemp
-    hp_reserved_kwh: float = 0.0         # totaal voor de WP gereserveerd (profiel + correctie)
-    cooling_correction_kwh: float = 0.0  # koel-delta (airco) t.o.v. het temp-blinde profiel
-    pv_clearsky_kwh: float = 0.0         # gemeten clear-sky-PV bij deze zonshoogte (referentielijn)
-    pv_clearsky_east_kwh: Optional[float] = None  # dezelfde lijn per dakhelft, alleen voor weergave
-    pv_clearsky_west_kwh: Optional[float] = None  # None = oude kalibratie zonder gesplitste sleutels
+    hp_reserved_kwh: float = 0.0         # total reserved for the heat pump (profile + correction)
+    cooling_correction_kwh: float = 0.0  # cooling delta (air conditioning) vs the temperature-blind profile
+    pv_clearsky_kwh: float = 0.0         # measured clear-sky PV at this sun elevation (reference line)
+    pv_clearsky_east_kwh: Optional[float] = None  # the same line per roof side, display only
+    pv_clearsky_west_kwh: Optional[float] = None  # None = old calibration without the split keys
 
     def hour(self) -> int:
         return self.dt.hour
@@ -423,7 +423,7 @@ class HourSlot:
         return ec.all_in_import(self.price_eur_kwh, tariff_for(self.dt.date()))
 
     def export_price(self) -> float:
-        # teruglever-waarde via gedeelde module (saldering-bewust)
+        # export value through the shared module (aware of net metering)
         return ec.export_credit_price(self.price_eur_kwh, tariff_for(self.dt.date()))
 
 
@@ -557,16 +557,14 @@ def fetch_all_prices(today: date) -> dict[int, float]:
 
 def backfill_prices_from_db(conn, prices: dict[int, float], today: date,
                             tomorrow: date) -> int:
-    """Vul kwartieren die de live-fetch niet teruggaf aan uit electricity_prices.
+    """Fill quarters the live fetch did not return from electricity_prices.
 
-    EnergyZero timeout't vaak genoeg (504 / read-timeout) dat een run met weinig of
-    NUL kwartieren terugkomt. Zonder dit viel een ontbrekend kwartier terug op de
-    0.15-median-van-niets ([]-default), all-in 0.27 — wat op 2026-09-14 de 08:00-
-    ochtendpiek verkeerd beprijsde en de actie naar LOAD_FIRST omklapte. De juiste
-    dag-vooruit-prijs staat vrijwel altijd al in de DB (de middernacht-run schrijft
-    hem weg), dus lees hem terug; alleen als de DB óók niks heeft blijft een slot
-    leeg voor de 0.15-laatste-redmiddel. Live-waarden worden nooit overschreven —
-    er worden uitsluitend gaten gevuld.
+    EnergyZero times out often enough (504 / read timeout) that a run comes back with few or ZERO
+    quarters. Without this a missing quarter fell back to the 0.15 median-of-nothing ([] default),
+    all-in 0.27 -- which on 2026-09-14 mispriced the 08:00 morning peak and flipped the action to
+    LOAD_FIRST. The right day-ahead price is nearly always in the DB already (the midnight run
+    writes it), so read it back; only when the DB has nothing either does a slot stay empty for the
+    0.15 last resort. Live values are never overwritten -- only gaps are filled.
     """
     missing = [idx for idx in range(192) if idx not in prices]
     if not missing:
@@ -676,49 +674,50 @@ def fetch_store_gas_price(conn, day) -> None:
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 _WEATHER_CACHE = Path("/tmp/open_meteo_cache.json")
 
-# --- Solcast PV-forecast (vergelijkings-bron; verandert de optimizer NIET) ---
-# Gated op env; gratis hobby-tier ~10 calls/dag -> 2 sites elke 6 u = 8/dag.
+# --- Solcast PV forecast (comparison source; does NOT change the optimizer) ---
+# Gated on env; free hobby tier ~10 calls/day -> 2 sites every 6 h = 8/day.
 SOLCAST_API_KEY       = os.environ.get("SOLCAST_API_KEY", "")
 SOLCAST_SITE_EAST     = os.environ.get("SOLCAST_SITE_EAST", "")
 SOLCAST_SITE_WEST     = os.environ.get("SOLCAST_SITE_WEST", "")
-SOLCAST_MIN_REFRESH_H = 6.0   # niet vaker ophalen dan dit (API-limiet sparen)
+SOLCAST_MIN_REFRESH_H = 6.0   # do not fetch more often than this (spare the API limit)
 
-# --- CAMS Radiation (Copernicus / SoDa) — satelliet-GEMETEN instraling, ~2 dagen latency.
-# Vergelijkings-/analysebron; verandert de optimizer NIET. Gated op env.
-# Gratis SoDa-account → het geregistreerde e-mailadres is de 'username'. Max ~100 req/dag.
+# --- CAMS Radiation (Copernicus / SoDa): satellite-MEASURED irradiance, ~2 days latency.
+# Comparison/analysis source; does NOT change the optimizer. Gated on env.
+# Free SoDa account -> the registered e-mail address is the 'username'. Max ~100 requests/day.
 CAMS_USERNAME      = os.environ.get("CAMS_USERNAME", "")   # geregistreerd SoDa e-mailadres
-CAMS_MIN_REFRESH_H = 12.0    # CAMS ververst ~1×/dag; 12 u spaart requests
-CAMS_BACKFILL_DAYS = 7       # rollend venster: laatste N dagen t/m 2 dagen geleden
+CAMS_MIN_REFRESH_H = 12.0    # CAMS refreshes ~once a day; 12 h spares requests
+CAMS_BACKFILL_DAYS = 7       # rolling window: the last N days up to 2 days ago
 CAMS_URL           = "https://api.soda-solardata.com/service/wps"
 
-# --- KNMI nowcast-overlay: STUURT de optimizer WEL (0-4u, ~99.8% accuraat vs AROME ~94%).
-# Overschrijft de AROME-PV voor de eerste uren met de verse KNMI-nowcast, met een soepele
-# overgang naar AROME op de naad en terugval op AROME bij ontbrekende/oude nowcast.
-# Backtest 21-07→05-08 (828 slots): MAE 118.8→87.2 Wh/slot (-27%), bias +20.6→+3.6 Wh (-83%).
+# --- KNMI nowcast overlay: DOES drive the optimizer (0-4 h, ~99.8% accurate vs AROME ~94%).
+# Overwrites the AROME PV for the first hours with the fresh KNMI nowcast, with a smooth transition
+# to AROME at the seam and a fallback to AROME when the nowcast is missing or old.
+# Backtest 21-07 -> 05-08 (828 slots): MAE 118.8 -> 87.2 Wh/slot (-27%), bias +20.6 -> +3.6 Wh (-83%).
 PV_NOWCAST_OVERLAY       = os.environ.get("PV_NOWCAST_OVERLAY", "1") == "1"
-PV_NOWCAST_HORIZON_H     = 4.0    # tot hoe ver vooruit de nowcast de AROME vervangt
-PV_NOWCAST_BLEND_START_H = 3.0    # vanaf hier lineair uitvloeien nowcast -> AROME
-PV_NOWCAST_MAX_AGE_MIN   = 90     # verse run vereist; ouder => geen overlay (val terug op AROME)
+PV_NOWCAST_HORIZON_H     = 4.0    # how far ahead the nowcast replaces AROME
+PV_NOWCAST_BLEND_START_H = 3.0    # from here a linear fade nowcast -> AROME
+PV_NOWCAST_MAX_AGE_MIN   = 90     # a fresh run is required; older => no overlay (fall back to AROME)
 PV_NOWCAST_FALSEZERO_KWH  = 0.01  # nowcast <= dit = "≈0"
-PV_NOWCAST_FALSEZERO_ELEV = 8.0   # ... én zon boven deze hoek (°) => valse nul (satelliet-data mist) -> AROME
+PV_NOWCAST_FALSEZERO_ELEV = 8.0   # ... and the sun above this angle (deg) => false zero (satellite data missing) -> AROME
 
-# --- Clear-sky-kalibratie: installatie-geometrie-correctie op de AROME-PV, per zonshoogte-graad,
-# afgeleid uit heldere dagen (r = werkelijk/AROME, ná _pv_horizon_factor → geen dubbeltelling).
-# Corrigeert m.n. de oost-string-namiddag-dropout; weer-onafhankelijk. Bestand regenereert bij
-# nieuwe heldere dagen. Schrijft ook de gemeten clear-sky-PV (pcs) per slot voor de grafiek-referentie.
+# --- Clear-sky calibration: installation geometry correction on the AROME PV, per degree of sun
+# elevation, derived from clear days (r = actual/AROME, after _pv_horizon_factor -> no double
+# counting). Corrects mainly the east string's afternoon drop-out; weather independent. The file is
+# regenerated on new clear days. Also writes the measured clear-sky PV (pcs) per slot for the chart
+# reference.
 PV_CLEARSKY_CALIB = os.environ.get("PV_CLEARSKY_CALIB", "1") == "1"
 _PV_CALIB_PATH    = Path(__file__).resolve().parent / "pv_clearsky_calibration.json"
-PCS_BLEND_H       = 0.75   # ±uur rond zonne-middag waarover pcs_m->pcs_a wordt geblend (deuk weg)
+PCS_BLEND_H       = 0.75   # +- hours around solar noon over which pcs_m -> pcs_a is blended (removes the dent)
 
-# --- Schaduwmasker per zonrichting x hoogte (common/pv_shade.py, gefit door pv_shade_fit.py) ---
-# Vervangt op de AROME-PV zowel _pv_horizon_factor als r: beide kijken alleen naar de zonshoogte,
-# en zijn in de zomer afgesteld (ochtendzon uit het NO achter bomen). In de winter komt de
-# ochtendzon uit het ZO (vrij) en staat de middagzon laag in het ZW (beschaduwd). Het masker is op
-# de AROME-voorspelling zelf gefit, dus bevat het ook AROME's eigen bias -> r overslaan.
-# Zonder (vers) masker in de DB: terug naar de oude horizonfactor + r.
+# --- Shade mask per sun azimuth x elevation (common/pv_shade.py, fitted by pv_shade_fit.py) ---
+# Replaces both _pv_horizon_factor and r on the AROME PV: both only look at the sun elevation and
+# were tuned in summer (morning sun from the NE, behind trees). In winter the morning sun comes from
+# the SE (open) and the afternoon sun is low in the SW (shaded). The mask is fitted on the AROME
+# forecast itself, so it also holds AROME's own bias -> skip r.
+# Without a (fresh) mask in the DB: back to the old horizon factor + r.
 PV_SHADE_MASK       = os.environ.get("PV_SHADE_MASK", "1") == "1"
 PV_SHADE_REFIT_DAYS = float(os.environ.get("PV_SHADE_REFIT_DAYS", "7"))
-_SHADE_MASK: Optional[dict] = None   # gezet in main(); None = oude horizonfactor + r
+_SHADE_MASK: Optional[dict] = None   # set in main(); None = old horizon factor + r
 
 
 def _load_weather_cache() -> tuple[dict, dict[int, float]]:
@@ -833,8 +832,8 @@ def write_om_forecast_cache(conn, target, quarters: list[float], run_ts: datetim
 
 
 def ensure_solcast_cache_table(conn):
-    """Cache van de Solcast PV-forecast (oost+west gecombineerd) per periode, zodat het
-    dashboard de Solcast-lijn uit de DB leest. Eén rij per slot_dt; upsert."""
+    """Cache of the Solcast PV forecast (east+west combined) per period, so the dashboard reads the
+    Solcast line from the DB. One row per slot_dt; upsert."""
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pv_solcast_forecast (
@@ -849,7 +848,7 @@ def ensure_solcast_cache_table(conn):
 
 
 def _fetch_solcast_site(resource_id: str) -> dict:
-    """Haal Solcast-forecast voor één site op. Returnt {periode_start(naïef lokaal): (kw, uren)}."""
+    """Fetch the Solcast forecast for one site. Returns {period_start (naive local): (kw, hours)}."""
     url = (f"https://api.solcast.com.au/rooftop_sites/{resource_id}/forecasts"
            f"?api_key={SOLCAST_API_KEY}&format=json&hours=48")
     r = requests.get(url, timeout=20)
@@ -857,7 +856,7 @@ def _fetch_solcast_site(resource_id: str) -> dict:
     out = {}
     for f in r.json().get("forecasts", []):
         hrs = 0.5 if f.get("period", "PT30M") == "PT30M" else 1.0
-        # period_end is UTC; converteer naar lokale tijd en bepaal periode-START
+        # period_end is UTC; convert to local time and determine the period START
         pe  = datetime.fromisoformat(f["period_end"].replace("Z", "+00:00")).astimezone()
         start = (pe - timedelta(hours=hrs)).replace(tzinfo=None)
         out[start] = (float(f.get("pv_estimate") or 0.0), hrs)
@@ -865,8 +864,8 @@ def _fetch_solcast_site(resource_id: str) -> dict:
 
 
 def update_solcast_cache(conn) -> None:
-    """Ververs (max. elke SOLCAST_MIN_REFRESH_H) de Solcast-cache: oost+west -> pv_kwh per periode.
-    Alleen-vergelijking; raakt de optimizer-beslissingen NIET. Gated op env-config."""
+    """Refresh (at most every SOLCAST_MIN_REFRESH_H) the Solcast cache: east+west -> pv_kwh per
+    period. Comparison only; does NOT touch the optimizer decisions. Gated on env config."""
     if not (SOLCAST_API_KEY and SOLCAST_SITE_EAST and SOLCAST_SITE_WEST):
         return
     ensure_solcast_cache_table(conn)
@@ -875,7 +874,7 @@ def update_solcast_cache(conn) -> None:
     last = cur.fetchone()[0]
     cur.close()
     if last is not None and (datetime.now() - last).total_seconds() < SOLCAST_MIN_REFRESH_H * 3600:
-        return  # nog vers genoeg -> spaar API-calls
+        return  # still fresh enough -> spare API calls
     try:
         east = _fetch_solcast_site(SOLCAST_SITE_EAST)
         west = _fetch_solcast_site(SOLCAST_SITE_WEST)
@@ -887,8 +886,8 @@ def update_solcast_cache(conn) -> None:
     for slot in sorted(set(east) | set(west)):
         e_kw, hrs = east.get(slot, (0.0, 0.5))
         w_kw, _   = west.get(slot, (0.0, 0.5))
-        # oost+west kWh in deze periode, mét lokale-horizon correctie (Solcast kent de lokale
-        # obstructie niet) — zelfde _pv_horizon_factor als de optimizer en CAMS-cache.
+        # east+west kWh in this period, with the local horizon correction (Solcast does not know
+        # the local obstruction) -- the same _pv_horizon_factor as the optimizer and the CAMS cache.
         rows.append((slot, (e_kw + w_kw) * hrs * _pv_horizon_factor(slot), run_ts))
     if not rows:
         return
@@ -904,8 +903,8 @@ def update_solcast_cache(conn) -> None:
 
 
 def ensure_cams_cache_table(conn):
-    """Cache van CAMS satelliet-instraling, omgerekend naar geschatte PV-kWh per 15-min slot.
-    Eén rij per slot_dt; upsert. Analyse-only — raakt de optimizer NIET."""
+    """Cache of CAMS satellite irradiance, converted to estimated PV kWh per 15-min slot.
+    One row per slot_dt; upsert. Analysis only -- does NOT touch the optimizer."""
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pv_cams_radiation (
@@ -921,11 +920,11 @@ def ensure_cams_cache_table(conn):
 
 
 def _fetch_cams_radiation(date_begin: str, date_end: str) -> dict:
-    """Haal CAMS Radiation (GHI, Wh/m² per 15-min) op voor [date_begin, date_end] (YYYY-MM-DD).
-    Returnt {naïef-lokale slot_start: ghi_wh_m2}. CAMS-tijden zijn UT → omgezet naar lokaal.
-    CSV: '#'-headerregels, dan kolomkop-regel, dan ';'-gescheiden data; 'Observation period'
-    = 'start/eind' ISO-UT, kolom 'GHI' = Wh/m² over de periode (verbose=false → integrated)."""
-    user = CAMS_USERNAME.replace("@", "%2540")     # @ dubbel-encoded zoals SoDa vereist
+    """Fetch CAMS Radiation (GHI, Wh/m2 per 15 min) for [date_begin, date_end] (YYYY-MM-DD).
+    Returns {naive local slot_start: ghi_wh_m2}. CAMS times are UT -> converted to local.
+    CSV: '#' header lines, then the column header line, then ';'-separated data; 'Observation
+    period' = 'start/end' ISO UT, column 'GHI' = Wh/m2 over the period (verbose=false -> integrated)."""
+    user = CAMS_USERNAME.replace("@", "%2540")     # @ double-encoded as SoDa requires
     data_inputs = (
         f"latitude={LAT};longitude={LON};altitude=-999;"
         f"date_begin={date_begin};date_end={date_end};"
@@ -942,15 +941,15 @@ def _fetch_cams_radiation(date_begin: str, date_end: str) -> dict:
         if not raw:
             continue
         if raw.startswith("#"):
-            # De kolomkop is de comment-regel die met 'Observation period' begint
-            # (pvlib-conventie). 'GHI' op naam zoeken — robuust tegen kolom-volgorde.
+            # The column header is the comment line that starts with 'Observation period' (pvlib
+            # convention). Find 'GHI' by name -- robust against column order.
             header = raw.lstrip("# ").strip()
             if header.startswith("Observation period"):
                 hdr = [c.strip() for c in header.split(";")]
                 if "GHI" in hdr:
                     ghi_idx = hdr.index("GHI")
             continue
-        if ghi_idx is None:                         # data vóór de header: overslaan
+        if ghi_idx is None:                         # data before the header: skip
             continue
         cols   = [c.strip() for c in raw.split(";")]
         period = cols[0] if cols else ""
@@ -967,9 +966,9 @@ def _fetch_cams_radiation(date_begin: str, date_end: str) -> dict:
 
 
 def update_cams_cache(conn) -> None:
-    """Ververs (max. elke CAMS_MIN_REFRESH_H) de CAMS-cache. Satelliet-gemeten GHI → geschatte
-    PV-kWh per 15-min slot via dezelfde GHI-fallback als de optimizer (PANEL_EFF_CAL, horizontaal).
-    Analyse-only; raakt de optimizer-beslissingen NIET. Gated op CAMS_USERNAME."""
+    """Refresh (at most every CAMS_MIN_REFRESH_H) the CAMS cache. Satellite-measured GHI -> estimated
+    PV kWh per 15-min slot through the same GHI fallback as the optimizer (PANEL_EFF_CAL, horizontal).
+    Analysis only; does NOT touch the optimizer decisions. Gated on CAMS_USERNAME."""
     if not CAMS_USERNAME:
         return
     ensure_cams_cache_table(conn)
@@ -978,8 +977,8 @@ def update_cams_cache(conn) -> None:
     last = cur.fetchone()[0]
     cur.close()
     if last is not None and (datetime.now() - last).total_seconds() < CAMS_MIN_REFRESH_H * 3600:
-        return  # nog vers genoeg -> spaar API-calls
-    date_end   = date.today() - timedelta(days=2)            # CAMS-data t/m ~2 dagen geleden
+        return  # still fresh enough -> spare API calls
+    date_end   = date.today() - timedelta(days=2)            # CAMS data up to ~2 days ago
     date_begin = date_end - timedelta(days=CAMS_BACKFILL_DAYS)
     try:
         ghi = _fetch_cams_radiation(date_begin.isoformat(), date_end.isoformat())
@@ -991,8 +990,8 @@ def update_cams_cache(conn) -> None:
         return
     run_ts = datetime.now()
     kwp    = PANEL_EAST_KWP + PANEL_WEST_KWP
-    # pv_kwh = horizontale GHI → PV, mét lokale-horizon correctie (oost-ochtend / west-namiddag),
-    # identiek aan wat de optimizer op zijn eigen schatting toepast. ghi_wh_m2 blijft ruw bewaard.
+    # pv_kwh = horizontal GHI -> PV, with the local horizon correction (east morning / west late
+    # afternoon), identical to what the optimizer applies to its own estimate. ghi_wh_m2 stays raw.
     rows   = [(slot, (ghi_wh / 1000.0) * kwp * PANEL_EFF_CAL * _pv_horizon_factor(slot), ghi_wh, run_ts)
               for slot, ghi_wh in sorted(ghi.items())]
     cur = conn.cursor()
@@ -1273,20 +1272,20 @@ def _pv_horizon_factor(dt_local: datetime) -> float:
 
 
 def _pv_geometry_factor(dt_local: datetime) -> float:
-    """Geometriefactor voor de AROME-PV van een slot: het schaduwmasker als dat geladen is,
-    anders de oude zonshoogte-horizonfactor."""
+    """Geometry factor for a slot's AROME PV: the shade mask when it is loaded, else the old
+    elevation-only horizon factor."""
     f = ps.factor(_SHADE_MASK, dt_local, LAT, LON)
     return _pv_horizon_factor(dt_local) if f is None else f
 
 
 def apply_pv_calibration(pv: float, calib_r: float, pv_src_override: Optional[str],
                          mask_active: bool) -> tuple[float, Optional[str]]:
-    """(pv, bronlabel) na de kalibratie op de AROME-PV van één slot.
+    """(pv, source label) after the calibration on one slot's AROME PV.
 
-    - Nowcast/blend overschrijft al (0-4u): niets doen.
-    - Schaduwmasker actief: r NIET toepassen -- het masker is op de AROME-voorspelling gefit en
-      bevat AROME's bias al; r erbovenop telt die dubbel (backtest 11-2026: sep-okt +2 tot +12% te hoog).
-    - Anders de oude r-kalibratie per zonshoogte."""
+    - Nowcast/blend already overwrites (0-4 h): do nothing.
+    - Shade mask active: do NOT apply r -- the mask is fitted on the AROME forecast and already
+      holds AROME's bias; r on top counts it twice (backtest 11-2026: Sep-Oct +2 to +12% too high).
+    - Otherwise the old r calibration per sun elevation."""
     if pv_src_override is not None:
         return pv, pv_src_override
     if mask_active:
@@ -1297,15 +1296,15 @@ def apply_pv_calibration(pv: float, calib_r: float, pv_src_override: Optional[st
 
 
 def _panel_params() -> dict:
-    """PV-constanten voor pv_shade_fit: dezelfde formules als _hourly_pv en read_knmi."""
+    """PV constants for pv_shade_fit: the same formulas as _hourly_pv and read_knmi."""
     return {"kwp_e": PANEL_EAST_KWP, "kwp_w": PANEL_WEST_KWP, "pr": PANEL_PR_GTI,
             "noct": PANEL_NOCT_C, "tcoef": PANEL_TEMP_COEFF, "peak": PEAK_MEASURED_KW,
             "total_kwp": PANEL_EAST_KWP + PANEL_WEST_KWP, "eff_cal": PANEL_EFF_CAL}
 
 
 def load_shade_mask(conn, now: datetime, refit: bool) -> Optional[dict]:
-    """Het AROME-schaduwmasker voor deze run (None = oude correctie). `refit` alleen in live runs:
-    fit beide maskers opnieuw als ze ontbreken of ouder zijn dan PV_SHADE_REFIT_DAYS."""
+    """The AROME shade mask for this run (None = old correction). `refit` only in live runs: refit
+    both masks when they are missing or older than PV_SHADE_REFIT_DAYS."""
     if not PV_SHADE_MASK:
         return None
     if refit:
@@ -1489,9 +1488,9 @@ def get_pv_forecast_details(radiation: dict, dt: datetime) -> tuple[float, float
 
 
 def load_nowcast_overlay(conn, now: datetime) -> dict:
-    """Verse KNMI-nowcast (pv_kwh per 15-min slot) van de laatste run, voor de in-day
-    PV-overlay. Leeg dict als uitgeschakeld of als de nieuwste run ouder is dan
-    PV_NOWCAST_MAX_AGE_MIN — dan valt de optimizer terug op AROME (robuust)."""
+    """Fresh KNMI nowcast (pv_kwh per 15-min slot) from the latest run, for the in-day PV overlay.
+    Empty dict when disabled or when the newest run is older than PV_NOWCAST_MAX_AGE_MIN -- then the
+    optimizer falls back to AROME (robust)."""
     if not PV_NOWCAST_OVERLAY:
         return {}
     try:
@@ -1553,9 +1552,9 @@ def apply_wp_plan(load_kwh: float, hp_reserved: float, plan_kwh: Optional[float]
 
 
 def nowcast_blend_weight(lead_h: float) -> float:
-    """Gewicht [0..1] van de nowcast in de PV-blend op lead-tijd `lead_h` (uren vooruit):
-    1.0 tot PV_NOWCAST_BLEND_START_H, lineair aflopend naar 0.0 op PV_NOWCAST_HORIZON_H,
-    en 0.0 buiten [0, horizon]. Zo geen sprong op de naad tussen nowcast en AROME."""
+    """Weight [0..1] of the nowcast in the PV blend at lead time `lead_h` (hours ahead): 1.0 up to
+    PV_NOWCAST_BLEND_START_H, falling linearly to 0.0 at PV_NOWCAST_HORIZON_H, and 0.0 outside
+    [0, horizon]. So no jump at the seam between nowcast and AROME."""
     if lead_h < 0.0 or lead_h > PV_NOWCAST_HORIZON_H:
         return 0.0
     if lead_h <= PV_NOWCAST_BLEND_START_H:
@@ -1565,11 +1564,12 @@ def nowcast_blend_weight(lead_h: float) -> float:
 
 
 def nowcast_false_zero(nc, elev_deg: float) -> bool:
-    """True als een nowcast-waarde een VALSE nul is: ≈0 terwijl de zon duidelijk op is.
+    """True when a nowcast value is a FALSE zero: ~0 while the sun is clearly up.
 
-    De satelliet-nowcast heeft vóór daglicht geen data en levert dan hele runs op 0 (ook voor de
-    daglicht-slots in hun 4u-venster). Bij zon boven de horizon geeft zelfs zwaar bewolkt altijd
-    íets, dus ≈0 = ontbrekende data, niet 'bewolkt' -> die slot niet blenden maar AROME gebruiken."""
+    The satellite nowcast has no data before daylight and then delivers whole runs at 0 (also for
+    the daylight slots in their 4 h window). With the sun above the horizon even heavy overcast
+    always gives something, so ~0 = missing data, not 'overcast' -> do not blend that slot, use
+    AROME."""
     if nc is None:
         return False
     return nc <= PV_NOWCAST_FALSEZERO_KWH and elev_deg > PV_NOWCAST_FALSEZERO_ELEV
@@ -1577,7 +1577,7 @@ def nowcast_false_zero(nc, elev_deg: float) -> bool:
 
 _pv_calib_cache = None
 def _pv_calib_deg() -> dict:
-    """Laadt de per-graad clear-sky-kalibratie (gecachet). {} als bestand ontbreekt/kapot."""
+    """Loads the per-degree clear-sky calibration (cached). {} when the file is missing/broken."""
     global _pv_calib_cache
     if _pv_calib_cache is None:
         try:
@@ -1589,8 +1589,9 @@ def _pv_calib_deg() -> dict:
 
 
 def pv_clearsky_calib(dt_local: datetime) -> tuple[float, Optional[float]]:
-    """(correctiefactor r, gemeten clear-sky-PV kWh/slot) voor slot dt_local, o.b.v. zonshoogte
-    + ochtend/middag uit de heldere-dag-kalibratie. r=1.0 / pcs=None als uit of onbekend."""
+    """(correction factor r, measured clear-sky PV kWh/slot) for slot dt_local, based on sun
+    elevation + morning/afternoon from the clear-day calibration. r=1.0 / pcs=None when off or
+    unknown."""
     if not PV_CLEARSKY_CALIB:
         return 1.0, None
     cal  = _pv_calib_deg()
@@ -1602,8 +1603,8 @@ def pv_clearsky_calib(dt_local: datetime) -> tuple[float, Optional[float]]:
     entry = cal.get("deg", {}).get(str(int(round(elev))))
     if not entry:
         return 1.0, None
-    # Zachte ochtend->middag-blend over ±PCS_BLEND_H rond zonne-middag (w=1 ochtend, 0 middag), voor
-    # ZOWEL r als pcs: een harde schakelaar geeft een sprong op de naad -> forecast-piek op het middaguur.
+    # Soft morning->afternoon blend over +-PCS_BLEND_H around solar noon (w=1 morning, 0 afternoon),
+    # for BOTH r and pcs: a hard switch gives a jump at the seam -> a forecast peak at noon.
     w = max(0.0, min(1.0, (noon + PCS_BLEND_H - t_h) / (2 * PCS_BLEND_H)))
     # r (forecast-correctie): geblend i.p.v. harde keuze.
     r_m, r_a = entry.get("r_m"), entry.get("r_a")
@@ -1614,14 +1615,14 @@ def pv_clearsky_calib(dt_local: datetime) -> tuple[float, Optional[float]]:
         r_a = r_a if r_a is not None else 1.0
         lo, hi = cal.get("meta", {}).get("clamp", [0.5, 1.15])
         r = max(lo, min(hi, w * r_m + (1.0 - w) * r_a))
-    # pcs (display-only referentielijn): zelfde blend, plus de seizoensterm.
+    # pcs (display-only reference line): the same blend, plus the season term.
     #
-    # kWh/slot = pcs_x + pcs_x_b * zonnedeclinatie. Zonshoogte alleen is niet genoeg: bij
-    # dezelfde hoogte staat de zon in augustus zuidelijker dan in juni, wat op een oost/west-
-    # opstelling gunstiger invalt (en de panelen zijn koeler). Gemeten scheelt dat 6,1% tussen
-    # juli en augustus. Zonder die term las de lijn te laag en kwam de werkelijke opbrengst er
-    # op 11 en 12 augustus 2026 bovenuit, wat voor een clear-sky-plafond onmogelijk is.
-    # Zie pv_clearsky_build.py. Een oude kalibratie zonder _b valt terug op de vlakke waarde.
+    # kWh/slot = pcs_x + pcs_x_b * solar declination. Elevation alone is not enough: at the same
+    # elevation the sun is further south in August than in June, which falls in more favourably on
+    # an east/west array (and the panels are cooler). Measured, that is 6.1% between July and
+    # August. Without that term the line read too low and the actual yield rose above it on 11 and
+    # 12 August 2026, which is impossible for a clear-sky ceiling. See pv_clearsky_build.py. An old
+    # calibration without _b falls back to the flat value.
     decl_deg = 23.45 * math.sin(math.radians(
         360 / 365 * (dt_local.timetuple().tm_yday - 81)))
 
@@ -1642,25 +1643,25 @@ def pv_clearsky_calib(dt_local: datetime) -> tuple[float, Optional[float]]:
 
 
 def pv_clearsky_split(dt_local: datetime) -> tuple[Optional[float], Optional[float]]:
-    """(clear-sky oost, clear-sky west) in kWh voor dit slot — ALLEEN voor weergave.
+    """(clear-sky east, clear-sky west) in kWh for this slot -- display ONLY.
 
-    Bewust een aparte functie naast pv_clearsky_calib in plaats van een extra retourwaarde
-    daarvan: die functie levert óók `r`, en `r` vermenigvuldigt de forecast waar de LP mee
-    rekent. Door de splitsing hier te houden kan een fout in deze code de besturing niet raken.
+    Deliberately a separate function next to pv_clearsky_calib rather than an extra return value of
+    it: that function also delivers `r`, and `r` multiplies the forecast the LP works with. Keeping
+    the split here means a bug in this code cannot touch the control.
 
-    De twee tellen niet exact op tot `pcs`: elke dakhelft krijgt in de fit zijn eigen optil
-    naar het 90-percentiel, en de som van twee bovengrenzen ligt hoger dan de bovengrens van
-    de som. Voor een referentielijn is dat de juiste kant om op te zitten.
+    The two do not add up exactly to `pcs`: each roof side gets its own lift to the 90th percentile
+    in the fit, and the sum of two upper bounds is higher than the upper bound of the sum. For a
+    reference line that is the right side to err on.
 
-    Levert (None, None) als de kalibratie de gesplitste sleutels niet heeft — dan is het een
-    oud bestand en toont het dashboard gewoon alleen de totale lijn.
+    Returns (None, None) when the calibration does not have the split keys -- then it is an old file
+    and the dashboard simply shows only the total line.
     """
     if not PV_CLEARSKY_CALIB:
         return None, None
     deg = _pv_calib_deg().get("deg", {})
-    # None betekent "deze kalibratie kent de splitsing niet" — dat is iets anders dan een
-    # nacht-slot, waar de waarde een echte nul is. Zonder dat onderscheid kreeg de grafiek
-    # 's nachts gaten terwijl de totale lijn daar gewoon over de bodem loopt.
+    # None means "this calibration does not know the split" -- different from a night slot,
+    # where the value is a real zero. Without that distinction the chart got gaps at night while
+    # the total line simply runs along the bottom there.
     if not any("pcs_m_e" in v or "pcs_a_e" in v for v in deg.values()):
         return None, None
     elev = _solar_elevation_deg(dt_local)
@@ -1944,10 +1945,10 @@ def write_schedule_to_db(conn, schedule: list[HourSlot], solver_status: str = "O
     else:
         log.warning("OM-raw: Open-Meteo unreachable this run — keeping cached curve")
 
-    # Solcast: UITGEZET 2026-08-05 (slechtste bron, +12%; niet gebruikt). Historie blijft in DB.
+    # Solcast: SWITCHED OFF 2026-08-05 (worst source, +12%; not used). History stays in the DB.
     # update_solcast_cache(conn)
 
-    # CAMS satelliet-gemeten instraling (analyse-only, ~2 dagen latency; raakt optimizer niet)
+    # CAMS satellite-measured irradiance (analysis only, ~2 days latency; does not touch the optimizer)
     update_cams_cache(conn)
 
     # Tag this run's today-rows with both totals so the dashboard can plot the
@@ -2006,10 +2007,10 @@ def store_predicted_snapshot(conn, schedule: list[HourSlot], today: date, overwr
 
 def store_rolling_predicted_snapshot(conn, today: date, initial_soc_pct: float,
                                      optimise_kwargs: dict, overwrite: bool = False):
-    """Optie (b): predicted-snapshot uit de ROLLING projectie (bootst de 15-min lus na), zodat de
-    predicted-lijn de rollende MPC-uitvoering vangt die het single-solve dagplan mist. ~96
-    LP-solves — 1x/dag (of via --snapshot backfill). Alleen harde grid-euro s, batterij buiten
-    beschouwing. Valt stil terug (geen snapshot) bij een fout."""
+    """Option (b): predicted snapshot from the ROLLING projection (mimics the 15-min loop), so the
+    predicted line captures the rolling MPC execution that the single-solve day plan misses. ~96 LP
+    solves -- once a day (or via --snapshot backfill). Hard grid euros only, battery left out.
+    Silently falls back (no snapshot) on an error."""
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS predicted_grid_snapshot (
@@ -2021,7 +2022,7 @@ def store_rolling_predicted_snapshot(conn, today: date, initial_soc_pct: float,
     if not overwrite:
         cur.execute("SELECT 1 FROM predicted_grid_snapshot WHERE snapshot_date=%s LIMIT 1", (today,))
         if cur.fetchone():
-            cur.close(); return   # al gesnapshot vandaag
+            cur.close(); return   # already snapshotted today
     cur.close()
     try:
         results = rolling_replay(start_qtr=0, end_qtr=96, initial_soc_pct=initial_soc_pct,
@@ -2131,12 +2132,11 @@ def hp_reserved_kwh(hp_profile_h: float, load_scale: float, hp_correction: float
 
 
 def build_load_profile(conn, base_load_w: float) -> dict[tuple[bool, int], float]:
-    """Weekdag/weekend-bewust, recency-gewogen uur-van-de-dag load-profiel (kWh/uur).
-    Geeft een dict met sleutel (is_weekend, hour). NB: GEEN pessimisme hier — dat
-    wordt in optimise() op de uiteindelijke slot-load toegepast zodat de in-day-ratio
-    schoon blijft.
-      #5 dag-weging  : recente dagen wegen zwaarder (exp. verval), weekend en weekdag apart.
-      #2 outlier     : de dag met het laagste totaalverbruik wordt genegeerd.
+    """Weekday/weekend-aware, recency-weighted hour-of-day load profile (kWh/hour).
+    Returns a dict keyed (is_weekend, hour). NB: NO pessimism here -- that is applied to the final
+    slot load in optimise(), so the in-day ratio stays clean.
+      #5 day weighting : recent days weigh more (exp. decay), weekend and weekday separately.
+      #2 outlier       : the day with the lowest total consumption is ignored.
     """
     skip  = _read_load_skip_days()
     now   = datetime.now()
@@ -2162,17 +2162,17 @@ def build_load_profile(conn, base_load_w: float) -> dict[tuple[bool, int], float
         by_day.setdefault(d, {})[int(r["hr"])] = max(r["avg_load_w"] or 0.0, 50.0)
     cur.close()
 
-    # Vandaag uitsluiten (partieel; in-day-adjustment behandelt de rest van vandaag apart)
+    # Exclude today (partial; the in-day adjustment handles the rest of today separately)
     by_day.pop(until.date(), None)
 
-    # #2 outlier: gooi de dag met het laagste totaalverbruik weg (bv. afwezigheid)
+    # #2 outlier: drop the day with the lowest total consumption (e.g. away from home)
     if LOAD_DROP_LOWEST_DAY and len(by_day) > 2:
         lowest = min(by_day, key=lambda dd: sum(by_day[dd].values()))
         by_day.pop(lowest, None)
 
-    # #5 recency-gewogen gemiddelde per (weekend?, uur)
+    # #5 recency-weighted average per (weekend?, hour)
     profile = weighted_hour_profile(by_day, until.date())
-    # ontbrekende sleutels opvullen met de base-load fallback
+    # fill missing keys with the base-load fallback
     for is_weekend in (False, True):
         for h in range(24):
             profile.setdefault((is_weekend, h), base_load_w / 1000.0)
@@ -2183,8 +2183,8 @@ def build_load_profile(conn, base_load_w: float) -> dict[tuple[bool, int], float
 
 
 def compute_inday_load_factor(conn, profile: dict[tuple[bool, int], float], now: datetime) -> float:
-    """#1 In-day adjustment: verhouding werkelijk vs voorspeld verbruik vandaag tot nu,
-    gedempt en geclampt. Schaalt straks alleen de resterende slots van VANDAAG."""
+    """#1 In-day adjustment: ratio of actual vs forecast consumption today so far, damped and
+    clamped. Later scales only the remaining slots of TODAY."""
     if not INDAY_ADJUST:
         return 1.0
     elapsed_h = now.hour + now.minute / 60.0
@@ -2205,7 +2205,7 @@ def compute_inday_load_factor(conn, profile: dict[tuple[bool, int], float], now:
     actual_w = max(row["avg_w"], 50.0)
 
     is_weekend = now.weekday() >= 5
-    hours_done = list(range(now.hour + 1))   # uren 0..nu (incl. lopend uur)
+    hours_done = list(range(now.hour + 1))   # hours 0..now (incl. the running hour)
     pred = [profile.get((is_weekend, h), profile.get((False, h), 0.0)) * 1000.0 for h in hours_done]
     pred_w = sum(pred) / len(pred) if pred else 0.0
     if pred_w <= 0:
@@ -2223,12 +2223,12 @@ def compute_inday_load_factor(conn, profile: dict[tuple[bool, int], float], now:
 # 5a2.  COOLING (AIRCO) LOAD FORECAST — APPLIED, bounded
 # ---------------------------------------------------------------------------
 def _cooling_fit(act: dict, acc: dict, today):
-    """Fit dagload ~ EWMA-graaduren op de laatste 14 historische dagen.
+    """Fit day load ~ EWMA degree hours on the last 14 historical days.
 
-    Returns (intercept, slope) of None bij een onbruikbare fit: te weinig punten, geen
-    spreiding in de graaduren, of een negatieve helling (fysisch onzin — meer koelen zou
-    dan minder load geven). None => de aanroeper valt terug op factor 1.0 (temp-blind).
-    Zuiver rekenwerk, geen DB — zo staat het in een test zonder database.
+    Returns (intercept, slope) or None on an unusable fit: too few points, no spread in the degree
+    hours, or a negative slope (physically nonsense -- more cooling would then mean less load).
+    None => the caller falls back to factor 1.0 (temperature-blind). Pure arithmetic, no DB -- so it
+    fits in a test without a database.
     """
     import statistics as _st
     fit_days = [d for d in sorted(act) if d < today and d in acc][-14:]
@@ -2247,11 +2247,11 @@ def _cooling_fit(act: dict, acc: dict, today):
 
 
 def _cooling_factor(intercept, slope, acc_day, base_kwh):
-    """Temp-aware/temp-blind schaal, geklemd op [MIN, MAX].
+    """Temperature-aware/temperature-blind scale, clamped to [MIN, MAX].
 
-    base_kwh is de temp-blinde dagvoorspelling (som van het profiel). De clamp is de vangrail:
-    zonder haar gaf de rauwe fit op 16-06 een factor van -0,08 (temp-aware -1,1 kWh); geklemd
-    wordt dat 0,7. Niet-positieve base => 1.0 (niets om tegen te schalen).
+    base_kwh is the temperature-blind day forecast (sum of the profile). The clamp is the guard
+    rail: without it the raw fit gave a factor of -0.08 on 16-06 (temperature-aware -1.1 kWh);
+    clamped that becomes 0.7. Non-positive base => 1.0 (nothing to scale against).
     """
     if base_kwh <= 0:
         return 1.0
@@ -2260,11 +2260,11 @@ def _cooling_factor(intercept, slope, acc_day, base_kwh):
 
 
 def compute_cooling_factors(conn, load_prof, now, radiation):
-    """Begrensde temp-aware koelcorrectie. Geeft {date: factor} voor vandaag en morgen.
+    """Bounded temperature-aware cooling correction. Returns {date: factor} for today and tomorrow.
 
-    De factor schaalt het temp-blinde dagprofiel naar de CDH-regressie, geklemd op [MIN,MAX].
-    Elke degeneratie -> lege dict => factor 1.0 in de lus = exact het huidige temp-blinde
-    gedrag. Read-only + fail-safe: gooit nooit door naar de optimizer.
+    The factor scales the temperature-blind day profile to the CDH regression, clamped to
+    [MIN, MAX]. Any degeneracy -> empty dict => factor 1.0 in the loop = exactly the current
+    temperature-blind behaviour. Read only + fail safe: never throws through to the optimizer.
     """
     factors: dict = {}
     if not COOLING_APPLY:
@@ -2289,7 +2289,7 @@ def compute_cooling_factors(conn, load_prof, now, radiation):
                if r["n"] and r["n"] > 250 and r["kwh"] is not None}
         cur.close()
 
-        acc, prev = {}, None                       # EWMA thermische-massa accumulator (historie)
+        acc, prev = {}, None                       # EWMA thermal mass accumulator (history)
         for d in sorted(cdh):
             acc[d] = cdh[d] if prev is None else cdh[d] + (alpha ** (d - prev).days) * acc[prev]
             prev = d
@@ -2300,7 +2300,7 @@ def compute_cooling_factors(conn, load_prof, now, radiation):
             return factors
         intercept, slope = fit
 
-        # verwachte graaduren voor vandaag en morgen uit de temp-forecast (radiation)
+        # expected degree hours for today and tomorrow from the temperature forecast (radiation)
         fc_sum: dict = {today: 0.0, tomorrow: 0.0}
         fc_cnt: dict = {today: 0, tomorrow: 0}
         for iso, entry in radiation.items():
@@ -2564,9 +2564,9 @@ def optimise(  # noqa: C901
     tomorrow     = today + timedelta(days=1)
     current_hour = (start_qtr_idx % 96) // 4
 
-    # Dag-MAX voorspeltemperatuur per horizon-dag: bepaalt de seizoensmodus (stoken vs koelen).
-    # Ontbreekt een dag in de forecast, dan 99C -> koelmodus (warmtepomp uit): de veilige default
-    # is 'geen spookverwarming', precies de bug die deze gate wegneemt.
+    # Day MAX forecast temperature per horizon day: decides the season mode (heating vs cooling).
+    # If a day is missing from the forecast, 99 C -> cooling mode (heat pump off): the safe default
+    # is 'no phantom heating', exactly the bug this gate removes.
     day_max_temp: dict = {}
     for _iso, _entry in radiation.items():
         try:
@@ -2602,14 +2602,15 @@ def optimise(  # noqa: C901
         # PV per quarter slot: linear interpolation between hour midpoints
         pv            = estimate_pv_kwh_per_quarter(radiation, dt, qtr)
 
-        # In-day nowcast-overlay: vervang de AROME-PV door de verse KNMI-nowcast voor de
-        # eerste 0-4u (waar de nowcast ~99.8% is vs AROME ~94%), soepel uitvloeiend naar
-        # AROME op de naad. Terugval op AROME als de slot in de nowcast ontbreekt.
+        # In-day nowcast overlay: replace the AROME PV with the fresh KNMI nowcast for the first
+        # 0-4 h (where the nowcast is ~99.8% vs AROME ~94%), fading smoothly into AROME at the
+        # seam. Falls back to AROME when the slot is missing from the nowcast.
         pv_src_override = None
         if nowcast_pv:
             nc = nowcast_pv.get(dt)
-            # Valse nul: ≈0 nowcast terwijl de zon op is = ontbrekende satelliet-data (vroege ochtend,
-            # vóór de eerste daglicht-run) -> negeer die slot en gebruik AROME i.p.v. de ochtend te nullen.
+            # False zero: ~0 nowcast while the sun is up = missing satellite data (early morning,
+            # before the first daylight run) -> ignore that slot and use AROME instead of zeroing
+            # the morning.
             if nc is not None and nowcast_false_zero(nc, _solar_elevation_deg(dt)):
                 nc = None
             if nc is not None:
@@ -2618,24 +2619,26 @@ def optimise(  # noqa: C901
                     pv = w * nc + (1.0 - w) * pv
                     pv_src_override = "KNMI_NOWCAST" if w >= 0.999 else "NOWCAST_BLEND"
 
-        # Clear-sky-kalibratie: corrigeer de AROME-PV voor de installatie-geometrie (per zonshoogte).
-        # Alleen waar de nowcast NIET al overschrijft (0-4u = nowcast-waarheid). pv_clearsky = referentie.
+        # Clear-sky calibration: correct the AROME PV for the installation geometry (per sun
+        # elevation). Only where the nowcast does NOT already overwrite (0-4 h = nowcast truth).
+        # pv_clearsky = the reference.
         calib_r, pv_clearsky = pv_clearsky_calib(dt)
         pcs_east, pcs_west = pv_clearsky_split(dt)
         pv, pv_src_override = apply_pv_calibration(pv, calib_r, pv_src_override, _SHADE_MASK is not None)
 
-        # #5 weekdag/weekend-bewust profiel; #2 pessimisme; #1 in-day factor (alleen vandaag)
+        # #5 weekday/weekend-aware profile; #2 pessimism; #1 in-day factor (today only)
         db_load_h     = load_profile.get((d.weekday() >= 5, hour),
                                          load_profile.get((False, hour), BASE_LOAD_FALLBACK_W / 1000))
         load_scale    = inday_load_factor if d == today else 1.0
         db_load_h    *= load_scale
-        # Seizoensgate: stookdag (dag-max <= 16C) => warmtepomp aan, airco uit; anders omgekeerd.
-        # Zo vullen de twee modellen elkaar aan i.p.v. dubbel te tellen in het tussenseizoen.
+        # Season gate: heating day (day max <= 16 C) => heat pump on, air conditioning off; otherwise
+        # the reverse. So the two models complement each other instead of double counting in the
+        # shoulder season.
         heating_mode  = day_max_temp.get(d, 99.0) <= HEATING_MAX_TEMP_C
-        # Temp-blinde basis vóór de koelfactor, zodat de airco-bijdrage het verschil is.
+        # Temperature-blind base before the cooling factor, so the air conditioning share is the difference.
         cool_base_h   = db_load_h * LOAD_PESSIMISM
         cool_factor   = 1.0 if heating_mode else cooling_factors.get(d, 1.0)
-        db_load_h    *= cool_factor                   # begrensde temp-aware schaal (airco)
+        db_load_h    *= cool_factor                   # bounded temperature-aware scale (air conditioning)
         db_load_h    *= LOAD_PESSIMISM
         cooling_corr  = (db_load_h - cool_base_h) * SLOT_H
         hp_corr_h     = predict_hp_correction_kwh(forecast_temp, ref_temp, hour) if heating_mode else 0.0
@@ -3899,12 +3902,12 @@ def rolling_replay(
 
 
 def decide_soc_floor(current_pct, base_pct, taper_socs, hours_since_update):
-    """Pure ratchet-beslissing voor de adaptieve SoC-vloer.
+    """Pure ratchet decision for the adaptive SoC floor.
 
-    taper_socs = SoC-waarden van recente vmin/vdelta-taper-events. We verhogen alleen
-    als er een taper bij de BODEM was (binnen SOC_FLOOR_PROX_PCT van de huidige vloer)
-    en de snelheidsbegrenzer het toelaat. Retour: (nieuwe_vloer, actie) met actie in
-    {None, 'raise', 'cap'}. Omlaag gaat NOOIT automatisch (handmatig na calibratie)."""
+    taper_socs = SoC values of recent vmin/vdelta taper events. We only raise when there was a taper
+    at the BOTTOM (within SOC_FLOOR_PROX_PCT of the current floor) and the rate limiter allows it.
+    Returns (new_floor, action) with action in {None, 'raise', 'cap'}. Down NEVER happens
+    automatically (by hand after a calibration)."""
     if hours_since_update is not None and hours_since_update < SOC_FLOOR_MIN_INTERVAL_H:
         return current_pct, None
     at_floor = [s for s in taper_socs if s is not None and s <= current_pct + SOC_FLOOR_PROX_PCT]
@@ -3916,8 +3919,8 @@ def decide_soc_floor(current_pct, base_pct, taper_socs, hours_since_update):
 
 
 def apply_adaptive_floor(conn):
-    """Lees de adaptieve SoC-vloer uit de DB, ratchet 'm bij een bodem-taper, en geef
-    de (evt. verhoogde) vloer % terug. State in battery_soc_floor (1 rij)."""
+    """Read the adaptive SoC floor from the DB, ratchet it on a bottom taper, and return the
+    (possibly raised) floor %. State in battery_soc_floor (1 row)."""
     import re as _re
     cur = conn.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS battery_soc_floor (
@@ -3988,8 +3991,8 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
 
     load_tariffs_from_db(conn)
 
-    # Adaptieve SoC-vloer (alleen live, niet bij replay/snapshot): ratchet omhoog bij
-    # bodem-tapers; herzet de LP-vloer-globals voordat optimise() ze leest.
+    # Adaptive SoC floor (live only, not in replay/snapshot): ratchet up on bottom tapers; reset the
+    # LP floor globals before optimise() reads them.
     if replay_at is None and snapshot_date is None:
         BAT_MIN_SOC_PCT = apply_adaptive_floor(conn)
         BAT_MIN_KWH = BAT_CAPACITY_KWH * BAT_MIN_SOC_PCT / 100.0
@@ -4040,12 +4043,12 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
 
     base_load    = read_avg_consumption(conn)
     load_prof    = build_load_profile(conn, base_load)
-    hp_prof      = build_hp_profile(conn)       # WP-deel van load_prof, alleen voor de weergave
+    hp_prof      = build_hp_profile(conn)       # heat pump share of load_prof, for display only
     inday_factor = compute_inday_load_factor(conn, load_prof, now)
     cooling_facs = compute_cooling_factors(conn, load_prof, now, radiation)  # begrensd; {} = temp-blind
-    nowcast_pv   = load_nowcast_overlay(conn, now)  # verse KNMI-nowcast voor de 0-4u PV-overlay
+    nowcast_pv   = load_nowcast_overlay(conn, now)  # fresh KNMI nowcast for the 0-4 h PV overlay
     _SHADE_MASK  = load_shade_mask(conn, now, refit=(replay_at is None and snapshot_date is None and not dry_run))
-    wp_plan      = load_wp_plan(conn, now) if replay_at is None else {}   # live WP-plan, niet in replays
+    wp_plan      = load_wp_plan(conn, now) if replay_at is None else {}   # live heat pump plan, not in replays
 
     mode = "DYNAMIC_PRICE"
     log.info("Optimizer mode: %s", mode)

@@ -55,11 +55,11 @@ LON = float(os.environ.get("SYSTEM_LON", "5.0"))
 
 MIN_PEAK_W = 500.0        # below this it is not a usable day
 MIN_SLOTS = 20            # minimaal aantal kwartieren met data
-MAX_TV = 1.25             # gladheid; 1,0 = perfecte belcurve (op en neer)
+MAX_TV = 1.25             # smoothness; 1.0 = a perfect bell curve (up and down)
 YIELD_QUANTILE = 0.75     # top-kwart dagopbrengst binnen de maand
 MIN_ELEV = 10             # below this elevation the measurement is too noise-sensitive
 MIN_POINTS = 8            # minimum number of points for a fit of its own per degree
-LIFT_Q = 0.90             # percentiel van de residuen -> bovengrens
+LIFT_Q = 0.90             # percentile of the residuals -> upper bound
 LIFT_FULL_ELEV = 25       # above this elevation the lift counts fully
 
 
@@ -166,7 +166,7 @@ def fit_bins(obs: dict) -> dict:
 
 
 def fill_and_smooth(fits: dict, morning: bool) -> dict:
-    """Gaten interpoleren en 3-punts gladstrijken over de zonshoogte."""
+    """Interpolate gaps and apply a 3-point smoothing over the sun elevation."""
     have = {e: ab for (e, m), ab in fits.items() if m is morning}
     if not have:
         return {}

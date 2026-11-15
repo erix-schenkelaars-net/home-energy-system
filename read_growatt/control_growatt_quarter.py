@@ -560,7 +560,7 @@ def read_register(client, reg: Register):
     return val
 
 
-SPH_BURST_POLL_S   = 3     # hoe vaak de vdelta_taper-latch peilen in de sleep
+SPH_BURST_POLL_S   = 3     # how often to poll the vdelta_taper latch during the sleep
 SPH_BURST_SAMPLE_S = 2     # sampling interval of the SPH pack voltage during a taper
 SPH_BURST_CAP_S    = 180   # safety cap: max burst duration if the latch stays stuck
 

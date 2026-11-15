@@ -47,7 +47,7 @@ def temp(v):
 
 
 def modbus_read(ser, start, count):
-    """Modbus-RTU functie 0x04 (read input registers) -> lijst van 16-bit woorden of None."""
+    """Modbus RTU function 0x04 (read input registers) -> list of 16-bit words or None."""
     frame = bytearray([SLAVE, 0x04, (start >> 8) & 0xFF, start & 0xFF,
                        (count >> 8) & 0xFF, count & 0xFF])
     crc = crc16(frame)
