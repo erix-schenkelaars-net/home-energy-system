@@ -491,6 +491,8 @@ def build_cfg():
         "softstart_rate": float(os.environ.get("WP_SOFTSTART_RATE", "1")),  # C of ramp per 5 min of run time
         # after a defrost the same ramp from the water (defrost_soft_flow); 0 = off
         "defrost_soft":  os.environ.get("WP_DEFROST_SOFTSTART", "1").strip() not in ("0", "", "false", "no"),
+        # OTThing OpenTherm mode: decides the override flags in command_wp (see there). repeater | master_slave
+        "ot_mode":       os.environ.get("WP_OT_MODE", "repeater").strip().lower(),
         # alert "Honeywell knob too low" (honeywell_low_step); 0 = off
         "hw_low_alert":  os.environ.get("WP_HW_LOW_ALERT", "1").strip() not in ("0", "", "false", "no"),
         "hw_low_margin": float(os.environ.get("WP_HW_LOW_MARGIN", "0.2")),   # K above the knob (the P60 stops at ~+0.5)
@@ -1530,6 +1532,16 @@ def publish_ha(cfg, state, with_discovery=False, plan=None, heatplan=None):
         _mqtt_publish(HA_HEATPLAN_TOPIC, json.dumps(heatplan), cfg, False, retain=True)
 
 
+OT_MODES = ("repeater", "master_slave")
+
+
+def override_flag(ot_mode):
+    """PURE: the overrideChOn/overrideChFlow payload for the OTThing mode. Repeater: "ON" (our circuit
+    replaces the Honeywell); Master+Slave: "OFF" (there ON would hand control back to the Honeywell).
+    Anything unknown -> "ON", the behaviour before WP_OT_MODE existed."""
+    return "OFF" if ot_mode == "master_slave" else "ON"
+
+
 def command_wp(cfg, heat, flow, sp=None):
     """LIVE heat pump control by pi5new. heat -> chMode1=heat + chSetTemp1=<flow> (the heat pump follows
     it because overrideChFlow1 is ON); off -> chMode1=off (heat pump target -> 0 = safe default, heat
@@ -1540,11 +1552,20 @@ def command_wp(cfg, heat, flow, sp=None):
     OTThing replace the Honeywell's enable bit with its own getChOn() (= chMode != off); roomMode1=heat
     because roomMode=off always makes getChOn() false. `sp` -> roomSetpoint1: the OTThing room suspend
     (setpoint+1.5) then works with OUR setpoint (source = MQTT in the OTThing config), not with the
-    Honeywell knob -- and so stays a safety net if wp_control fails."""
+    Honeywell knob -- and so stays a safety net if wp_control fails.
+
+    The override flags mean the OPPOSITE in the two OTThing modes (firmware CHcontrol.cpp,
+    masterOvrdEnabled = Master+Slave): in Repeater, overrideChFlow1/overrideChOn1 ON = the OTThing's own
+    circuit (our chSetTemp1/chMode1) replaces the Honeywell's TSet/enable; in Master+Slave, ON = use the
+    Honeywell's TSet/enable (its idle TSet is 65 C, unclipped). So both are published per cfg['ot_mode']
+    (WP_OT_MODE): ON in "repeater", OFF in "master_slave". Both retained, so a reboot of the OTThing
+    picks up the right value at once."""
     ch = cfg["channel"]
     dry = not cfg["control_live"]
+    ovr = override_flag(cfg["ot_mode"])
     _mqtt_publish(f"{cfg['base_topic']}/roomMode{ch}/set", "heat", cfg, dry, retain=True)
-    _mqtt_publish(f"{cfg['base_topic']}/overrideChOn{ch}/set", "ON", cfg, dry, retain=True)
+    _mqtt_publish(f"{cfg['base_topic']}/overrideChOn{ch}/set", ovr, cfg, dry, retain=True)
+    _mqtt_publish(f"{cfg['base_topic']}/overrideChFlow{ch}/set", ovr, cfg, dry, retain=True)
     if sp is not None:
         _mqtt_publish(f"{cfg['base_topic']}/roomSetpoint{ch}/set", str(sp), cfg, dry, retain=True)
     if heat and flow is not None:
@@ -1603,6 +1624,8 @@ def main():
                 f"setpoint[{'LIVE' if sp_live else 'DRY'}]->{cfg['base_topic']}/roomSetpoint{cfg['channel']}/set "
                 f"buiten[{'uit' if not cfg['publish_outside'] else ('DRY' if cfg['outside_dry_run'] else 'LIVE')}]"
                 f"->{cfg['base_topic']}/outsideTemp/set")
+    dbg("CONF", f"OTThing-mode = {cfg['ot_mode']} -> overrideChOn1/overrideChFlow1 = {override_flag(cfg['ot_mode'])}"
+                + ("" if cfg["ot_mode"] in OT_MODES else "  (ONBEKEND: valt terug op ON)"))
     dbg("CONF", f"roomSetpoint = {'LIVE — publiceert!' if sp_live else 'DROOG (logt alleen)'} | "
                 f"buitentemp = {'DROOG' if cfg['outside_dry_run'] else 'LIVE — publiceert!'}"
                 + ("" if cfg["outside_dry_run"] else "  (zorg dat de HA-P60-inlaat-publisher UIT staat!)"))

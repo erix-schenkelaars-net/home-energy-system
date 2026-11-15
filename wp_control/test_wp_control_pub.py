@@ -675,6 +675,24 @@ class TestCommandWp(unittest.TestCase):
             self.assertEqual(calls["otthing/CE150C/roomSetpoint1/set"]["payload"], "22.0")
             self.assertTrue(all(kw["retain"] for kw in calls.values()))
 
+    def test_override_flags_follow_the_ot_mode(self):
+        # Repeater: ON = our circuit replaces the Honeywell. Master+Slave: ON would mean "use the
+        # Honeywell's TSet" (idle 65 C, unclipped) -> both flags must be OFF there.
+        for mode, want in (("repeater", "ON"), ("master_slave", "OFF"), ("nonsense", "ON")):
+            wp.mqtt_publish.single.reset_mock()
+            c = wp.build_cfg(); c["control_live"] = True; c["ot_mode"] = mode
+            wp.command_wp(c, heat=True, flow=40.0, sp=22.0)
+            calls = {call.args[0]: call.kwargs for call in wp.mqtt_publish.single.call_args_list}
+            for flag in ("overrideChOn1", "overrideChFlow1"):
+                self.assertEqual(calls[f"otthing/CE150C/{flag}/set"]["payload"], want, (mode, flag))
+                self.assertTrue(calls[f"otthing/CE150C/{flag}/set"]["retain"])
+            self.assertEqual(calls["otthing/CE150C/chSetTemp1/set"]["payload"], "40.0")
+
+    def test_ot_mode_default_is_repeater(self):
+        self.assertEqual(wp.build_cfg()["ot_mode"], "repeater")
+        with patch.dict(os.environ, {"WP_OT_MODE": "Master_Slave"}):
+            self.assertEqual(wp.build_cfg()["ot_mode"], "master_slave")
+
     def test_live_without_setpoint_skips_room_setpoint(self):
         wp.mqtt_publish.single.reset_mock()
         c = wp.build_cfg(); c["control_live"] = True
