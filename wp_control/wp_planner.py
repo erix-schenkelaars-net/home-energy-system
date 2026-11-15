@@ -42,9 +42,13 @@ PENALTY_RAMP_SLOTS = 8       # first 2 h: comfort penalty AND margin ramp up fro
 BIAS_HOURS = 6               # forecast-vs-sensor offset measured over this many hours ...
 BIAS_DECAY_H = 12            # ... and faded out over the horizon with this time constant
 TANGENTS = tuple(x / 2 for x in range(3, 21))   # 1.5 .. 10 kW every 0.5: coarser lines made the plan stick to their kinks
-# During a Honeywell bump the heat is capped: a bump lasts an hour, 10 kW at 50 °C does not reach 23 °C
-# in that hour anyway, it mostly buys a poor COP (11-07: three bumps, 30-60 min at 7-8 kW, ~EUR 1.50).
-BUMP_QMAX = float(os.environ.get("WP_BUMP_QMAX", "5.0"))
+# One heat cap for the whole plan, bumps included (2026-11-15, replaces WP_BUMP_QMAX). Low and long is
+# the better COP (10-30: 3.99 -> 4.41 with longer, lower runs), and a bump lasts an hour: 10 kW at 50 °C
+# does not reach 23 °C in that hour anyway, it mostly buys a poor COP (11-07: three bumps, 30-60 min at
+# 7-8 kW, ~EUR 1.50). Per quarter the cap is lifted to the house's steady heat loss at that quarter's
+# floor and forecast outside temperature (heat_cap), so in frost it never makes the floor unreachable:
+# at 0.251 kW/K, 6 kW holds 21.7 down to about -2 °C, 19.5 at night down to about -4.4 °C.
+QMAX = float(os.environ.get("WP_QMAX", "6.0"))
 # A bump needs at least this long after the restart lockout, else it is left out of the plan. 11-08: stop
 # at 16:00, bump at 16:09 until 17:09: the only quarter it could still act on was 17:00, so the plan
 # bought 5 kW at EUR 0.50 for a 22.8 floor it could never reach.
@@ -155,7 +159,7 @@ def defrost_relax(t, defrost_end, k=None, hold_h=None, rate=None):
 
 def defrost_from_rows(rows, gap=DEFROST_GAP_K, min_rows=DEFROST_MIN_ROWS):
     """PURE: the most recent defrost in energy rows (ts, flame, ot_flow, ot_return, flow_cmd), oldest
-    first -> {"start", "end", "flow_before"} or None.
+    first -> {"start", "end", "flow_before", "water_end"} or None.
 
     Read from the OTThing (local OpenTherm), not from the Sparrow status: that comes through the cloud
     and HA's Weheat integration and freezes now and then -- its negative output power with it. During
@@ -163,7 +167,8 @@ def defrost_from_rows(rows, gap=DEFROST_GAP_K, min_rows=DEFROST_MIN_ROWS):
     the compressor runs; while heating it is always warmer. 10-20..11-14: every defrost the Sparrow
     reported has >= 2 consecutive rows with return - flow >= 2 K, plus one on 11-10 11:35 that the
     frozen feed reported as 'heating'; the only row outside a defrost was a single one (11-04 14:10).
-    flow_before = our last flow command before the defrost (for the shadow cap in wp_control)."""
+    flow_before = our last flow command before the defrost; water_end = the warmer of flow and return in
+    the last defrost row: where wp_control's post-defrost ramp starts (defrost_soft_flow)."""
     def hit(r):
         return bool(r[1]) and r[2] is not None and r[3] is not None and r[3] - r[2] >= gap
     best, run = None, []
@@ -179,8 +184,10 @@ def defrost_from_rows(rows, gap=DEFROST_GAP_K, min_rows=DEFROST_MIN_ROWS):
     if best is None:
         return None
     before = [r[4] for r in rows[:best[0]] if r[4] is not None]
-    return {"start": rows[best[0]][0], "end": rows[best[1]][0],
-            "flow_before": float(before[-1]) if before else None}
+    last = rows[best[1]]
+    return {"start": rows[best[0]][0], "end": last[0],
+            "flow_before": float(before[-1]) if before else None,
+            "water_end": float(max(last[2], last[3]))}
 
 
 def read_defrost(db, now, hours=None):
@@ -543,18 +550,19 @@ def read_run_state(db, now):
     return run_state_from_rows(rows, now)
 
 
-def build_live_inputs(rows, now, bands, recent, bump=None, lower=None, defrost_end=None):
+def build_live_inputs(rows, now, bands, recent, bump=None, lower=None, defrost_end=None, house=None):
     """PURE: planner inputs from per-quarter rows starting at the current quarter.
 
     rows:   [{"t", "price", "t_out_fc", "pv_fc"}...]; a missing price takes the same quarter a day
             earlier (what the optimiser does before tomorrow's prices are out)
     recent: [(sensor, forecast)...] for the bias correction
-    bump:   (until, temp[, q_before]) -- a Honeywell bump: the room must reach `temp` until `until`, with
-            the heat capped meanwhile at bump_qmax(q_before), see there
+    bump:   (until, temp[, q_before]) -- a Honeywell bump: the room must reach `temp` until `until`; the
+            heat cap never goes below q_before meanwhile (heat_cap)
     lower:  (until, temp) -- a manual lowering: the comfort floor is capped at `temp` until `until`
     defrost_end: end of the last defrost -> the floor is lowered by defrost_relax (not during a bump:
             that is an explicit request)
-    The floor itself comes from comfort_floors: upward band steps are ramps."""
+    house:  the house model parameters, for the frost lift of the heat cap (heat_cap); None = no lift
+    The floor itself comes from comfort_floors: upward band steps are ramps. qmax per quarter = heat_cap."""
     by_t = {r["t"]: r for r in rows}
     price, fc = [], []
     for r in rows:
@@ -573,7 +581,7 @@ def build_live_inputs(rows, now, bands, recent, bump=None, lower=None, defrost_e
     t_out = corrected_outside(fc_filled, [m for m, _ in recent], [f for _, f in recent])
     tmin, qmax = [], []
     floors = comfort_floors(bands, [r["t"] for r in rows])
-    for r, tm in zip(rows, floors):
+    for r, tm, to in zip(rows, floors, t_out):
         if tm is not None:
             tm = round(tm - defrost_relax(r["t"], defrost_end), 2)
         if lower and r["t"] < lower[0]:
@@ -582,19 +590,25 @@ def build_live_inputs(rows, now, bands, recent, bump=None, lower=None, defrost_e
         if in_bump:
             tm = max(tm or 0.0, bump[1] - MARGIN)     # the bump temperature itself, margin included
         tmin.append(tm)
-        qmax.append(bump_qmax(bump[2] if len(bump) > 2 else None) if in_bump else None)
+        qmax.append(heat_cap(house, tm, to, (bump[2] if len(bump) > 2 else None) if in_bump else None))
     return {"price": price, "t_out": t_out, "pv_kw": [r.get("pv_fc") or 0.0 for r in rows],
             "hour": [r["t"].hour + r["t"].minute / 60 for r in rows], "tmin": tmin, "qmax": qmax}
 
 
-def bump_qmax(q_before):
-    """PURE: the heat cap during a bump: BUMP_QMAX, but never below `q_before`, the heat the planner
-    was already delivering when the bump started (None/0 when it was off or unknown).
+def heat_cap(house, floor, t_out, q_before=None):
+    """PURE: the heat cap (kW) for one quarter: QMAX, lifted to the steady heat loss
+    ua * (floor - t_out) when the house needs more than that to hold the floor (frost), and during a
+    bump never below `q_before`, the heat the planner was already delivering when the bump started
+    (None/0 when it was off or unknown).
 
-    The cap is there so a bump cannot ask the heat pump for 8 kW. It must not make a bump turn the heat
-    DOWN: on 2026-11-15 the planner ran 5.25 kW (price charging), the bump capped it to 5.0 and the
-    flow target fell 1 K -- turning the dial up made the house get less heat."""
-    return max(BUMP_QMAX, q_before or 0.0)
+    The bump part: a bump must not turn the heat DOWN. On 2026-11-15 the planner ran 5.25 kW (price
+    charging), the bump capped it to 5.0 and the flow target fell 1 K -- turning the dial up made the
+    house get less heat. The loss ignores internal and solar gains on purpose: in doubt the cap lifts
+    a little early rather than leaving the room under the floor. house/floor/t_out None = no lift."""
+    loss = 0.0
+    if house is not None and floor is not None and t_out is not None:
+        loss = hm.ua(house) * (floor - t_out)
+    return round(max(QMAX, loss, q_before or 0.0), 2)
 
 
 def usable_bump(bump, first_slot, running, off_min, min_off_min):
@@ -658,7 +672,7 @@ def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flo
         defrost = read_defrost(db, now)
     except Exception:            # without it the floor is simply not relaxed: the behaviour before 11-14
         defrost = None
-    inp = build_live_inputs(fut, now, bands, recent, bump_used, lower, defrost and defrost["end"])
+    inp = build_live_inputs(fut, now, bands, recent, bump_used, lower, defrost and defrost["end"], house=p)
     res = plan(params, room_now, tm, inp, on0=running, off_minutes=off_min)
     if "on" not in res:
         raise RuntimeError(f"solver: {res.get('message')}")

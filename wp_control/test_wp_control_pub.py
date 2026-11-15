@@ -1261,23 +1261,94 @@ class TestPlannerFlowDrop(unittest.TestCase):
         self.assertEqual(wp.planner_flow_drop(None, 38.0, True, 1.0), (None, None))
 
 
-class TestDefrostCapShadow(unittest.TestCase):
-    """Alleen een logregel: wat een kap op het doel van vóór het ontdooien zou sturen (11-14 08:15)."""
-    DEF = {"start": datetime(2026, 11, 14, 8, 10), "end": datetime(2026, 11, 14, 8, 15), "flow_before": 42.4}
+class TestDefrostSoftFlow(unittest.TestCase):
+    """Na een ontdooiing loopt het doel op vanaf het water, als bij een zachte herstart. Waarden:
+    2026-11-15 07:35-07:45 (laatste rij aanvoer 29.5 / retour 33.3; plan 42.0; daarna 07:50 water
+    37.3, 07:55 39.8: sneller dan de oploop)."""
+    DEF = {"start": datetime(2026, 11, 15, 7, 35), "end": datetime(2026, 11, 15, 7, 45),
+           "flow_before": 44.3, "water_end": 33.3}
 
-    def test_logs_when_the_plan_asks_more_than_before_the_defrost(self):
-        line = wp.defrost_cap_shadow({"heat": True, "flow": 49.1}, self.DEF, datetime(2026, 11, 14, 8, 32))
-        self.assertIn("SCHADUW", line)
-        self.assertIn("42.4", line)
-        self.assertIn("49.1", line)
+    def _cfg(self, **over):
+        return dict(wp.build_cfg(), **over)
 
-    def test_silent_when_not_higher_too_late_off_or_unknown(self):
-        t = datetime(2026, 11, 14, 8, 32)
-        self.assertIsNone(wp.defrost_cap_shadow({"heat": True, "flow": 41.0}, self.DEF, t))
-        self.assertIsNone(wp.defrost_cap_shadow({"heat": True, "flow": 49.1}, self.DEF, datetime(2026, 11, 14, 9, 20)))
-        self.assertIsNone(wp.defrost_cap_shadow({"heat": False, "flow": None}, self.DEF, t))
-        self.assertIsNone(wp.defrost_cap_shadow({"heat": True, "flow": 49.1}, None, t))
-        self.assertIsNone(wp.defrost_cap_shadow({"heat": True, "flow": 49.1}, dict(self.DEF, flow_before=None), t))
+    def at(self, m):
+        return datetime(2026, 11, 15, 7, 45) + timedelta(minutes=m)
+
+    def test_starts_just_above_the_water_instead_of_the_plan(self):
+        flow, why = wp.defrost_soft_flow(42.0, self.DEF, self.at(0), 33.3, self._cfg())
+        self.assertEqual(flow, 36.3)                          # 33.3 + 3, not 42 (gap 9 K -> 5100 rpm)
+        self.assertIn("ontdooi-oploop", why)
+
+    def test_ramp_rises_with_time(self):
+        flow, _ = wp.defrost_soft_flow(46.0, self.DEF, self.at(20), None, self._cfg())
+        self.assertEqual(flow, 40.3)                          # 33.3 + 3 + 1 * 20/5
+
+    def test_never_below_the_live_water_so_the_pump_does_not_stop_itself(self):
+        # 07:55: water 39.8 is already above the ramp (37.3): the target follows the water + 3
+        flow, _ = wp.defrost_soft_flow(46.0, self.DEF, self.at(10), 39.8, self._cfg())
+        self.assertEqual(flow, 42.8)
+
+    def test_only_lowers_never_above_the_plan(self):
+        self.assertEqual(wp.defrost_soft_flow(42.0, self.DEF, self.at(10), 39.8, self._cfg()), (42.0, None))
+        self.assertEqual(wp.defrost_soft_flow(35.0, self.DEF, self.at(0), 33.3, self._cfg()), (35.0, None))
+
+    def test_window_floor_flag_and_missing_data(self):
+        c = self._cfg()
+        self.assertEqual(wp.defrost_soft_flow(46.0, self.DEF, self.at(61), 33.0, c), (46.0, None))
+        self.assertEqual(wp.defrost_soft_flow(46.0, self.DEF, self.at(-1), 33.0, c), (46.0, None))
+        self.assertEqual(wp.defrost_soft_flow(46.0, self.DEF, self.at(5), 33.0, c, below_floor=True), (46.0, None))
+        self.assertEqual(wp.defrost_soft_flow(46.0, self.DEF, self.at(5), 33.0, self._cfg(defrost_soft=False)),
+                         (46.0, None))
+        self.assertEqual(wp.defrost_soft_flow(46.0, None, self.at(5), 33.0, c), (46.0, None))
+        self.assertEqual(wp.defrost_soft_flow(46.0, dict(self.DEF, water_end=None), self.at(5), 33.0, c), (46.0, None))
+        self.assertEqual(wp.defrost_soft_flow(None, self.DEF, self.at(5), 33.0, c), (None, None))
+
+    def test_on_by_default_and_switchable(self):
+        self.assertTrue(wp.build_cfg()["defrost_soft"])
+        with patch.dict(os.environ, {"WP_DEFROST_SOFTSTART": "0"}):
+            self.assertFalse(wp.build_cfg()["defrost_soft"])
+
+
+class TestHoneywellLowAlert(unittest.TestCase):
+    """Melding als de Honeywell-knop onder 22,5 staat en de kamer richting knop + 0,5 gaat, waar de P60
+    zelf stopt. Verloop 2026-11-12: knop 21,5 sinds 12:15 (verlaging tot 13:12), kamer 22,0, P60 stopte
+    15:07 terwijl wij nog stookten."""
+    T = datetime(2026, 11, 12, 13, 20)
+
+    def step(self, knob, room, since=None, latched=False, m=0, lowering=False):
+        return wp.honeywell_low_step(knob, room, 22.5, 0.2, lowering, since, latched,
+                                     self.T + timedelta(minutes=m), 600)
+
+    def test_triggers_after_the_hold_on_the_case_of_11_12(self):
+        since, latched, act = self.step(21.5, 22.0)
+        self.assertEqual((latched, act), (False, None))            # risk starts, not yet held
+        since, latched, act = self.step(21.5, 22.0, since, latched, m=10)
+        self.assertEqual((latched, act), (True, "trigger"))
+        self.assertEqual(self.step(21.5, 22.0, since, latched, m=15)[2], None)   # once only
+
+    def test_not_during_a_manual_lowering(self):
+        # 12:15-13:12 the user wanted it cooler: a self-stop then is harmless
+        self.assertEqual(self.step(21.5, 22.0, m=10, lowering=True), (None, False, None))
+
+    def test_no_risk_while_the_room_is_well_below_the_knob_plus_margin(self):
+        self.assertEqual(self.step(21.5, 21.6, m=10), (None, False, None))
+
+    def test_clears_only_when_the_knob_is_back(self):
+        since = self.T
+        # the room dropping is not enough: the next warm-up would hit the same stop
+        self.assertEqual(self.step(21.5, 21.4, since, True, m=30), (None, True, None))
+        self.assertEqual(self.step(22.5, 21.4, since, True, m=40), (None, False, "clear"))
+        self.assertEqual(self.step(22.5, 22.9, m=40), (None, False, None))   # knob fine: nothing to clear
+
+    def test_a_missing_reading_changes_nothing(self):
+        since = self.T
+        self.assertEqual(self.step(None, 22.0, since, True, m=5), (since, True, None))
+        self.assertEqual(self.step(21.5, None, since, False, m=5), (since, False, None))
+
+    def test_defaults(self):
+        c = wp.build_cfg()
+        self.assertTrue(c["hw_low_alert"])
+        self.assertEqual((c["hw_low_margin"], c["hw_low_hold_s"]), (0.2, 600.0))
 
 
 class TestEnableTrace(unittest.TestCase):
@@ -1539,7 +1610,7 @@ class TestRuntimeState(unittest.TestCase):
 
     def test_bump_start_remembers_the_heat_already_delivered(self):
         # 2026-11-15: planner at 5.25 kW, dial 22.5 -> 23.0. The bump must carry that 5.25 along, so the
-        # planner's bump cap does not pull the heat down to WP_BUMP_QMAX.
+        # planner's bump cap does not pull the heat down to WP_QMAX.
         st = {"ovr_until": None, "ovr_target": None, "last_setp": 21.0, "last_q": 5.25}
         wp.decide_with_override(self.now, 23.0, st, cfg())
         self.assertEqual(st["ovr_q"], 5.25)

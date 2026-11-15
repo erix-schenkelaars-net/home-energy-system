@@ -357,8 +357,10 @@ CREATE TABLE IF NOT EXISTS `electricity_prices` (
 -- ---------------------------------------------------------------------------
 -- alert_latch
 -- ---------------------------------------------------------------------------
--- One row per alert key. Written by common/battery_alert.py (read_seplos and
--- control_growatt). Tracks active/cleared state and acknowledgement by the user.
+-- One row per alert key. Written by common/battery_alert.py (read_seplos,
+-- control_growatt and wp_control). Tracks active/cleared state and acknowledgement by the user.
+-- wp_control's hw_setpoint_low (2026-11-15): the Honeywell knob is below WP_OVERRIDE_THRESHOLD while the
+-- room nears knob + 0.5, where the heat pump stops itself (it sees the knob as OpenTherm ID16).
 -- Read by WordPress battery page and homepage tile shortcode.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `alert_latch` (

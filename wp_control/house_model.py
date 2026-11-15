@@ -41,6 +41,14 @@ def gains(p, hour):
             + p["a2"] * math.cos(2 * w) + p["b2"] * math.sin(2 * w))
 
 
+def ua(p):
+    """Steady-state heat loss (kW/K): room -> outside, plus room -> mass -> outside in series (the
+    mass settles between room and outside). With the 2026-11-06 fit: 0.125 + 0.126 = 0.251 kW/K.
+    (Ur + Um = 0.261, the "UA 262" in the fit notes, is the loss while the mass is still at room
+    temperature; the series value is what a long cold spell asks.)"""
+    return p["Ur"] + p["Um"] * p["H"] / (p["H"] + p["Um"])
+
+
 def step(p, tr, tm, t_out, q, pv, hour, dt):
     """One explicit step of the house model. Returns (tr, tm) after dt hours."""
     flow_rm = p["H"] * (tr - tm)

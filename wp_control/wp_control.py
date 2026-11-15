@@ -24,6 +24,7 @@ import paho.mqtt.publish as mqtt_publish
 import paho.mqtt.client as mqtt_client
 
 from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
+from common.battery_alert import alert_trigger, alert_clear, alert_active   # alert_latch + HA-push
 
 # ── logging (stdout-only; entrypoint tee't naar /logs/debug_YYYY-MM-DD.log) ──────────────
 def dbg(area, msg):
@@ -330,24 +331,44 @@ def planner_flow_drop(flow, last_cmd, running, max_drop, land_below=None, land_s
     return held, f"aanvoer-rem: plan {flow} -> {held}°C (vorig commando {last_cmd}, max -{step:g}°C/cyclus)"
 
 
-DEFROST_CAP_MIN = 60     # schaduw-kap: zo lang na het einde van een ontdooiing
+DEFROST_SOFT_MAX_MIN = 60     # zo lang na het einde van een ontdooiing loopt hooguit de oploop
 
 
-def defrost_cap_shadow(dec, defrost, now, window_min=DEFROST_CAP_MIN):
-    """PUUR, ALLEEN LOGGEN: wat een kap 'aanvoerdoel na ontdooien niet boven het doel van vóór het
-    ontdooien' zou hebben gedaan. Na een ontdooiing is het water ~35 °C; met een doel van 47-50 °C gaat
-    de P60 naar 98 % en schiet ~5 K door (2026-11-14 06:25-07:35 en 08:25-09:35). Of zo'n kap dat
-    voorkomt is onbewezen — het gat met het koude water drijft de P60 misschien evengoed — dus eerst
-    schaduw. Geeft de logregel of None."""
-    if not defrost or not dec.get("heat") or dec.get("flow") is None:
-        return None
-    before = defrost.get("flow_before")
-    if before is None or (now - defrost["end"]).total_seconds() > window_min * 60:
-        return None
-    if dec["flow"] <= before:
-        return None
-    return (f"[SCHADUW ontdooi-kap] ontdooid {defrost['start']:%H:%M}-{defrost['end']:%H:%M}: "
-            f"zou aanvoer {before}°C sturen i.p.v. {dec['flow']}°C (doel van vóór het ontdooien)")
+def defrost_soft_flow(flow, defrost, now, water_now, cfg, below_floor=False, max_min=DEFROST_SOFT_MAX_MIN):
+    """PUUR: na een ontdooiing het aanvoerdoel laten oplopen als bij een zachte herstart (2026-11-15).
+
+    Tijdens het ontdooien trekt de P60 warmte uit het water: aanvoer/retour zakken naar 26-33 °C. Met
+    het doel van de planner (42-47 °C) ziet hij daarna een gat van 10-15 K en gaat naar vol vermogen
+    (11-14 06:25: 5460 rpm, 2,5 kW elektrisch, ~1 u lang; 11-15 07:50: 5100 rpm). Wat dat drijft is het
+    gat, niet de hoogte van het doel (zie soft_start_flow). Plafond:
+
+        max(water_eind + gap + rate * minuten-sinds-einde / 5,  water_nu + gap)
+
+    water_eind = de warmste van aanvoer/retour in de laatste ontdooi-rij (defrost["water_end"]). De
+    tweede term is er omdat het water na een ontdooiing sneller oploopt dan de oploop: 2,5-5 °C per
+    5 min in het eerste kwartier (11-15 04:25-04:40 en 07:45-08:00). Zonder die term zakt het doel
+    onder het water en stopt de P60 zichzelf -- een uur herstartblokkade, erger dan de piek. Geen ratel
+    als op 11-03: dit kan het doel alleen verlagen, nooit boven het planner-doel tillen.
+
+    Alleen binnen `max_min` na het einde, niet onder de comfortgrens (dan is er haast, zoals bij de
+    zachte herstart), en uit met WP_DEFROST_SOFTSTART=0. Geeft (flow, toelichting of None)."""
+    if not cfg.get("defrost_soft") or flow is None or not defrost or below_floor:
+        return flow, None
+    water_end = defrost.get("water_end")
+    if water_end is None:
+        return flow, None
+    t = (now - defrost["end"]).total_seconds() / 60
+    if t < 0 or t > max_min:
+        return flow, None
+    gap, rate = cfg["softstart_gap"], cfg["softstart_rate"]
+    ramp = water_end + gap + rate * t / 5
+    cap = ramp if water_now is None else max(ramp, water_now + gap)
+    cap = round(max(cfg["flow_min"], cap), 1)
+    if cap >= flow:
+        return flow, None
+    now_txt = "?" if water_now is None else f"{water_now} +{gap:g} = {water_now + gap:.1f}"
+    return cap, (f"ontdooi-oploop: ontdooid {defrost['start']:%H:%M}-{defrost['end']:%H:%M}: {flow} -> {cap}°C | "
+                 f"water na ontdooien {water_end} +{gap:g} +{rate:g}/5min ({t:.0f} min) = {ramp:.1f} | water nu {now_txt}")
 
 
 def start_kick_flow(flow, running, water, gap, cap):
@@ -462,6 +483,12 @@ def build_cfg():
         "softstart_neg": float(os.environ.get("WP_SOFTSTART_NEG", "3")),    # max °C onder de stooklijn
         "softstart_gap": float(os.environ.get("WP_SOFTSTART_GAP", "3")),    # startdoel = water + gap
         "softstart_rate": float(os.environ.get("WP_SOFTSTART_RATE", "1")),  # °C oploop per 5 min looptijd
+        # na een ontdooiing dezelfde oploop vanaf het water (defrost_soft_flow); 0 = uit
+        "defrost_soft":  os.environ.get("WP_DEFROST_SOFTSTART", "1").strip() not in ("0", "", "false", "no"),
+        # melding "Honeywell-knop te laag" (honeywell_low_step); 0 = uit
+        "hw_low_alert":  os.environ.get("WP_HW_LOW_ALERT", "1").strip() not in ("0", "", "false", "no"),
+        "hw_low_margin": float(os.environ.get("WP_HW_LOW_MARGIN", "0.2")),   # K boven de knop (P60 stopt ~+0,5)
+        "hw_low_hold_s": float(os.environ.get("WP_HW_LOW_HOLD_S", "600")),
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
         "out_max":   float(os.environ.get("WP_OUTSIDE_MAX", "50")),
@@ -664,6 +691,35 @@ def load_state(now, path=STATE_FILE, max_age_s=STATE_MAX_AGE_S):
     return ovr, heat, i
 
 
+HW_LOW_KEY = "hw_setpoint_low"     # alert_latch-sleutel: Honeywell-knop te laag (WordPress-banner + HA-push)
+
+
+def honeywell_low_step(knob, room, threshold, margin, lowering_active, since, latched, now, hold_s):
+    """PUUR: toestandsmachine voor de melding "Honeywell-knop te laag" (2026-11-15).
+
+    De Honeywell geeft zijn knopstand als OpenTherm-ID16 door aan de P60 (de OTThing in Repeater laat ID16
+    ongemoeid, firmware 2.61..2.63). Komt de kamer ~0,5 boven die stand, dan stopt de P60 zelf -- ook als
+    wij nog stoken -- met een uur herstartblokkade (11-05 14:50, 11-09 04:10, 11-12 15:07; elke keer stond
+    de knop onder 22,5). Zolang de OTThing ID16 niet kan vervangen (feature request OT-Thing #72) is de
+    knop op `threshold` laten staan de remedie; deze melding vraagt erom.
+
+    Risico = knop < threshold, kamer >= knop + margin, en geen lopende handmatige verlaging (dan wil de
+    gebruiker het juist koeler en is een stop onschuldig; het risico begint pas als dat uur voorbij is).
+    `hold_s` aangehouden -> 'trigger'. 'clear' pas als de knop weer op threshold staat: zakt alleen de
+    kamer, dan blijft het risico bij de volgende opwarming bestaan. Een ontbrekende lezing verandert niets.
+    Geeft (since, latched, action) met action 'trigger' | 'clear' | None."""
+    if knob is None or room is None:
+        return since, latched, None
+    if knob >= threshold - 0.05:
+        return None, False, ("clear" if latched else None)
+    if lowering_active or room < knob + margin:
+        return None, latched, None
+    since = now if since is None else since
+    if not latched and (now - since).total_seconds() >= hold_s:
+        return since, True, "trigger"
+    return since, latched, None
+
+
 def decide_with_override(now, thermostat_setp, state, cfg, price_win=None):
     """PUUR: wrapt decide_setpoint met de handmatige-override-regel.
 
@@ -688,7 +744,7 @@ def decide_with_override(now, thermostat_setp, state, cfg, price_win=None):
 
     Bij het openen van een bump-venster gaat `last_q` (de planner-warmte van de vorige cyclus, kW)
     mee als `ovr_q`: de bump-cap van de planner zakt nooit onder wat er al geleverd werd (zie
-    wp_planner.bump_qmax).
+    wp_planner.heat_cap).
 
     `state` = mutabele dict {ovr_until, ovr_target, ovr_q, und_until, und_target, last_setp, last_q} die tussen
     cycli bewaard blijft. Bump en verlaging gaan vóór het prijsvenster (price_win, zie
@@ -1515,19 +1571,16 @@ def plan_cycle(cfg, now, room, ovr_state):
     relax_txt = (f" | ontdooid {defrost['end']:%H:%M} -> grens -{diag['relax']:.2f}K"
                  if defrost and diag.get("relax") else "")
     cap_now = ((diag.get("inputs") or {}).get("qmax") or [None])[0]
-    if cap_now is not None:
-        relax_txt += f" | bump-cap {cap_now:.2f}kW"
+    if cap_now is not None and (bump or cap_now > wp_planner.QMAX):     # only when it is not the plain WP_QMAX
+        relax_txt += f" | {'bump-cap' if bump else 'vorst-cap'} {cap_now:.2f}kW"
     dbg("PLAN", f"[{'LIVE' if mode else 'SCHADUW'}] kamer={room} massa={diag['tm']:.2f} {run_txt} "
                 f"KNMI-bias={bias}K -> {act}{' | bump genegeerd (herstartblokkade)' if diag.get('bump_skipped') else ''}"
                 f"{relax_txt}"
                 f" | kamer over 1u {res['room'][3]:.2f} | OTThing-sp {dec['room_sp']} | 12u {on_next} | €{diag['cost']:.2f}/{diag['slots'] / 4:.0f}u")
-    shadow = defrost_cap_shadow(dec, defrost, now)
-    if shadow:
-        dbg("PLAN", shadow)
     write_plan(cfg, mode, dec, res, diag, now)
     dec = dict(dec, mass=diag["tm"], heatplan=heatplan_payload(res, diag, now),
                room_1h=res["room"][3], running=diag["running"], on_min=diag.get("on_min"),
-               start_water=diag.get("start_water"), tmin_now=(diag.get("inputs") or {}).get("tmin", [None])[0])
+               start_water=diag.get("start_water"), defrost=defrost, tmin_now=(diag.get("inputs") or {}).get("tmin", [None])[0])
     return dec
 
 
@@ -1586,6 +1639,8 @@ def main():
                 + f" verlaging={ovr_state['und_target']}"
                 + (f" tot {ovr_state['und_until']:%H:%M}" if ovr_state["und_until"] else "")
                 + f" heat={heat_state.get('heat')} I={i_state['i']}")
+    hw_since = None                      # melding "Honeywell-knop te laag": sinds wanneer het risico loopt
+    hw_latched = alert_active(HW_LOW_KEY) if cfg["hw_low_alert"] else False   # geen dubbele melding na een herstart
     ha_announced = False                 # HA-discovery één keer per proces-start
     price_logged = None                  # het prijsvenster één keer per wijziging loggen
     while True:
@@ -1609,6 +1664,19 @@ def main():
         sp, reason = decide_with_override(datetime.now(), sp_live, ovr_state, cfg, price_win)
         dbg("CTRL", f"kamer={room} buiten={outside} thermostaat_vraag={sp_now}({src}) "
                     f"-> gewenst={sp} ({reason})")
+        if cfg["hw_low_alert"]:
+            t_now, und = datetime.now(), ovr_state.get("und_until")
+            hw_since, hw_latched, hw_act = honeywell_low_step(
+                sp_now, room, cfg["ovr_threshold"], cfg["hw_low_margin"], und is not None and t_now < und,
+                hw_since, hw_latched, t_now, cfg["hw_low_hold_s"])
+            if hw_act == "trigger":
+                msg = (f"Honeywell staat op {sp_now} °C bij kamer {room} °C: zet hem terug op "
+                       f"{cfg['ovr_threshold']} °C, anders stopt de warmtepomp zelf (kamer > knop + 0,5)")
+                dbg("CTRL", f"⚠ MELDING {HW_LOW_KEY}: {msg}")
+                alert_trigger(HW_LOW_KEY, msg)
+            elif hw_act == "clear":
+                dbg("CTRL", f"✓ MELDING {HW_LOW_KEY} opgeheven: Honeywell weer op {sp_now} °C")
+                alert_clear(HW_LOW_KEY, f"Honeywell weer op {sp_now} °C")
         if not cfg["control_live"]:
             publish_setpoint(sp, cfg)        # live gaat het setpoint mee met command_wp (retained)
 
@@ -1662,11 +1730,10 @@ def main():
                     heat, flow, sp_cmd = planned["heat"], planned["flow"], planned["room_sp"]
                     if heat:
                         tmin_now = planned.get("tmin_now")
+                        below_floor = tmin_now is not None and room is not None and room < tmin_now
                         flow, why = soft_start_flow(flow, base, room, planned["room_1h"],
                                                     planned["running"], planned["on_min"], cfg,
-                                                    planned["start_water"],
-                                                    below_floor=(tmin_now is not None and room is not None
-                                                                 and room < tmin_now))
+                                                    planned["start_water"], below_floor=below_floor)
                         if why:
                             dbg("PLAN", why)
                         flow, why = planner_flow_drop(flow, last_cmd, planned["running"], cfg["flow_max_drop"],
@@ -1674,6 +1741,11 @@ def main():
                         if why:
                             dbg("PLAN", why)
                         water = live_water()
+                        # after the drop brake: the ramp sits at water + gap by construction, so a drop of more
+                        # than flow_max_drop is safe here, and the brake would otherwise undo it
+                        flow, why = defrost_soft_flow(flow, planned.get("defrost"), now, water, cfg, below_floor)
+                        if why:
+                            dbg("PLAN", why)
                         flow, why = start_kick_flow(flow, planned["running"],
                                                     water if water is not None else planned["start_water"],
                                                     cfg["softstart_gap"], cfg["flow_cap"])

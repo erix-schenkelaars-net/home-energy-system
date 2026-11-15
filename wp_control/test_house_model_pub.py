@@ -138,6 +138,58 @@ class TestComfortFloors(unittest.TestCase):
                          [wpp.comfort_min(self.BANDS, t) for t in times])
 
 
+class TestHeatCap(unittest.TestCase):
+    """WP_QMAX for the whole plan; lifted to the steady heat loss when the house needs more (frost)."""
+    H = None
+
+    def setUp(self):
+        self.H = PARAMS["house"]
+
+    def test_ua_is_the_series_loss_of_the_two_nodes(self):
+        p = self.H
+        self.assertAlmostEqual(hm.ua(p), p["Ur"] + p["Um"] * p["H"] / (p["H"] + p["Um"]))
+        self.assertTrue(0.2 < hm.ua(p) < 0.3)                  # ~0.25 kW/K with the 11-06 fit
+
+    def test_plain_cap_when_the_loss_is_lower(self):
+        self.assertEqual(wpp.heat_cap(self.H, 21.7, 5.0), wpp.QMAX)
+
+    def test_lifted_in_frost_so_the_floor_stays_reachable(self):
+        cap = wpp.heat_cap(self.H, 21.7, -5.0)
+        self.assertAlmostEqual(cap, round(hm.ua(self.H) * 26.7, 2))
+        self.assertGreater(cap, wpp.QMAX)
+
+    def test_a_bump_keeps_the_heat_already_delivered(self):
+        self.assertEqual(wpp.heat_cap(self.H, 21.7, 5.0, q_before=wpp.QMAX + 1.0), wpp.QMAX + 1.0)
+        self.assertEqual(wpp.heat_cap(self.H, 21.7, 5.0, q_before=None), wpp.QMAX)
+
+    def test_no_lift_without_house_floor_or_outside(self):
+        for args in ((None, 21.7, -10.0), (self.H, None, -10.0), (self.H, 21.7, None)):
+            self.assertEqual(wpp.heat_cap(*args), wpp.QMAX)
+
+    def test_planner_stays_under_the_cap_in_mild_weather(self):
+        # a 1.8 K deficit would pull more than WP_QMAX; with the cap every slot stays at or under it
+        inp = _inputs(24, t_out=8.0, tmin=22.8)
+        inp["qmax"] = [wpp.heat_cap(self.H, 22.8, 8.0)] * 24
+        res = wpp.plan(PARAMS, 21.0, 21.0, inp, on0=True)
+        self.assertTrue(all(q <= wpp.QMAX + 1e-6 for q in res["Q"]))
+
+    def test_in_a_settled_frost_only_the_lifted_cap_holds_the_floor(self):
+        # -10 C for days (mass at its steady temperature), floor 21.0, 12 h: a plain 6 kW cap lets the room
+        # sag to ~20.5; the cap lifted to the heat loss (~7.8 kW) keeps it on the floor
+        p, to = self.H, -10.0
+        tm = to + p["H"] / (p["H"] + p["Um"]) * (21.2 - to)
+
+        def min_room(cap):
+            inp = _inputs(48, t_out=to, tmin=21.0)
+            inp["qmax"] = [cap] * 48
+            return min(wpp.plan(PARAMS, 21.2, tm, inp, on0=True)["room"][8:])
+
+        lifted = wpp.heat_cap(p, 21.0, to)
+        self.assertGreater(lifted, wpp.QMAX)
+        self.assertLess(min_room(wpp.QMAX), 20.8)
+        self.assertGreaterEqual(min_room(lifted), 21.0)
+
+
 class TestDefrostRelax(unittest.TestCase):
     END = datetime(2026, 11, 14, 8, 15)
 
@@ -171,6 +223,7 @@ class TestDefrostFromRows(unittest.TestCase):
         self.assertEqual(d["start"], datetime(2026, 11, 14, 8, 10))
         self.assertEqual(d["end"], datetime(2026, 11, 14, 8, 15))
         self.assertEqual(d["flow_before"], 41.4)
+        self.assertEqual(d["water_end"], 35.8)          # last defrost row 08:15: flow 32.0, return 35.8
 
     def test_a_single_row_is_not_a_defrost(self):
         # 11-04 14:10: one row with return 2.4 K above flow, no defrost
@@ -312,9 +365,9 @@ class TestLiveInputs(unittest.TestCase):
         bump = wpp.build_live_inputs(rows, self.T0, bands, [], bump=(self.T0 + timedelta(hours=1), 22.5))
         self.assertAlmostEqual(bump["tmin"][0], 22.5 - wpp.MARGIN)
         self.assertEqual(bump["tmin"][4], 21.0)      # bump over after 1 h
-        # during the bump the heat is capped (11-07: 10 kW at 50 C for an hour, three times)
-        self.assertEqual(bump["qmax"][0], wpp.BUMP_QMAX)
-        self.assertIsNone(bump["qmax"][4])
+        # during the bump and after it the heat is capped at WP_QMAX (11-07: 10 kW at 50 C for an hour)
+        self.assertEqual(bump["qmax"][0], wpp.QMAX)
+        self.assertEqual(bump["qmax"][4], wpp.QMAX)
         low = wpp.build_live_inputs(rows, self.T0, bands, [], lower=(self.T0 + timedelta(hours=1), 19.0))
         self.assertEqual(low["tmin"][0], 19.0)
 
@@ -324,13 +377,23 @@ class TestLiveInputs(unittest.TestCase):
         from datetime import timedelta
         rows = self._rows(16)
         until = self.T0 + timedelta(hours=1)
-        above = wpp.BUMP_QMAX + 0.25
+        above = wpp.QMAX + 0.25
         inp = wpp.build_live_inputs(rows, self.T0, wpp.parse_comfort(""), [], bump=(until, 23.0, above))
         self.assertEqual(inp["qmax"][0], above)
-        self.assertIsNone(inp["qmax"][4])
-        for q_before in (None, 0.0, wpp.BUMP_QMAX - 1.0):   # off / unknown / below: the plain cap
+        self.assertEqual(inp["qmax"][4], wpp.QMAX)          # bump over: back to the plain cap
+        for q_before in (None, 0.0, wpp.QMAX - 1.0):        # off / unknown / below: the plain cap
             inp = wpp.build_live_inputs(rows, self.T0, wpp.parse_comfort(""), [], bump=(until, 23.0, q_before))
-            self.assertEqual(inp["qmax"][0], wpp.BUMP_QMAX)
+            self.assertEqual(inp["qmax"][0], wpp.QMAX)
+
+    def test_cap_lifts_to_the_heat_loss_in_frost(self):
+        # mild: 21.7 at 9 C needs 0.251 * 12.7 = 3.2 kW -> the plain cap; frost -6 C: 0.251 * 27.7 = 6.95 kW
+        bands = wpp.parse_comfort("00:00-23:59=21.7")
+        house = PARAMS["house"]
+        mild = wpp.build_live_inputs(self._rows(8, fc=9.0), self.T0, bands, [], house=house)
+        frost = wpp.build_live_inputs(self._rows(8, fc=-6.0), self.T0, bands, [], house=house)
+        self.assertEqual(mild["qmax"][0], wpp.QMAX)
+        self.assertAlmostEqual(frost["qmax"][0], hm.ua(house) * (21.7 + 6.0), places=2)
+        self.assertGreater(frost["qmax"][0], wpp.QMAX)
 
     def test_defrost_lowers_the_floor_but_not_a_bump(self):
         from datetime import timedelta

@@ -252,9 +252,28 @@ the return while the compressor runs; two consecutive 5-min rows with return −
 every defrost 10-20..11-14, plus one the frozen feed reported as "heating" (11-10 11:35), with no
 false alarm. If the OTThing rows are missing, the floor is simply not relaxed.
 
-`[SCHADUW ontdooi-kap]` in the log (only a log line, it steers nothing): what a cap at the
-pre-defrost supply target would have sent in the hour after a defrost. Whether that would stop the
-P60 going to 98 % after a defrost is unproven (the gap to the ~35 °C water may drive it anyway).
+**Honeywell knob too low** (2026-11-15). The P60 receives the Honeywell knob as OpenTherm ID16 (the
+OTThing in Repeater mode forwards ID16/ID24 unchanged, firmware 2.61 to 2.63-RC3) and stops itself when
+the room gets about 0.5 K above it, even while we still ask for heat, followed by an hour of restart
+lockout. 11-05 14:50, 11-09 04:10 and 11-12 15:07, each time with the knob below 22.5; all other stops
+in that period were flow overshoot. Until the OTThing can replace ID16 (feature request
+[OT-Thing #72](https://github.com/Phunkafizer/OT-Thing/issues/72)), the remedy is to leave the knob at
+`WP_OVERRIDE_THRESHOLD`; `hw_setpoint_low` asks for it (see `WP_HW_LOW_ALERT`). Not during a manual
+lowering: then the user wants it cooler and a stop does no harm.
+
+**Soft restart after a defrost** (2026-11-15, replaces the `[SCHADUW ontdooi-kap]` log line). A
+defrost pulls the water down to 26-33 °C; with the planner's 42-47 °C target the P60 then sees a gap
+of 10-15 K and goes to full power for up to an hour (11-14 06:25: 5460 rpm, 2.5 kW electric). What
+drives that is the gap, as at a restart, so for up to 60 min after a defrost the target is capped at
+
+    max(water at the end of the defrost + 3 + 1 °C per 5 min,  live water + 3)
+
+The second term is needed because the water climbs 2.5-5 °C per 5 min in the first quarter after a
+defrost, faster than the ramp: without it the target would drop below the water and the P60 would
+stop itself, with an hour of restart lockout. It can only lower the planner's target, never raise it,
+so the live water cannot ratchet it up (11-03). Not while the room is under the comfort floor, and
+applied after the 1 °C/cycle drop brake (the ramp sits at water + 3 by construction, so the drop is
+safe). The log shows `ontdooi-oploop: ...`; `WP_DEFROST_SOFTSTART=0` switches it off.
 
 Not done on purpose: dropping the target faster while the compressor runs high. On 2026-11-04 the
 P60 ran at 98 % when the target fell from 50 to 36 °C with water at 52 °C; within 10 min it was at
@@ -299,13 +318,23 @@ and the P60 stopped itself for an hour (2026-11-06 09:36).
 its ramp and only the curve cap applies: a restart with a comfort deficit starts at ~40 °C instead of
 water + 3 (2026-11-06 10:39: target 28.5 °C, the room fell to 20.9 at a floor of 21.3).
 
-**Bump cap.** During a Honeywell bump the planner's heat is capped at `WP_BUMP_QMAX` (default 5 kW). A
-bump lasts an hour; 10 kW at 50 °C does not reach 23 °C in that hour anyway and mostly buys a poor COP
-(2026-11-07: three bumps, 30-60 min at 7-8 kW each, ~EUR 1.50). The cap never goes below the heat the
-planner was already delivering when the bump started (`ovr_q`, kept across a restart): on 2026-11-15 the
-planner ran 5.25 kW during price charging, the bump capped it to 5.0 and the flow target fell 1 K, so
-turning the dial up gave less heat. `.env` sets `WP_BUMP_QMAX=7.0` since then (about +0.5 K/h at 6 °C
-outside, against +0.2). The `[PLAN]` log shows `bump-cap X.XXkW` while a bump is active.
+**Heat cap** (`WP_QMAX`, default 6 kW, 2026-11-15; replaces `WP_BUMP_QMAX`). One cap for every
+quarter of the plan, bumps included. Low and long is the better COP (10-30: 3.99 -> 4.41 with longer,
+lower runs), and a bump lasts an hour: 10 kW at 50 °C does not reach 23 °C in that hour anyway and
+mostly buys a poor COP (2026-11-07: three bumps, 30-60 min at 7-8 kW each, ~EUR 1.50).
+
+Per quarter the cap is lifted to the house's steady heat loss at that quarter's comfort floor and
+forecast outside temperature, `ua * (floor - outside)` with `ua` = 0.251 kW/K from the house model
+(room->outside plus room->mass->outside in series). So in frost the cap never makes the floor
+unreachable: 6 kW holds 21.7 °C down to about -2 °C outside, 19.5 at night down to about -4.4 °C. At
+-10 °C a plain 6 kW cap would let the room sag to ~20.5 at a floor of 21.0; the lifted cap (~7.8 kW)
+holds it. Internal and solar gains are left out on purpose, so in doubt the cap lifts a little early.
+
+During a bump the cap never goes below the heat the planner was already delivering when the bump
+started (`ovr_q`, kept across a restart): on 2026-11-15 the planner ran 5.25 kW during price
+charging, the bump capped it to 5.0 and the flow target fell 1 K, so turning the dial up gave less
+heat. The `[PLAN]` log shows `bump-cap X.XXkW` while a bump is active and `vorst-cap X.XXkW` when the
+frost lift is above `WP_QMAX`.
 
 **Bump during the restart lockout.** A bump that leaves less than `WP_BUMP_MIN_USABLE_MIN` (default 30)
 after the ~60 min restart lockout is left out of the plan: normal comfort floor, no heat cap, and
@@ -330,6 +359,10 @@ room keeps falling for a while longer than predicted.
 | `WP_COMFORT_RAMP_MAX_MIN` | `120` | longest staircase; if even `WP_COMFORT_STEP_MAX_K` takes longer, the staircase starts higher (18.0 → 20.8 would start at 19.2) |
 | `WP_DEFROST_RELAX_K` | `0.2` | after a defrost the floor is this much lower, so the missed heat is made up in cheap hours (0 = off) |
 | `WP_DEFROST_RELAX_H` | `4` | ... for this many hours after the defrost ended, then back by `WP_COMFORT_STEP_K` per quarter; a new defrost extends it, it never adds up |
+| `WP_DEFROST_SOFTSTART` | `1` | after a defrost the target ramps up from the water like a soft restart (`ontdooi-oploop` in the log); `0` = off |
+| `WP_QMAX` | `6.0` | heat cap (kW) for every quarter of the plan, bumps included; lifted per quarter to the steady heat loss in frost, and during a bump never below the heat already delivered. Replaces `WP_BUMP_QMAX` (2026-11-15) |
+| `WP_HW_LOW_ALERT` | `1` | alert `hw_setpoint_low` (WordPress banner + HA push via `battery/alert`) when the Honeywell knob is below `WP_OVERRIDE_THRESHOLD` and the room is at least `WP_HW_LOW_MARGIN` above it for `WP_HW_LOW_HOLD_S`, outside a manual lowering; cleared once the knob is back. `0` = off |
+| `WP_HW_LOW_MARGIN` / `WP_HW_LOW_HOLD_S` | `0.2` / `600` | see above; the P60 stops itself at about knob + 0.5 |
 
 The planner needs numpy/scipy (in the wp_control image since 2026-11-03); wp_control imports it only
 when `WP_PLANNER` is shadow or live, so the rules run without it. Fitting and backtests also run in
