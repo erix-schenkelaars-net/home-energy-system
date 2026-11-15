@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""sph_standby.py — one-shot: zet de SPH5000 passief ('standby') + VERIFIEER het écht.
+"""sph_standby.py — one-shot: put the SPH5000 in passive mode ('standby') + REALLY VERIFY it.
 
-Voor de maandelijkse batterij-kalibratie. growatt_controller MOET gestopt zijn: dan is de
-SPH-serial (/dev/sphgen) vrij én commandeert niets de SPH (ook de SOC-guards niet).
+For the monthly battery calibration. growatt_controller MUST be stopped: then the SPH serial port
+(/dev/sphgen) is free and nothing else commands the SPH (the SOC guards neither).
 
-Hergebruikt control_growatt's set_in_standby() (battery-first + remote 0 W + AC-charge uit) en
-leest daarna TERUG:
-  - de commando-kant (Priority_of_work, AC_charging_enable), én
-  - de ECHTE accu-power (reg 31200) + accu-stroom (reg 31215) — want de schrijf-registers
-    zeggen alleen "commando gegeven"; alleen de gemeten power/stroom ~0 bewijst dat de SPH
-    daadwerkelijk passief is (het remote-power-commando mag 1% zijn = ~0 W, de HOLD-truc).
+Reuses control_growatt's set_in_standby() (battery first + remote 0 W + AC charge off) and then
+reads BACK:
+  - the command side (Priority_of_work, AC_charging_enable), and
+  - the REAL battery power (reg 31200) + battery current (reg 31215): the write registers only
+    say "command given"; only a measured power/current of ~0 proves the SPH is actually passive
+    (the remote power command may be 1% = ~0 W, the HOLD trick).
 
-Wijzigt control_growatt_quarter.py NIET — importeert het alleen.
+Does NOT change control_growatt_quarter.py; it only imports it.
 """
 import sys
 import time
 
 import control_growatt_quarter as c
 
-REG_CHARGE_DISCHARGE_POWER = 31200   # INT32, W   (echte accu-power)
+REG_CHARGE_DISCHARGE_POWER = 31200   # INT32, W   (real battery power)
 REG_BATTERY_CURRENT        = 31215   # INT32, A×10
 IDLE_W = 100.0                       # |power| hieronder = passief
-IDLE_A = 2.0                         # |stroom| hieronder = passief
+IDLE_A = 2.0                         # |current| below this = passive
 
 
 def standby_ok(prio, ac, power_w, current_a):
-    """Standby bevestigd: battery-first + AC-charge uit + de ECHTE power/stroom ~0."""
+    """Standby confirmed: battery first + AC charge off + the REAL power/current ~0."""
     return (prio == 1 and ac == 0
             and abs(power_w) <= IDLE_W and abs(current_a) <= IDLE_A)
 
@@ -49,7 +49,7 @@ def verify(client):
 
 
 def _set_hold(client, pct):
-    """Battery-first + remote-enabled + AC-charge uit, met remote power = pct% (0 of 1%)."""
+    """Battery first + remote enabled + AC charge off, with remote power = pct% (0 or 1%)."""
     c.write_sph5k_reg(client, c.REG_ADDR["REG_Priority_of_work"], 1)
     c.write_sph5k_reg(client, c.REG_ADDR["REG_Remote_power_control_enable"], 1)
     c.write_sph5k_reg(client, c.REG_ADDR["REG_AC_charging_enable"], 0)
@@ -57,7 +57,7 @@ def _set_hold(client, pct):
 
 
 def _sample(client, n=6, interval=5):
-    """Bemonster de ECHTE accu-power (W) + -stroom (A) n keer."""
+    """Sample the REAL battery power (W) + current (A) n times."""
     powers, currents = [], []
     for _ in range(n):
         powers.append(_read_signed32(client, REG_CHARGE_DISCHARGE_POWER, 0.1))
@@ -67,10 +67,10 @@ def _sample(client, n=6, interval=5):
 
 
 def probe(client):
-    """Meet-modus: vergelijk power=0 vs REMOTE_HOLD_POWER(1%) op de ECHTE power/stroom.
+    """Probe mode: compare power=0 vs REMOTE_HOLD_POWER (1%) on the REAL power/current.
 
-    Data om te beslissen of de 1%-anti-fallback-truc in control_growatt écht nodig is —
-    zónder die operationele code aan te raken. Vereist growatt_controller GESTOPT.
+    Data to decide whether the 1% anti-fallback trick in control_growatt is really needed --
+    without touching that operational code. Requires growatt_controller to be STOPPED.
     """
     print("PROBE — vergelijk power=0 vs hold=1% op de gemeten accu-power/-stroom.")
     print("(growatt_controller moet gestopt zijn; de SPH wordt op ~0 W gehouden.)")
@@ -109,11 +109,11 @@ def main():
             sys.exit(0)
         print("SPH → standby (battery-first + AC-charge uit + anti-fallback hold 1%≈0 W)…")
         ok_set = c.set_in_standby(client)
-        # set_in_standby schrijft power=0. De live-controller roept dat elke 60 s opnieuw aan
-        # (self-healing); ons one-shot draait ÉÉN keer en moet uren onbeheerd blijven staan.
-        # Daarom zetten we de anti-fallback-hold REMOTE_HOLD_POWER (1% ≈ 0 W, control_growatt
-        # regel 178), zodat de SPH niet naar autonome LOAD_FIRST-ontlading terugvalt.
-        # verify() bevestigt daarna de ECHTE power/stroom ~0.
+        # set_in_standby writes power=0. The live controller calls it again every 60 s
+        # (self-healing); our one-shot runs ONCE and must stay put unattended for hours.
+        # So we set the anti-fallback hold REMOTE_HOLD_POWER (1% = ~0 W, control_growatt line 178),
+        # so the SPH does not fall back to autonomous LOAD_FIRST discharging.
+        # verify() then confirms the REAL power/current ~0.
         c.write_sph5k_reg(client, c.REG_ADDR["REG_Remote_charge_and_discharge_power"],
                           c.to_uint16(c.REMOTE_HOLD_POWER))
         time.sleep(3)                      # laat de SPH uitregelen vóór we meten

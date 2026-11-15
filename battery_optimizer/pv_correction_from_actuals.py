@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Herijk de forecast-correctie r_m/r_a in pv_clearsky_calibration.json zodat de dag-vooruit forecast
-op HELDERE dagen de WERKELIJK GEMETEN opbrengst volgt — verhelpt de ochtend-boven / middag-onder scheefheid van de
-oude 2-dagen-r (scheef r_a<r_m, artefact van 07-29's heiige middag).
+"""Recalibrate the forecast correction r_m/r_a in pv_clearsky_calibration.json so the day-ahead
+forecast follows the ACTUALLY MEASURED yield on CLEAR days -- fixes the morning-high/afternoon-low
+skew of the old two-day r (skewed r_a<r_m, an artefact of 07-29's hazy afternoon).
 
-Methode: de opgeslagen AROME_CALIB-forecast is `pv_kwh = OM_raw * r_oud`. We willen dat de forecast
-op een heldere dag uitkomt op wat er werkelijk uit de omvormer kwam. Dus
-**r_nieuw = r_oud * median(werkelijk / pv_kwh)** over de slots van heldere dagen. pcs blijft ongemoeid.
+Method: the stored AROME_CALIB forecast is `pv_kwh = OM_raw * r_old`. We want the forecast on a
+clear day to come out at what actually came out of the inverter. So
+**r_new = r_old * median(actual / pv_kwh)** over the slots of clear days. pcs is left alone.
 
-WAAROM NIET MEER NAAR pcs (gewijzigd 2026-08-15). Tot nu toe was het doel `forecast = pcs`. Dat was
-juist zolang pcs een GEMIDDELDE over heldere dagen was, maar sinds de herbouw van 2026-08-13 is pcs
-een BOVENGRENS: per zonshoogte opgetild naar het 90-percentiel van de residuen, zodat de lijn in de
-grafiek boven de heldere dagen ligt in plaats van er middendoor. De forecast op een plafond pinnen
-overschat per constructie, en het meest waar de optil vol meetelt (boven 25 graden zonshoogte).
-Gemeten op 32 dagen: op heldere dagen kwam de middag 1,33 kWh te hoog uit, de ochtend maar 0,18.
-pcs blijft doen waarvoor het bedoeld is — de referentielijn in de grafiek — en r kijkt weer naar de
-werkelijkheid.
+WHY NO LONGER TOWARDS pcs (changed 2026-08-15). Until then the target was `forecast = pcs`. That
+was right while pcs was an AVERAGE over clear days, but since the rebuild of 2026-08-13 pcs is an
+UPPER BOUND: lifted per sun elevation to the 90th percentile of the residuals, so the line in the
+chart lies above the clear days instead of through them. Pinning the forecast to a ceiling
+overestimates by construction, most where the lift counts fully (above 25 degrees elevation).
+Measured over 32 days: on clear days the afternoon came out 1.33 kWh too high, the morning only
+0.18. pcs keeps doing what it is for -- the reference line in the chart -- and r looks at reality
+again.
 
-HELDERE DAGEN, NIET HELDERE SLOTS. De selectie gebeurt op DAGniveau (dagopbrengst >= CLEAR_DAY x de
-clear-sky van die dag). Per slot selecteren op een hoge gemeten waarde zou de factor omhoog trekken
-(je kiest dan de meevallers), en per slot selecteren op alleen de forecast trekt hem omlaag (dan
-zitten er momenten in waar de voorspelling helder zei en het toch bewolkt was).
+CLEAR DAYS, NOT CLEAR SLOTS. Selection happens at DAY level (day yield >= CLEAR_DAY x that day's
+clear sky). Selecting per slot on a high measured value would pull the factor up (you pick the
+lucky ones), and selecting per slot on the forecast alone pulls it down (then it includes moments
+where the forecast said clear and it was cloudy anyway).
 
-Draaien IN battery_optimizer (erix_db-creds via ../.env). Zie [[feedback_pv_tooling_in_battery_optimizer]].
+Run INSIDE battery_optimizer (erix_db credentials via ../.env).
 """
 import os, json, math, statistics, mysql.connector
 from collections import defaultdict
@@ -34,11 +34,11 @@ TZ = ZoneInfo("Europe/Amsterdam")
 IN_PATH = os.environ.get("IN", "/app/pv_clearsky_calibration.json")
 OUT_PATH = os.environ.get("OUT", "/tmp/new_clearsky.json")
 CLEAR_FRAC = float(os.environ.get("CLEAR_FRAC", "0.70"))   # forecast >= dit * pcs = "helder voorspeld"
-CLEAR_DAY  = float(os.environ.get("CLEAR_DAY", "0.85"))   # dagopbrengst >= dit * clear-sky = heldere dag
-# battery_schedule had t/m 2026-05-22 UURSLOTS (24 per dag), daarna kwartieren (96). Een uurslot
-# draagt de energie van een heel uur, de gemeten reeks hier is per kwartier: dat scheelt een factor
-# vier in de verhouding werkelijk/forecast. De eerste run hierop koos precies die vier uur-dagen als
-# "helderst" en kwam op r_m *= 0,342. Alleen het kwartier-tijdperk gebruiken haalt dat weg.
+CLEAR_DAY  = float(os.environ.get("CLEAR_DAY", "0.85"))   # day yield >= this * clear sky = a clear day
+# battery_schedule had HOURLY SLOTS up to 2026-05-22 (24 per day), quarters (96) after that. An
+# hourly slot carries a whole hour's energy while the measured series here is per quarter: a factor
+# four in the actual/forecast ratio. The first run on this picked exactly those hourly days as
+# "clearest" and arrived at r_m *= 0.342. Using only the quarter-hour era removes that.
 QUARTER_ERA = os.environ.get("QUARTER_ERA", "2026-05-23")
 NOON, BLEND = 13.5, 0.75                                    # zelfde blend als pv_clearsky_calib
 CLAMP = (0.5, 1.15)
@@ -71,10 +71,10 @@ def main():
         ent = deg.get(str(int(round(e))))
         if not ent:
             return None, None, e, morn
-        # Seizoensterm meenemen: sinds 2026-08-13 is pcs = a + b * zonnedeclinatie, en b is overal
-        # negatief. Alleen de intercept nemen (= declinatie 0, de equinox) overschat de zomer fors;
-        # in augustus las dit script daardoor 46 kWh clear-sky per dag waar het er 35 zijn, en dan
-        # haalt geen enkele dag meer de heldere-dag-drempel.
+        # Include the season term: since 2026-08-13 pcs = a + b * solar declination, and b is negative
+        # everywhere. Taking only the intercept (= declination 0, the equinox) overestimates summer
+        # badly; in August this script read 46 kWh clear sky per day where it is 35, and then no day
+        # reaches the clear-day threshold any more.
         doy = dt.timetuple().tm_yday
         decl_deg = 23.45 * math.sin(math.radians(360/365 * (doy - 81)))
 
@@ -103,19 +103,19 @@ def main():
           ON b.slot_dt = x.slot_dt AND b.created_at = x.mc
         WHERE b.pv_source IN ('KNMI_GTI', 'AROME_CALIB') AND b.pv_kwh>0
           AND b.slot_dt >= %s""", (QUARTER_ERA,))
-    # Beide bronnen lopen door dezelfde formule pv_kwh = OM_raw * r; het label AROME_CALIB wordt
-    # alleen gezet als r toevallig != 1.0, en dat gold nog maar voor 109 van de 4888 slots. Op
-    # alleen dat label filteren gaf 0 heldere dagen. De nowcast-slots blijven er bewust buiten:
-    # daar overschrijft de nowcast de forecast en is r helemaal niet toegepast.
+    # Both sources go through the same formula pv_kwh = OM_raw * r; the label AROME_CALIB is only
+    # set when r happens to be != 1.0, which held for just 109 of the 4888 slots. Filtering on that
+    # label alone gave 0 clear days. The nowcast slots stay out on purpose: there the nowcast
+    # overwrites the forecast and r is not applied at all.
     rows = cur.fetchall()
 
-    # Werkelijke opbrengst per slot uit het VERMOGENS-register (de dagteller heeft maar 0,1 kWh
-    # resolutie, wat op kwartierniveau hele slots op 0,00 zet).
+    # Actual yield per slot from the POWER register (the day counter only has 0.1 kWh resolution,
+    # which sets whole slots to 0.00 at quarter-hour level).
     cur.execute("""SELECT DATE(ts), HOUR(ts)*4 + FLOOR(MINUTE(ts)/15), AVG(sph_pv_power_tot_w)
                    FROM energy WHERE sph_pv_power_tot_w IS NOT NULL GROUP BY 1, 2""")
     act = {(d, int(q)): float(w or 0) * 0.25 / 1000.0 for d, q, w in cur.fetchall()}
 
-    # Heldere DAGEN: gemeten dagopbrengst t.o.v. de clear-sky van diezelfde dag.
+    # Clear DAYS: measured day yield relative to that same day's clear sky.
     day_act, day_pcs = defaultdict(float), defaultdict(float)
     for (d, q), kwh in act.items():
         day_act[d] += kwh
@@ -135,10 +135,10 @@ def main():
                       % (d, day_act.get(d, 0), day_pcs[d], day_act.get(d, 0) / day_pcs[d],
                          "  <- helder" if d in clear_days else ""))
 
-    # Te weinig heldere slots (NL + 5 mnd) voor per-graad-r. Robuust: ÉÉN correctiefactor per dagdeel
-    # = median(pcs/forecast) op helder-voorspelde mid-hoge slots (>=MIN_ELEV; lage zon = horizon = punt 2,
-    # niet nu). Die factor schaalt de hele r_m- resp. r_a-curve → behoudt de elevatie-vorm, haalt de
-    # m/a-scheefheid eruit. forecast = OM_raw*r_oud*factor = pcs op helder.
+    # Too few clear slots (NL + 5 months) for an r per degree. Robust: ONE correction factor per part
+    # of the day = median(pcs/forecast) on mid-high slots forecast as clear (>= MIN_ELEV; low sun =
+    # horizon = point 2, not now). That factor scales the whole r_m or r_a curve -> keeps the shape
+    # over elevation, removes the morning/afternoon skew. forecast = OM_raw*r_old*factor = pcs when clear.
     MIN_ELEV = float(os.environ.get("MIN_ELEV", "20"))
     corr_m, corr_a = [], []
     used = 0
@@ -149,7 +149,7 @@ def main():
         if pcs is None or pcs < 0.05:
             continue
         pvk = float(pvk)
-        if pvk < CLEAR_FRAC * pcs:            # forecast voorspelde geen heldere lucht -> overslaan
+        if pvk < CLEAR_FRAC * pcs:            # the forecast did not predict a clear sky -> skip
             continue
         a = act.get((slot_dt.date(), slot_dt.hour * 4 + slot_dt.minute // 15))
         if a is None or a <= 0.0:

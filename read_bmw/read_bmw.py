@@ -46,7 +46,7 @@ import paho.mqtt.client as mqtt
 import mysql.connector
 from dotenv import load_dotenv
 
-# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+# add both the script dir and its parent so the import works in both places (tests included).
 for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -345,11 +345,10 @@ HA_ENTITIES: dict[str, tuple] = {
     "vehicle_body_trunk_isLocked":
         ("binary_sensor", "Trunk Locked",         None,  "lock",     None),
     # ── Door status (arm proxy — streams LOCKED/SECURED real-time) ──────────────
-    # Op deze F45 (225XE) streamen armStatus/anti-theft NIET (bevestigd 2026-07-04
-    # met alle 245 descriptors aan + een ritje) en individuele deur-isOpen geven
-    # nooit 'open' af. vehicle.cabin.door.status doet dat wél: real-time LOCKED ↔
-    # SECURED. SECURED = volledig vergrendeld/scherp → beste "arm"-signaal dat de
-    # auto verstuurt. Alarm triggert op 'verlaat SECURED'.
+    # On this F45 (225XE) armStatus/anti-theft do NOT stream (confirmed 2026-07-04 with all 245
+    # descriptors on + a drive), and the individual door isOpen never reports 'open'.
+    # vehicle.cabin.door.status does: real-time LOCKED <-> SECURED. SECURED = fully locked/armed,
+    # the best "arm" signal the car sends. The alarm triggers on 'leaves SECURED'.
     "vehicle_cabin_door_status":
         ("sensor",        "Door Status",          None,  None,       "mdi:car-door-lock"),
     # ── Windows (confirmed) ────────────────────────────────────────────────────

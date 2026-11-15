@@ -1,14 +1,14 @@
-"""Kwantificeer de ochtend-wobble van de WP: anti-cycling-lockouts + kamer-dip.
+"""Quantify the heat pump's morning wobble: anti-cycling lockouts + room dip.
 
-De WP is nu room-setpoint-gestuurd: op een koude ochtend blast de compressor vol (tot ~5460 rpm)
-om de achterstand op het setpoint in te halen, schiet de water-temp voorbij, en anti-cycling dwingt
-dan ~60 min standby waarin de kamer terugzakt. Deze tool meet dat per dag, zodat je na elke tuning
-(kleinere stappen, een ochtend-vermogen/flow-cap, of OpenTherm water-temp-sturing) kunt zien of de
-ochtendlijn gladder wordt: lockouts -> 0, kamer-dip omlaag, max-rpm omlaag.
+The heat pump is room-setpoint controlled: on a cold morning the compressor runs flat out (up to
+~5460 rpm) to catch up with the setpoint, the water temperature overshoots, and anti-cycling then
+forces ~60 min of standby in which the room drops back. This tool measures that per day, so after
+every tuning (smaller steps, a morning power/flow cap, or OpenTherm water-temperature control) you
+can see whether the morning line gets smoother: lockouts -> 0, room dip down, max rpm down.
 
-Een lockout = een anti-cycling-standby MIDDEN in de catch-up (WP viel stil en hervat daarna weer),
-niet het einde-ochtend-uitschakelen. Kamer-dip = piek->dal binnen zo'n standby (de kamer schiet nog
-na door thermische traagheid vóór 'ie zakt).
+A lockout = an anti-cycling standby IN THE MIDDLE of the catch-up (the heat pump stopped and resumed
+afterwards), not the end-of-morning switch-off. Room dip = peak -> trough within such a standby (the
+room still overshoots from thermal inertia before it drops).
 
     docker exec battery_optimizer python3 /app/wp_morning_wobble.py [--days N] [--start YYYY-MM-DD]
 """
@@ -18,8 +18,8 @@ import argparse
 import os
 from datetime import date, timedelta
 
-WIN_START, WIN_END = "05:00:00", "10:30:00"   # ochtend catch-up-venster
-RPM_ON = 100                                  # compressor > dit = draait
+WIN_START, WIN_END = "05:00:00", "10:30:00"   # morning catch-up window
+RPM_ON = 100                                  # compressor above this = running
 
 
 def _db():
@@ -64,7 +64,7 @@ def day_wobble(cur, d: str):
             if rows[j][2]:
                 temps.append(rows[j][2])
             j += 1
-        if j < len(rows) and temps:            # WP hervat -> echte lockout (geen einde-ochtend)
+        if j < len(rows) and temps:            # heat pump resumes -> a real lockout (not end of morning)
             locks += 1
             stby_min += (j - k) * 5
             max_dip = max(max_dip, max(temps) - min(temps))

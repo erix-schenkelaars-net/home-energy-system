@@ -1,43 +1,40 @@
 #!/usr/bin/env python3
-"""Bouw de clear-sky-referentielijn (pcs) uit de EIGEN array-historie in erix_db.
+"""Build the clear-sky reference line (pcs) from the array's OWN history in erix_db.
 
-WAAROM DEZE METHODE (2026-08-13). De vorige kalibratie (referentiedagen uit de resol-DB,
-2026-08-08/09) had twee fouten die elkaar versterkten:
+WHY THIS METHOD (2026-08-13). The previous calibration (reference days from the resol DB,
+2026-08-08/09) had two errors that reinforced each other:
 
-  1. ALLEEN ZONSHOOGTE, GEEN SEIZOEN. De referentiedagen lagen rond de zonnewende. Bij
-     dezelfde zonshoogte staat de zon later in het jaar verder naar het zuiden; op een
-     oost/west-opstelling valt het licht dan gunstiger in en zijn de panelen koeler.
-     Gemeten: augustus levert bij gelijke zonshoogte 6,1% meer dan juli. De lijn las
-     daardoor het hele jaar te laag, en op 11 en 12 augustus 2026 kwam de WERKELIJKE
-     opbrengst 4-8% BOVEN de clear-sky uit — per definitie onmogelijk.
-  2. GEMIDDELDE IN PLAATS VAN BOVENGRENS. Het gemiddelde per graad over 8 heldere dagen
-     legt per constructie de helft van de heldere dagen erboven. Juli bevestigde dat:
-     0,998 / 1,012 / 1,002.
+  1. ELEVATION ONLY, NO SEASON. The reference days were around the solstice. At the same sun
+     elevation the sun is further south later in the year; on an east/west array the light then
+     falls in more favourably and the panels are cooler. Measured: at equal elevation August
+     yields 6.1% more than July. So the line read too low all year, and on 11 and 12 August 2026
+     the ACTUAL yield came out 4-8% ABOVE the clear sky -- impossible by definition.
+  2. AVERAGE INSTEAD OF UPPER BOUND. The average per degree over 8 clear days puts half of the
+     clear days above it by construction. July confirmed it: 0.998 / 1.012 / 1.002.
 
-HET MODEL. Per zonshoogte-graad (ochtend en middag apart) is de opbrengst LINEAIR in de
-zonnedeclinatie:  kWh_per_slot = a(elev) + b(elev) x declinatie.  Dat is gemeten, niet
-aangenomen: gemiddelde relatieve restspreiding 0,079, bij hoge zon 0,01-0,04. Ter
-vergelijking gaf een puur multiplicatief seizoensmodel 0,146 en een ruw fysisch
-POA-model 0,371. De helling b is overal negatief (mediaan -0,006 kWh per graad): meer
-declinatie = zomer = minder opbrengst bij gelijke zonshoogte.
+THE MODEL. Per degree of sun elevation (morning and afternoon separately) the yield is LINEAR in
+the solar declination:  kWh_per_slot = a(elev) + b(elev) x declination.  That is measured, not
+assumed: mean relative residual spread 0.079, 0.01-0.04 at high sun. For comparison a purely
+multiplicative season model gave 0.146 and a rough physical POA model 0.371. The slope b is
+negative everywhere (median -0.006 kWh per degree): more declination = summer = less yield at the
+same elevation.
 
-Declinatie is fysisch de juiste seizoens-as en is symmetrisch: dezelfde declinatie geeft
-dezelfde zonnebaan, dus de meetreeks februari-augustus dekt ook september-november.
-Alleen declinatie onder de gemeten ondergrens (ruwweg 10 nov - 1 feb) is extrapolatie;
-dat staat in meta.extrapolated.
+Declination is physically the right season axis and is symmetric: the same declination gives the
+same sun path, so the February-August series also covers September-November. Only declination
+below the measured minimum (roughly 10 Nov - 1 Feb) is extrapolation; that is recorded in
+meta.extrapolated.
 
-BOVENGRENS. Na de fit wordt per graad opgetild met een percentiel van de residuen, zodat
-de lijn boven de gemeten heldere dagen ligt in plaats van er middendoor. De lift wordt
-gedempt bij lage zon, waar de meting ruis-gevoelig is (horizon, schaduw) en de bijdrage
-aan de dag klein.
+UPPER BOUND. After the fit each degree is lifted by a percentile of the residuals, so the line lies
+above the measured clear days instead of through them. The lift is damped at low sun, where the
+measurement is noise-sensitive (horizon, shade) and the contribution to the day small.
 
-HELDERE DAGEN. Gladde belcurve EN top-kwart dagopbrengst binnen de maand. Gladheid alleen
-is niet genoeg: een egaal bewolkte dag is ook glad. 13 augustus 2026 had de beste
-gladheid van allemaal maar haalde 0,65x de referentie.
+CLEAR DAYS. A smooth bell curve AND a top-quarter day yield within the month. Smoothness alone is
+not enough: an evenly overcast day is smooth too. 13 August 2026 had the best smoothness of all but
+reached 0.65x the reference.
 
-pcs is display-only (referentielijn in de grafiek) en raakt geen optimizer-beslissing.
+pcs is display only (reference line in the chart) and touches no optimizer decision.
 
-Draaien:
+Run:
     IN=/app/pv_clearsky_calibration.json OUT=/tmp/new_clearsky.json \
         python3 pv_clearsky_build.py
 """
@@ -56,14 +53,14 @@ OUT_PATH = os.environ.get("OUT", "/tmp/new_clearsky.json")
 LAT = float(os.environ.get("SYSTEM_LAT", "52.0"))
 LON = float(os.environ.get("SYSTEM_LON", "5.0"))
 
-MIN_PEAK_W = 500.0        # daaronder is het geen bruikbare dag
+MIN_PEAK_W = 500.0        # below this it is not a usable day
 MIN_SLOTS = 20            # minimaal aantal kwartieren met data
 MAX_TV = 1.25             # gladheid; 1,0 = perfecte belcurve (op en neer)
 YIELD_QUANTILE = 0.75     # top-kwart dagopbrengst binnen de maand
-MIN_ELEV = 10             # onder deze zonshoogte is de meting te ruis-gevoelig
-MIN_POINTS = 8            # minimaal aantal punten voor een eigen fit per graad
+MIN_ELEV = 10             # below this elevation the measurement is too noise-sensitive
+MIN_POINTS = 8            # minimum number of points for a fit of its own per degree
 LIFT_Q = 0.90             # percentiel van de residuen -> bovengrens
-LIFT_FULL_ELEV = 25       # boven deze zonshoogte telt de lift volledig mee
+LIFT_FULL_ELEV = 25       # above this elevation the lift counts fully
 
 
 def declination(d: date) -> float:
@@ -77,7 +74,7 @@ def _eot_snoon(d: date) -> float:
 
 
 def solar_elevation(dt: datetime) -> float:
-    """Zonshoogte in graden. Klokstanden zijn lokale tijd (CEST = UTC+2)."""
+    """Sun elevation in degrees. Clock times are local time (CEST = UTC+2)."""
     decl = math.radians(declination(dt.date()))
     ha = (dt.hour + dt.minute / 60.0 - 2.0 - _eot_snoon(dt.date())) * 15.0
     lr = math.radians(LAT)
@@ -91,10 +88,10 @@ def is_morning(dt: datetime) -> bool:
 
 
 def load_days(cur) -> dict:
-    """{"tot"|"east"|"west": {datum: {kwartier: kWh}}}
+    """{"tot"|"east"|"west": {date: {quarter: kWh}}}
 
-    Oost is string 2, west is string 1. Dat staat nergens gedocumenteerd; het is afgeleid
-    uit de dagcurve — de string die 's ochtends piekt kijkt naar het oosten.
+    East is string 2, west is string 1. That is not documented anywhere; it is derived from the
+    day curve -- the string that peaks in the morning faces east.
     """
     cur.execute("""
         SELECT DATE(ts), HOUR(ts) * 4 + FLOOR(MINUTE(ts) / 15),
@@ -132,7 +129,7 @@ def select_clear_days(days: dict) -> list:
 
 
 def collect(days: dict, clear: list) -> dict:
-    """{(zonshoogte, ochtend): [(declinatie, kWh), ...]}"""
+    """{(elevation, morning): [(declination, kWh), ...]}"""
     obs = defaultdict(list)
     for d in clear:
         dec = declination(d)
@@ -146,7 +143,7 @@ def collect(days: dict, clear: list) -> dict:
 
 
 def fit_bins(obs: dict) -> dict:
-    """Per graad een rechte door (declinatie, kWh), daarna opgetild tot bovengrens."""
+    """Per degree a straight line through (declination, kWh), then lifted to an upper bound."""
     fits = {}
     for key, pts in obs.items():
         if len(pts) < MIN_POINTS:
@@ -162,7 +159,7 @@ def fit_bins(obs: dict) -> dict:
             a = my - b * mx
         residuals = sorted(y - (a + b * x) for x, y in pts)
         lift = residuals[min(len(residuals) - 1, int(len(residuals) * LIFT_Q))]
-        # Bij lage zon is de meting ruis-gevoelig; daar de lift dempen.
+        # At low sun the measurement is noise-sensitive; damp the lift there.
         damp = min(1.0, max(0.0, (key[0] - MIN_ELEV) / (LIFT_FULL_ELEV - MIN_ELEV)))
         fits[key] = (a + max(0.0, lift) * damp, b)
     return fits
@@ -196,16 +193,15 @@ def fill_and_smooth(fits: dict, morning: bool) -> dict:
 
 
 def extend(profile: dict, lo: int, hi: int) -> dict:
-    """Trek het profiel door tot buiten het gemeten bereik.
+    """Extend the profile beyond the measured range.
 
-    Boven: de curve verzadigt bij hoge zon (meer beam levert nauwelijks nog winst), dus
-    de bovenste graad wordt vlak doorgetrokken. Zonder dit kregen de piekuren van
-    juni-dagen géén waarde — de zon komt hier tot ~62 graden terwijl de fit op 60 stopt —
-    en kwam juni 10-15% te laag uit, precies de fout die we juist repareerden.
+    Top: the curve saturates at high sun (more beam hardly adds anything), so the top degree is
+    extended flat. Without this the peak hours of June days got NO value -- the sun gets to ~62
+    degrees here while the fit stops at 60 -- and June came out 10-15% too low, exactly the error
+    we were fixing.
 
-    Onder: lineair uittaperen naar nul bij 2 graden. Daar gaat het om enkele procenten
-    van de dag en een echte fit is er te ruis-gevoelig, maar hem leeg laten kost de
-    ochtend- en avondstaart.
+    Bottom: taper linearly to zero at 2 degrees. That is a few percent of the day and a real fit
+    is too noise-sensitive there, but leaving it empty costs the morning and evening tails.
     """
     if not profile:
         return {}
@@ -221,7 +217,7 @@ def extend(profile: dict, lo: int, hi: int) -> dict:
 
 
 def day_check(days: dict, clear: list, prof_m: dict, prof_a: dict) -> dict:
-    """{datum: (werkelijke kWh, model-kWh)} over de heldere dagen."""
+    """{date: (actual kWh, model kWh)} over the clear days."""
     check = {}
     for d in clear:
         dec = declination(d)
@@ -239,13 +235,13 @@ def day_check(days: dict, clear: list, prof_m: dict, prof_a: dict) -> dict:
 
 
 def ceiling_safety(days: dict, clear: list, prof_m: dict, prof_a: dict) -> float:
-    """Laatste vangnet: geen gemeten heldere dag mag boven het model uitkomen (normaal 1.0)."""
+    """Last safety net: no measured clear day may come out above the model (normally 1.0)."""
     check = day_check(days, clear, prof_m, prof_a)
     return round(max([1.0] + [a / m for a, m in check.values()]), 4)
 
 
 def build_profiles(days: dict, clear: list):
-    """(ochtendprofiel, middagprofiel, veiligheidsschaal) of None als de fit niet lukt."""
+    """(morning profile, afternoon profile, safety scale) or None when the fit fails."""
     fits = fit_bins(collect(days, clear))
     prof_m = extend(fill_and_smooth(fits, True), 3, 65)
     prof_a = extend(fill_and_smooth(fits, False), 3, 65)
@@ -272,14 +268,14 @@ def main() -> None:
     days = load_days(cur)
     conn.close()
 
-    # Heldere dagen worden op de TOTALE opbrengst gekozen: helder is een eigenschap van de dag,
-    # niet van een dakhelft. Dezelfde dagenlijst gaat daarna door alle drie de fits.
+    # Clear days are chosen on the TOTAL yield: clear is a property of the day, not of a roof side.
+    # The same list of days then goes through all three fits.
     clear = select_clear_days(days["tot"])
     if len(clear) < 8:
         raise SystemExit(f"te weinig heldere dagen ({len(clear)}) — niets geschreven")
 
-    # Drie keer dezelfde pijplijn. Het achtervoegsel is meteen de sleutelnaam in de JSON:
-    # "" = totaal (de bestaande pcs_m/pcs_a), "_e" = oostdak, "_w" = westdak.
+    # The same pipeline three times. The suffix is also the key name in the JSON:
+    # "" = total (the existing pcs_m/pcs_a), "_e" = east roof, "_w" = west roof.
     built = {}
     for suffix, name in (("", "tot"), ("_e", "east"), ("_w", "west")):
         res = build_profiles(days[name], clear)
@@ -308,7 +304,7 @@ def main() -> None:
                     entry[name] = None
                     entry.pop(f"{name}_b", None)
                     continue
-                entry[name] = round(ab[0] * saf, 4)         # a, bij declinatie 0
+                entry[name] = round(ab[0] * saf, 4)         # a, at declination 0
                 entry[f"{name}_b"] = round(ab[1] * saf, 5)  # helling per graad
 
     decls = [declination(d) for d in clear]
@@ -337,10 +333,10 @@ def main() -> None:
     for key in ("ref_days", "scale_factor", "scale_to_peak_kwh", "season"):
         cal["meta"].pop(key, None)
         cal.pop(key, None)
-    # Coordinaten horen niet in dit bestand: het is versioneerd en de repo is publiek. Ze zaten
-    # er via het inputbestand in en werden door .update() ongemerkt meegedragen -- zo stonden ze
-    # op 2026-08-13 in de publieke historie. De locatie komt uit SYSTEM_LAT/SYSTEM_LON in .env
-    # en is voor het lezen van de kalibratie niet nodig.
+    # Coordinates do not belong in this file: it is versioned and the repo is public. They came in
+    # through the input file and were carried along unnoticed by .update() -- that is how they got
+    # into the public history on 2026-08-13. The location comes from SYSTEM_LAT/SYSTEM_LON in .env
+    # and is not needed to read the calibration.
     for key in ("lat", "lon", "latitude", "longitude"):
         cal["meta"].pop(key, None)
     json.dump(cal, open(OUT_PATH, "w"), indent=1)

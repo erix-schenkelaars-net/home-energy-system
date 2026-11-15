@@ -11,6 +11,6 @@ services:
       - TZ=Europe/Amsterdam
     volumes:
       - ../common:/app/common:ro
-      # Map de lokale folder met je script/config naar /app in de container
+      # Mount the local folder with the script/config at /app in the container
       - .:/app
       - ./logs:/logs

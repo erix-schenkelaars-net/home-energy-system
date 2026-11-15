@@ -35,8 +35,8 @@ from datetime import datetime, timedelta
 import struct
 import mysql.connector
 import sys
-# common/ wordt read-only gemount in de container (/app/common) en ligt op de host in de repo-root;
-# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+# common/ is mounted read-only in the container (/app/common) and sits in the repo root on the host;
+# add both the script dir and its parent so the import works in both places (tests included).
 for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -413,7 +413,7 @@ def fill_null_p1_rows(since_minutes=24*60):
         dbg(1, DEBUG_DB_UPDATE, "DB", f"⛔ fill_null_p1_rows FAILED: {e}")
 
 def init_cost_calc():
-    """Laad gedeelde tarieven/vaste kosten en seed de vorige telwerkstand (na read_last_db_state)."""
+    """Load the shared tariffs/fixed costs and seed the previous meter reading (after read_last_db_state)."""
     global _TARIFFS, _FIXED, _PREV_CUM, _PREV_TS
     try:
         db = mysql.connector.connect(host=MYSQL_HOST, user=MYSQL_USER,
@@ -433,13 +433,13 @@ def init_cost_calc():
 
 
 def compute_interval_costs(ts, cum_imp, cum_exp, cum_gas):
-    """4 kostcomponenten (€) voor het interval sinds de vorige write.
-    Telwerk-delta (cumulatief, rollover-veilig) × werkelijke kwartierprijs — geen middeling."""
+    """The 4 cost components (EUR) for the interval since the previous write.
+    Meter delta (cumulative, rollover-safe) x the actual quarter-hour price; no averaging."""
     global _PREV_CUM, _PREV_TS
     if _PREV_CUM["imp"] is None or _PREV_TS is None:
         _PREV_CUM = {"imp": cum_imp, "exp": cum_exp, "gas": cum_gas}
         _PREV_TS = ts
-        return (None, None, None, None)   # eerste write na (re)start: nog geen interval
+        return (None, None, None, None)   # first write after a (re)start: no interval yet
     d_imp = max(0.0, cum_imp - _PREV_CUM["imp"])
     d_exp = max(0.0, cum_exp - _PREV_CUM["exp"])
     d_gas = max(0.0, cum_gas - _PREV_CUM["gas"])
@@ -710,7 +710,7 @@ if __name__ == "__main__":
                     f"→ electricity_today={electricity_today:.3f} kWh  "
                     f"p_del_avg={p_del_db:.1f} W  p_ret_avg={p_ret_db:.1f} W")
 
-                # Realized kost over dit interval (telwerk-delta × werkelijke prijs)
+                # Realized cost over this interval (meter delta x actual price)
                 cum_imp = P1_LAST_DATA['p1_e_t1_i'] + P1_LAST_DATA['p1_e_t2_i']
                 cum_exp = P1_LAST_DATA['p1_e_t1_e'] + P1_LAST_DATA['p1_e_t2_e']
                 cum_gas = P1_LAST_DATA['p1_gas']

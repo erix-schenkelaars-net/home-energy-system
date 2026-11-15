@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Reset de adaptieve SoC-vloer naar de basis — draai dit NA een top-balancering.
+"""Reset the adaptive SoC floor to its base value; run this AFTER a top balance.
 
-De battery_optimizer ratchet de vloer automatisch omhoog bij een bodem-taper
-(vmin/vdelta); terugzetten gaat bewust met de hand, hier.
+battery_optimizer ratchets the floor up automatically on a bottom taper (vmin/vdelta); setting
+it back is deliberately done by hand, here.
     python3 tools/reset_soc_floor.py
 """
 import os, mysql.connector

@@ -1588,7 +1588,7 @@ class TestEvChargeWindow(unittest.TestCase):
 
 
 class TestPvNowcastOverlay(unittest.TestCase):
-    """In-day KNMI-nowcast-overlay op de PV-forecast (0-4u vervangt AROME, naad-blend)."""
+    """In-day KNMI nowcast overlay on the PV forecast (0-4 h replaces AROME, blended seam)."""
 
     def test_blend_weight_full_until_blend_start(self):
         # Binnen 0..BLEND_START: volledig nowcast.
@@ -1602,17 +1602,17 @@ class TestPvNowcastOverlay(unittest.TestCase):
         self.assertEqual(mod.nowcast_blend_weight(mod.PV_NOWCAST_HORIZON_H), 0.0)
 
     def test_blend_weight_zero_outside_window(self):
-        # Buiten [0, horizon]: geen nowcast (val terug op AROME).
+        # Outside [0, horizon]: no nowcast (fall back to AROME).
         self.assertEqual(mod.nowcast_blend_weight(-0.25), 0.0)
         self.assertEqual(mod.nowcast_blend_weight(mod.PV_NOWCAST_HORIZON_H + 1.0), 0.0)
 
     def test_overlay_disabled_returns_empty(self):
-        # Vlag uit => lege overlay, ongeacht DB-inhoud.
+        # Flag off => empty overlay, whatever the DB holds.
         with patch.object(mod, "PV_NOWCAST_OVERLAY", False):
             self.assertEqual(mod.load_nowcast_overlay(MagicMock(), datetime(2026, 8, 5, 12, 0)), {})
 
     def test_overlay_stale_run_falls_back(self):
-        # Nieuwste run ouder dan de max-age => lege overlay (AROME-fallback).
+        # Newest run older than the max age => empty overlay (AROME fallback).
         now = datetime(2026, 8, 5, 12, 0)
         stale = now - timedelta(minutes=mod.PV_NOWCAST_MAX_AGE_MIN + 30)
         conn = MagicMock()
@@ -1622,7 +1622,7 @@ class TestPvNowcastOverlay(unittest.TestCase):
 
 
 class TestPvClearskySplit(unittest.TestCase):
-    """Clear-sky per dakhelft — weergave-only, en het mag `r` niet kunnen raken."""
+    """Clear sky per roof side: display only, and it must not be able to touch `r`."""
 
     FAKE = {"deg": {"40": {"r_m": 0.96, "r_a": 0.30,
                            "pcs_m": 0.80, "pcs_a": 0.70,
@@ -1637,7 +1637,7 @@ class TestPvClearskySplit(unittest.TestCase):
                 patch.object(mod, "_solar_noon", lambda d: 13.7))
 
     def test_morning_favours_east_afternoon_favours_west(self):
-        """De hele reden van de splitsing: 's ochtends levert het oostdak, 's middags het westdak."""
+        """The whole reason for the split: the east roof delivers in the morning, the west roof in the afternoon."""
         with contextlib.ExitStack() as st:
             for p_ in self._patched():
                 st.enter_context(p_)
@@ -1647,7 +1647,7 @@ class TestPvClearskySplit(unittest.TestCase):
         self.assertGreater(w_a, e_a)
 
     def test_old_calibration_without_split_keys_returns_none(self):
-        """Een kalibratie van vóór deze wijziging mag geen crash geven, alleen geen lijnen."""
+        """A calibration from before this change must not crash, it just gives no lines."""
         old = {"deg": {"40": {"r_m": 1.0, "r_a": 1.0, "pcs_m": 0.8, "pcs_a": 0.7}},
                "meta": {"clamp": [0.5, 1.15]}}
         with contextlib.ExitStack() as st:
@@ -1660,10 +1660,10 @@ class TestPvClearskySplit(unittest.TestCase):
             self.assertEqual(mod.pv_clearsky_split(datetime(2026, 7, 15, 12, 0)), (None, None))
 
     def test_night_is_a_real_zero_not_a_missing_value(self):
-        """None = "deze kalibratie kent de splitsing niet"; nacht = 0,0.
+        """None = "this calibration does not know the split"; night = 0.0.
 
-        Zonder dat onderscheid schreef de backfill NULL voor elk nachtslot, en dan krijgt de
-        grafiek 's nachts gaten terwijl de totale clear-sky-lijn daar over de bodem loopt.
+        Without that distinction the backfill wrote NULL for every night slot, and then the chart
+        has gaps at night while the total clear-sky line runs along the bottom there.
         """
         with contextlib.ExitStack() as st:
             for p_ in self._patched():
@@ -1684,10 +1684,10 @@ class TestPvClearskySplit(unittest.TestCase):
         self.assertGreaterEqual(w, 0.0)
 
     def test_split_does_not_touch_the_forecast_factor(self):
-        """De borging van deze wijziging: `r` stuurt de LP en moet identiek blijven.
+        """The safeguard of this change: `r` drives the LP and must stay identical.
 
-        pv_clearsky_split is bewust een APARTE functie; deze test valt om zodra iemand de
-        splitsing alsnog in pv_clearsky_calib vlecht en daarbij r meeneemt.
+        pv_clearsky_split is deliberately a SEPARATE function; this test fails as soon as someone
+        weaves the split into pv_clearsky_calib after all and takes r along.
         """
         with contextlib.ExitStack() as st:
             for p_ in self._patched():
@@ -1700,7 +1700,7 @@ class TestPvClearskySplit(unittest.TestCase):
 
 
 class TestPvClearskyCalib(unittest.TestCase):
-    """Clear-sky-kalibratie: per-zonshoogte correctiefactor + gemeten clear-sky-PV, met clamp."""
+    """Clear-sky calibration: correction factor per sun elevation + measured clear-sky PV, with clamp."""
 
     def test_disabled_returns_neutral(self):
         with patch.object(mod, "PV_CLEARSKY_CALIB", False):
@@ -1718,19 +1718,19 @@ class TestPvClearskyCalib(unittest.TestCase):
              patch.object(mod, "_pv_calib_cache", fake), \
              patch.object(mod, "_solar_elevation_deg", lambda dt, *a, **k: 40.2), \
              patch.object(mod, "_solar_noon", lambda d: 13.7):
-            # ochtend (vóór zonnemiddag) -> r_m / pcs_m
+            # morning (before solar noon) -> r_m / pcs_m
             r, p = mod.pv_clearsky_calib(datetime(2026, 7, 15, 10, 0))
             self.assertAlmostEqual(r, 0.96); self.assertAlmostEqual(p, 0.74)
-            # middag -> r_a=0.30 wordt geclampd naar 0.5, pcs_a onaangeroerd
+            # afternoon -> r_a=0.30 is clamped to 0.5, pcs_a untouched
             r2, p2 = mod.pv_clearsky_calib(datetime(2026, 7, 15, 16, 0))
             self.assertAlmostEqual(r2, 0.5); self.assertAlmostEqual(p2, 0.62)
 
     def test_season_term_lowers_clearsky_toward_midsummer(self):
-        """Bij gelijke zonshoogte levert de array minder rond de zonnewende.
+        """At equal sun elevation the array yields less around the solstice.
 
-        Regressie: zonder deze term stond de clear-sky in augustus 4-8% ONDER de
-        werkelijke opbrengst (11 en 12 augustus 2026), wat voor een plafond niet kan.
-        pcs_m_b is negatief, dus hoge declinatie (juni) drukt de lijn omlaag.
+        Regression: without this term the clear sky in August sat 4-8% BELOW the actual yield
+        (11 and 12 August 2026), which a ceiling cannot do. pcs_m_b is negative, so high
+        declination (June) pushes the line down.
         """
         fake = {"deg": {"40": {"r_m": 1.0, "r_a": 1.0, "pcs_m": 1.00, "pcs_a": 1.00,
                                "pcs_m_b": -0.010, "pcs_a_b": -0.010}},
@@ -1741,7 +1741,7 @@ class TestPvClearskyCalib(unittest.TestCase):
              patch.object(mod, "_solar_noon", lambda d: 13.7):
             # 21 juni: declinatie ~ +23,4 -> 1.00 - 0.010*23.4
             _, midsummer = mod.pv_clearsky_calib(datetime(2026, 6, 21, 10, 0))
-            # 22 maart = dag 81 -> declinatie exact 0 in deze formule -> onveranderd
+            # 22 March = day 81 -> declination exactly 0 in this formula -> unchanged
             _, equinox = mod.pv_clearsky_calib(datetime(2026, 3, 22, 10, 0))
 
         self.assertLess(midsummer, equinox)
@@ -1749,7 +1749,7 @@ class TestPvClearskyCalib(unittest.TestCase):
         self.assertAlmostEqual(equinox, 1.00, places=2)
 
     def test_calibration_without_slope_stays_flat(self):
-        """Een oude kalibratie zonder pcs_*_b mag niet stuklopen of verschuiven."""
+        """An old calibration without pcs_*_b must not break or shift."""
         fake = {"deg": {"40": {"r_m": 1.0, "r_a": 1.0, "pcs_m": 0.80, "pcs_a": 0.80}},
                 "meta": {"clamp": [0.5, 1.15]}}
         with patch.object(mod, "PV_CLEARSKY_CALIB", True), \
@@ -1763,7 +1763,7 @@ class TestPvClearskyCalib(unittest.TestCase):
         self.assertAlmostEqual(december, 0.80)
 
     def test_clearsky_never_negative(self):
-        """Doortrekking naar de winter mag de lijn niet onder nul duwen."""
+        """Extending into winter must not push the line below zero."""
         fake = {"deg": {"12": {"r_m": 1.0, "r_a": 1.0, "pcs_m": 0.05, "pcs_a": 0.05,
                                "pcs_m_b": -0.010, "pcs_a_b": -0.010}},
                 "meta": {"clamp": [0.5, 1.15]}}
@@ -1777,20 +1777,20 @@ class TestPvClearskyCalib(unittest.TestCase):
 
 
 class TestNowcastFalseZero(unittest.TestCase):
-    """Valse-nul-guard: ≈0 nowcast bij zon-op = ontbrekende satelliet-data -> AROME (niet blenden)."""
+    """False-zero guard: ~0 nowcast with the sun up = missing satellite data -> AROME (no blend)."""
 
     def test_zero_with_sun_up_is_false_zero(self):
-        # zon duidelijk op (>8°) én nowcast ≈0 -> valse nul
+        # sun clearly up (>8 deg) and nowcast ~0 -> false zero
         self.assertTrue(mod.nowcast_false_zero(0.0, 20.0))
         self.assertTrue(mod.nowcast_false_zero(0.005, 12.0))
 
     def test_low_but_real_cloud_is_not_false_zero(self):
-        # bewolkt geeft laag maar >drempel -> echte data, wél blenden
+        # overcast gives low but > threshold -> real data, do blend
         self.assertFalse(mod.nowcast_false_zero(0.05, 20.0))
         self.assertFalse(mod.nowcast_false_zero(0.5, 40.0))
 
     def test_zero_at_low_sun_is_legit(self):
-        # zon (nog) laag -> 0 is legitiem (nacht/schemer), geen valse nul
+        # sun (still) low -> 0 is legitimate (night/twilight), no false zero
         self.assertFalse(mod.nowcast_false_zero(0.0, 3.0))
         self.assertFalse(mod.nowcast_false_zero(0.0, mod.PV_NOWCAST_FALSEZERO_ELEV))
         self.assertFalse(mod.nowcast_false_zero(None, 30.0))
@@ -2050,16 +2050,16 @@ class _FakeConn:
 
 
 class TestPriceBackfill(unittest.TestCase):
-    """Regressie 2026-09-14: EnergyZero 504 -> lege prijs-dict -> elk slot viel terug
-    op de 0.15-median-van-niets (all-in 0.27), wat de 08:00-piek verkeerd beprijsde en
-    de actie naar LOAD_FIRST omklapte. De fix vult ontbrekende slots uit
-    electricity_prices (de dag-vooruit-prijzen die er al staan)."""
+    """Regression 2026-09-14: EnergyZero 504 -> empty price dict -> every slot fell back to the
+    0.15 median-of-nothing (all-in 0.27), which mispriced the 08:00 peak and flipped the action to
+    LOAD_FIRST. The fix fills missing slots from electricity_prices (the day-ahead prices already
+    there)."""
 
     TODAY = date(2026, 9, 14)
     TOMORROW = date(2026, 9, 15)
 
     def _rows(self):
-        # 08:00 = idx 32, 08:15 = idx 33 vandaag; 00:00 morgen = idx 96.
+        # 08:00 = idx 32, 08:15 = idx 33 today; 00:00 tomorrow = idx 96.
         return [
             (datetime(2026, 9, 14, 8, 0), 0.413142),
             (datetime(2026, 9, 14, 8, 15), 0.361076),
@@ -2076,10 +2076,10 @@ class TestPriceBackfill(unittest.TestCase):
         self.assertAlmostEqual(prices[96], 0.250000)   # morgen 00:00
 
     def test_live_values_are_never_overwritten(self):
-        prices = {32: 0.99}                            # verse live-prijs voor 08:00
+        prices = {32: 0.99}                            # fresh live price for 08:00
         mod.backfill_prices_from_db(_FakeConn(self._rows()), prices,
                                     self.TODAY, self.TOMORROW)
-        self.assertEqual(prices[32], 0.99)             # blijft de live-waarde
+        self.assertEqual(prices[32], 0.99)             # stays the live value
         self.assertAlmostEqual(prices[33], 0.361076)   # gat wél gevuld
 
     def test_nothing_missing_is_a_noop(self):
@@ -2095,13 +2095,13 @@ class TestPriceBackfill(unittest.TestCase):
         prices = {}
         n = mod.backfill_prices_from_db(_BoomConn(), prices,
                                         self.TODAY, self.TOMORROW)
-        self.assertEqual(n, 0)          # geen crash, geen slots gevuld
+        self.assertEqual(n, 0)          # no crash, no slots filled
 
 
 
 class TestAdaptiveFloor(unittest.TestCase):
-    """Ratchet-logica van de adaptieve SoC-vloer (decide_soc_floor). Alleen omhoog,
-    bij een bodem-taper, met snelheidsbegrenzer en cap."""
+    """Ratchet logic of the adaptive SoC floor (decide_soc_floor). Only up, on a bottom taper,
+    with a rate limiter and a cap."""
 
     def test_raises_on_floor_taper(self):
         new, act = mod.decide_soc_floor(20.0, 20.0, [19.9], hours_since_update=10)
@@ -2114,7 +2114,7 @@ class TestAdaptiveFloor(unittest.TestCase):
         self.assertEqual(new, 20.0)
 
     def test_taper_far_above_floor_ignored(self):
-        # een taper bij hoge SoC (bv. transient) mag de vloer niet optillen
+        # a taper at high SoC (e.g. a transient) must not raise the floor
         new, act = mod.decide_soc_floor(20.0, 20.0, [55.0], hours_since_update=10)
         self.assertIsNone(act)
         self.assertEqual(new, 20.0)
@@ -2132,7 +2132,7 @@ class TestAdaptiveFloor(unittest.TestCase):
     def test_never_exceeds_cap_on_raise(self):
         new, act = mod.decide_soc_floor(29.0, 20.0, [28.9], hours_since_update=10)
         self.assertEqual(act, "raise")
-        self.assertEqual(new, 30.0)   # 29+2 geclamped naar cap 30
+        self.assertEqual(new, 30.0)   # 29+2 clamped to cap 30
 
 
 

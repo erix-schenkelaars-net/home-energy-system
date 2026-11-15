@@ -8,16 +8,16 @@ services:
     env_file:
       - ../.env
     environment:
-      # Veilige default: nooit publiceren tot dit bewust op 0 gaat. Overschrijft ../.env.
-      WP_DRY_RUN: "1"          # roomSetpoint-sturing: DROOG (nog niet vrijgegeven)
-      # Buitentemp LIVE (2026-09-10): geverifieerd dat niets anders naar outsideTemp/set publiceert
-      # (niet in automations.yaml/configuration.yaml; OTThing stond op OT-slave, nu op MQTT gezet),
-      # dus wp_control is de enige bron. roomSetpoint blijft droog via WP_DRY_RUN.
+      # Safe default: never publish until this is deliberately set to 0. Overrides ../.env.
+      WP_DRY_RUN: "1"          # roomSetpoint control: DRY (not released yet)
+      # Outside temperature LIVE (2026-09-10): verified that nothing else publishes to outsideTemp/set
+      # (not in automations.yaml/configuration.yaml; the OTThing was on OT slave, now set to MQTT),
+      # so wp_control is the only source. roomSetpoint stays dry via WP_DRY_RUN.
       WP_OUTSIDE_DRY_RUN: "0"
-      # pi5new REGELT de WP LIVE (2026-10-23): beslist aan/uit (hysterese rond Honeywell-setpoint) +
-      # stuurt de aanvoer via chMode1/chSetTemp1. Vereist overrideChFlow1=ON op de OTThing. Terug naar
-      # shadow = "0". Live publiceert wp_control ook roomSetpoint1 + overrideChOn1/roomMode1 (CH-enable,
-      # 2026-10-25); WP_DRY_RUN geldt dan niet meer.
+      # pi5new CONTROLS the heat pump LIVE (2026-10-23): decides on/off and sends the flow target via
+      # chMode1/chSetTemp1. Needs overrideChFlow1=ON on the OTThing. Back to shadow = "0". Live,
+      # wp_control also publishes roomSetpoint1 + overrideChOn1/roomMode1 (CH enable, 2026-10-25);
+      # WP_DRY_RUN no longer applies then.
       WP_CONTROL_LIVE: "1"
     volumes:
       - .:/app

@@ -1,6 +1,6 @@
 #!/bin/sh
 # entrypoint.sh — wp_control
-# Logt naar /logs/debug_YYYY-MM-DD.log (rotatie per kalenderdag; opruiming door host-cron cleanup_logs.sh).
+# Logs to /logs/debug_YYYY-MM-DD.log (rotated per calendar day; cleaned up by the host cron cleanup_logs.sh).
 
 LOG_DIR=/logs
 mkdir -p "${LOG_DIR}"

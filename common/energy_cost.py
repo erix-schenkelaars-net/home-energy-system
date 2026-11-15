@@ -1,16 +1,16 @@
 """
-energy_cost.py — gedeelde, CANONIEKE energie-kostenberekening.
+energy_cost.py — shared, CANONICAL energy cost calculation.
 
-Eén bron van waarheid voor de all-in prijsopbouw + saldering, gebruikt door:
-  - battery_optimizer        -> prijssignaal / geplande kost (import_price / export_price)
-  - read_p1                  -> werkelijke (realized) kost per 5-min-rij in de energy-tabel
-  - tools/backfill_cost_*.py -> herberekening van historische kost (dryrun + apply)
+Single source of truth for the all-in price build-up + net metering (saldering), used by:
+  - battery_optimizer        -> price signal / planned cost (import_price / export_price)
+  - read_p1                  -> actual (realized) cost per 5-min row in the energy table
+  - tools/backfill_cost_*.py -> recalculation of historical cost (dry run + apply)
 
-Tarieven uit erix_db.energy_tariffs, vaste kosten uit erix_db.fixed_costs.
-Alle bedragen incl. 21% BTW. WIJZIG DE FORMULE ALLEEN HIER.
+Tariffs from erix_db.energy_tariffs, fixed costs from erix_db.fixed_costs.
+All amounts incl. 21% VAT. CHANGE THE FORMULA ONLY HERE.
 
-Wordt read-only in de containers gemount op /app/common (zie docker-compose.yml),
-zodat alle consumers exact dezelfde berekening gebruiken.
+Mounted read-only into the containers at /app/common (see docker-compose.yml), so every
+consumer uses exactly the same calculation.
 """
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -27,11 +27,11 @@ class Tariff:
     saldering:               bool
     gas_inkoop_m3:           float
     gas_energiebelasting_m3: float
-    # Referentie-vast-contract, ALLEEN voor het C/D-blok in het LP-kostenrapport van de
-    # battery_optimizer. Nooit onderdeel van de all-in/saldering-formule hieronder, en read_p1
-    # en het dashboard doen er niets mee. None = geen gecheckt aanbod voor deze periode; het
-    # rapport laat de vergelijking dan wég in plaats van een verouderd getal te tonen alsof het
-    # klopt (0.26 stond jaren hardcoded en lag onder ELKE dynamische kwartierprijs).
+    # Reference fixed-price contract, ONLY for the C/D block in battery_optimizer's LP cost
+    # report. Never part of the all-in/net-metering formula below, and read_p1 and the dashboard
+    # ignore it. None = no checked offer for this period; the report then leaves the comparison
+    # out instead of showing a stale number as if it were right (0.26 was hard-coded for years
+    # and sat below EVERY dynamic quarter-hour price).
     ref_fixed_import_kwh:    Optional[float] = None
     ref_fixed_export_kwh:    Optional[float] = None
     ref_fixed_note:          Optional[str]   = None
@@ -41,14 +41,14 @@ class Tariff:
 class FixedCosts:
     valid_from:   date
     valid_until:  Optional[date]
-    elec_lev_day: float   # vaste leveringskosten stroom
-    elec_sys_day: float   # systeembeheer/capaciteitstarief stroom
-    verm_eb_day:  float   # vermindering energiebelasting (negatief)
+    elec_lev_day: float   # fixed electricity supply cost
+    elec_sys_day: float   # electricity grid/capacity tariff
+    verm_eb_day:  float   # energy tax reduction (negative)
     gas_lev_day:  float
     gas_sys_day:  float
 
 
-# Fallback (Powerpeers vanaf 2026-06-01) — alleen gebruikt als de DB-read faalt.
+# Fallback (Powerpeers from 2026-06-01): only used when the DB read fails.
 _FALLBACK_TARIFFS = [
     Tariff(date(2026, 6, 1), date(2026, 12, 31), 0.0100, 0.110848, 0.0100, True,  0.082100, 0.726799,
            0.27, 0.27, "1-jaar vast, gecheckt 2026-08-18 (saldering: export=import)"),
@@ -58,7 +58,7 @@ _FALLBACK_TARIFFS = [
 
 
 def _pick(rows, d: date):
-    """Rij die geldig is op datum d (clamp naar dichtstbijzijnde rand als buiten bereik)."""
+    """The row valid on date d (clamped to the nearest edge when out of range)."""
     for r in rows:
         if r.valid_from <= d and (r.valid_until is None or d <= r.valid_until):
             return r
@@ -68,7 +68,7 @@ def _pick(rows, d: date):
 
 
 # ---------------------------------------------------------------------------
-# DB loaders (mysql.connector connection; werkt in beide containers)
+# DB loaders (mysql.connector connection; works in both containers)
 # ---------------------------------------------------------------------------
 def load_tariffs(conn) -> list[Tariff]:
     cur = conn.cursor(dictionary=True)
@@ -119,10 +119,10 @@ def fixed_for(fixed, d: date) -> Optional[FixedCosts]:
 
 
 # ---------------------------------------------------------------------------
-# Prijs-lookups: WERKELIJKE marktprijs uit de DB (geen middeling)
+# Price lookups: the ACTUAL market price from the DB (no averaging)
 # ---------------------------------------------------------------------------
 def elec_spot_for_ts(conn, ts: datetime) -> float:
-    """markttarief_kwh (incl. BTW, excl. energiebelasting) van het kwartier dat ts bevat."""
+    """markttarief_kwh (incl. VAT, excl. energy tax) of the quarter that contains ts."""
     cur = conn.cursor()
     cur.execute("SELECT markttarief_kwh FROM electricity_prices WHERE ts <= %s "
                 "ORDER BY ts DESC LIMIT 1", (ts,))
@@ -141,30 +141,30 @@ def gas_spot_for_day(conn, d: date) -> float:
 
 
 # ---------------------------------------------------------------------------
-# CANONIEKE formule (incl. 21% BTW) — identiek aan optimizer + dashboard
+# CANONICAL formula (incl. 21% VAT), identical to optimizer + dashboard
 # ---------------------------------------------------------------------------
 def all_in_import(spot: float, t: Tariff) -> float:
-    """Afnameprijs €/kWh = EPEX(incl. BTW) + inkoopvergoeding + energiebelasting."""
+    """Import price EUR/kWh = EPEX (incl. VAT) + purchase fee (inkoopvergoeding) + energy tax."""
     return spot + t.inkoop_kwh + t.energiebelasting_kwh
 
 
 def export_credit_price(spot: float, t: Tariff) -> float:
-    """Teruglever-waarde €/kWh.
-    Saldering : volledige afnameprijs − verkoopvergoeding.
-    Na saldering: EPEX excl. BTW − verkoopvergoeding."""
+    """Export value EUR/kWh.
+    With net metering   : full import price - sales fee (verkoopvergoeding).
+    After net metering  : EPEX excl. VAT - sales fee."""
     if t.saldering:
         return all_in_import(spot, t) - t.verkoop_kwh
     return spot / 1.21 - t.verkoop_kwh
 
 
 def elec_var_eur(import_kwh: float, export_kwh: float, spot: float, t: Tariff) -> float:
-    """Netto variabele stroomkost € over een interval (import-kost − export-credit)."""
+    """Net variable electricity cost EUR over an interval (import cost - export credit)."""
     return import_kwh * all_in_import(spot, t) - export_kwh * export_credit_price(spot, t)
 
 
 def gas_var_eur(m3: float, gas_spot: float, t: Tariff) -> float:
     return m3 * (gas_spot + t.gas_inkoop_m3 + t.gas_energiebelasting_m3)
 
-# NB: vaste kosten worden NIET hier berekend — ze worden bij weergave afgeleid uit de
-# fixed_costs-tabel (zie Energiekosten-GC.php / functions.php). De oude elec_fix_eur/
-# gas_fix_eur-helpers zijn verwijderd (waren dood; niemand riep ze aan).
+# NB: fixed costs are NOT calculated here; they are derived for display from the fixed_costs
+# table (see Energiekosten-GC.php / functions.php). The old elec_fix_eur/gas_fix_eur helpers
+# were removed (dead code; nobody called them).

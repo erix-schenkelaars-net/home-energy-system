@@ -1,6 +1,6 @@
 #!/bin/sh
-# entrypoint.sh — calibrate_seplos (STAP a: read-only DB-monitor)
-# Logt naar stdout én /logs/debug_YYYY-MM-DD.log (conform repo-conventie; geen FileHandler in Python).
+# entrypoint.sh — calibrate_seplos (STEP a: read-only DB monitor)
+# Logs to stdout and /logs/debug_YYYY-MM-DD.log (repo convention; no FileHandler in Python).
 
 LOG_DIR=/logs
 mkdir -p "${LOG_DIR}"
@@ -18,8 +18,8 @@ until python3 -c "import socket; s=socket.create_connection(('${DB_HOST}', 3306)
 done
 echo "MariaDB reachable, starting calibrate_seplos (read-only monitor)."
 
-# Roteer per KALENDERDAG (niet per containerstart), zodat een langlopende container
-# niet meer naar één groeiend bestand schrijft. tee-equivalent: ook naar stdout.
+# Rotate per CALENDAR DAY (not per container start), so a long-running container no
+# longer writes into one ever-growing file. tee equivalent: stdout as well.
 exec python3 -u calibrate_seplos.py 2>&1 | while IFS= read -r line; do
     printf '%s\n' "$line"
     printf '%s\n' "$line" >> "${LOG_DIR}/debug_$(date +%Y-%m-%d).log"

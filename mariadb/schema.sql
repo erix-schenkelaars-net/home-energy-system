@@ -189,11 +189,13 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `honeywell_ot_heater0_room_setpoint_c` float       DEFAULT NULL,
   `honeywell_ot_heater0_room_t_c`       float        DEFAULT NULL,
   `honeywell_ot_heater0_suspended`      tinyint(1)   DEFAULT NULL,
-  -- OTThing-BEREKENDE + naar de WP gestuurde aanvoer-target (curve-output). In Repeater+override
-  -- vervangt dit de Honeywell-TSet richting de WP (read_otthing). Shadow-paar met wp_shadow_flow_target_c.
+  -- The flow target the OTThing CALCULATES and sends to the heat pump (curve output). In
+  -- Repeater+override it replaces the Honeywell TSet towards the heat pump (read_otthing).
+  -- Shadow pair with wp_shadow_flow_target_c.
   `honeywell_ot_flow_setpoint_c`        float        DEFAULT NULL COMMENT 'OTThing curve-output = WP-aanvoer-target °C (heatercircuit.flowsetpoint)',
-  -- wp_shadow_*: wat pi5new ZOU sturen, DRY (wp_control). Overnacht-vergelijking met de OTThing vóór de
-  -- chSetTemp1-sturing live gaat; room/set = pi5new's inputs, flow_target = de 6-punts weercurve.
+  -- wp_shadow_*: what pi5new WOULD send, DRY (wp_control). Overnight comparison with the OTThing
+  -- before chSetTemp1 control went live; room/set = pi5new's inputs, flow_target = the 6-point
+  -- weather curve.
   `wp_shadow_room_t_c`                  float        DEFAULT NULL COMMENT 'pi5new input: gemeten kamertemp °C (= roomunit.room_t)',
   `wp_shadow_room_set_c`                float        DEFAULT NULL COMMENT 'pi5new input: kamer-setpoint °C (= Honeywell roomunit.room_set_t)',
   `wp_shadow_outside_c`                 float        DEFAULT NULL COMMENT 'pi5new input: buitentemp °C waarop de curve rekent (HA-sensor, KNMI-fallback)',
@@ -216,10 +218,10 @@ CREATE TABLE IF NOT EXISTS `energy` (
   `honeywell_ot_thermo_room_set_t_c`    float        DEFAULT NULL COMMENT 'Room setpoint °C',
   `honeywell_ot_thermo_room_t_c`        float        DEFAULT NULL COMMENT 'Room temperature °C',
   `honeywell_ot_thermo_smart_power`     varchar(20)  DEFAULT NULL,
-  -- roomunit = de FYSIEKE Honeywell-klokthermostaat, gelezen via de OTThing slave-interface in
-  -- Master-mode (enableSlave). Dit is in Master de echte thermostaat; honeywell_ot_thermo_* is
-  -- daar juist de OTThing->WP-commandokant. wp_control gebruikt set_t als comfort-dial (de mens
-  -- draait eraan) en ch_set/ch_enable om een handmatige "bump" te detecteren. (read_otthing)
+  -- roomunit = the PHYSICAL Honeywell clock thermostat, read through the OTThing slave interface
+  -- (enableSlave). This is the real thermostat; honeywell_ot_thermo_* is the OTThing->heat pump
+  -- command side. wp_control uses set_t as the comfort dial (the knob a person turns) and
+  -- ch_set/ch_enable to detect a manual "bump". (read_otthing)
   `otthing_roomunit_set_t_c`            float        DEFAULT NULL COMMENT 'Honeywell kamer-setpoint °C (comfort-dial)',
   `otthing_roomunit_room_t_c`           float        DEFAULT NULL COMMENT 'Honeywell gemeten kamertemp °C',
   `otthing_roomunit_ch_set_t_c`         float        DEFAULT NULL COMMENT 'Flow die de Honeywell zelf zou vragen °C',
@@ -713,14 +715,13 @@ CREATE TABLE IF NOT EXISTS `calibration_log` (
     INDEX (`session_id`), INDEX (`ts`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- battery_soc_floor — adaptieve LP-SoC-vloer (1 rij, id=1).
--- De battery_optimizer ratchet floor_pct omhoog (stap SOC_FLOOR_STEP_PCT, cap
--- SOC_FLOOR_CAP_PCT, max ~1 stap per SOC_FLOOR_MIN_INTERVAL_H) zodra een vmin/vdelta-
--- taper bij de bodem (binnen SOC_FLOOR_PROX_PCT van de vloer) vuurt — om de zwakke
--- cel #16 van z'n knik te houden tot de balans is hersteld. Terug naar base_pct gaat
--- HANDMATIG na een top-balancering via tools/reset_soc_floor.py. Waarom een tabel en
--- geen env: de verhoogde vloer moet herstarts overleven en door de optimizer per run
--- gelezen worden.
+-- battery_soc_floor — adaptive LP SoC floor (1 row, id=1).
+-- battery_optimizer ratchets floor_pct up (step SOC_FLOOR_STEP_PCT, cap SOC_FLOOR_CAP_PCT, at
+-- most ~1 step per SOC_FLOOR_MIN_INTERVAL_H) when a vmin/vdelta taper fires near the bottom
+-- (within SOC_FLOOR_PROX_PCT of the floor) -- to keep the weak cell #16 away from its knee until
+-- the balance is restored. Back to base_pct happens BY HAND after a top balance, via
+-- tools/reset_soc_floor.py. Why a table and not an env var: the raised floor must survive
+-- restarts and be read by the optimizer on every run.
 CREATE TABLE IF NOT EXISTS battery_soc_floor (
   id         TINYINT      PRIMARY KEY,
   floor_pct  FLOAT        NOT NULL,

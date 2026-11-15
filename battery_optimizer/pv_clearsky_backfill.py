@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
-"""Herbereken battery_schedule.pv_clearsky_kwh voor alle bestaande rijen.
+"""Recalculate battery_schedule.pv_clearsky_kwh for all existing rows.
 
-Waarom: de clear-sky-referentie is op 2026-08-13 herbouwd (zie pv_clearsky_build.py).
-Rijen die daarvóór zijn weggeschreven houden hun oude, te lage waarde — en vóór
-2026-08-05 stond er helemaal niets. Deze backfill trekt de hele historie gelijk met de
-huidige berekening, zodat een teruggekeken dag dezelfde referentielijn toont als vandaag.
+Why: the clear-sky reference was rebuilt on 2026-08-13 (see pv_clearsky_build.py). Rows written
+before that keep their old, too-low value -- and before 2026-08-05 there was nothing at all. This
+backfill brings the whole history in line with the current calculation, so a day looked back on
+shows the same reference line as today.
 
-pv_clearsky_kwh is display-only: de grafiek leest hem, geen enkele optimizer-beslissing
-hangt ervan af. Sinds 2026-08-15 geldt hetzelfde voor de splitsing per dakhelft
-(pv_clearsky_east_kwh / pv_clearsky_west_kwh). Deze backfill raakt ALLEEN die drie kolommen
-en nooit pv_kwh, want dat is de forecast waar de LP mee rekent.
+pv_clearsky_kwh is display only: the chart reads it, no optimizer decision depends on it. Since
+2026-08-15 the same holds for the split per roof side (pv_clearsky_east_kwh / pv_clearsky_west_kwh).
+This backfill touches ONLY those three columns and never pv_kwh, which is the forecast the LP uses.
 
-SLOTDUUR. De tabel is niet overal kwartier-gebaseerd: t/m 2026-05-22 stonden er uurslots
-(24 per dag), daarna kwartieren (96), met 22 mei als gemengde dag. pv_clearsky_calib()
-geeft kWh per KWARTIER, dus voor een uurslot moeten de vier kwartieren worden opgeteld.
-De duur wordt daarom per rij afgeleid uit de afstand tot het volgende slot van die dag —
-dat werkt ook op de gemengde dag, en zou een factor 4 fout hebben opgeleverd.
+SLOT LENGTH. The table is not quarter-based everywhere: up to 2026-05-22 it held hourly slots (24
+per day), quarters (96) after that, with 22 May as a mixed day. pv_clearsky_calib() gives kWh per
+QUARTER, so for an hourly slot the four quarters must be added up. The length is therefore derived
+per row from the distance to that day's next slot -- that also works on the mixed day, where a fixed
+length would have been a factor 4 off.
 
-Draaien (in de battery_optimizer-container):
-    python3 pv_clearsky_backfill.py --dry-run      # toont wat er zou veranderen
-    python3 pv_clearsky_backfill.py --apply        # schrijft, na een backup
+Run (in the battery_optimizer container):
+    python3 pv_clearsky_backfill.py --dry-run      # shows what would change
+    python3 pv_clearsky_backfill.py --apply        # writes, after a backup
 """
 import argparse
 import csv
@@ -33,8 +32,8 @@ import mysql.connector
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_optimizer_LP_quarter as opt      # noqa: E402
 
-# /output is bind-mounted naar de host; /app/data was dat niet, dus daar overleefde de
-# backup de eerstvolgende image-rebuild niet -- precies wanneer je hem nodig hebt.
+# /output is bind-mounted to the host; /app/data was not, so a backup there did not survive the
+# next image rebuild -- exactly when you need it.
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/output")
 QUARTER = timedelta(minutes=15)
 MAX_SLOT = timedelta(hours=2)                   # vangnet tegen gaten in de reeks
@@ -48,10 +47,10 @@ def connect():
 
 
 def clearsky_for(slot: datetime, duration: timedelta):
-    """(totaal, oost, west) clear-sky-kWh over de duur van dit slot.
+    """(total, east, west) clear-sky kWh over the length of this slot.
 
-    Oost/west zijn None zodra de kalibratie de gesplitste sleutels niet kent, zodat een
-    oude kalibratie geen nullen wegschrijft die als 'gemeten 0' zouden worden gelezen.
+    East/west are None when the calibration does not know the split keys, so an old calibration
+    does not write zeros that would be read as 'measured 0'.
     """
     total = 0.0
     east = west = 0.0
@@ -86,7 +85,7 @@ def main() -> None:
                    FROM battery_schedule ORDER BY slot_dt""")
     rows = cur.fetchall()
 
-    # oude waarde per slot bewaren (kan meerdere rijen per slot hebben)
+    # keep the old value per slot (a slot can have several rows)
     old = {}
     per_day = defaultdict(list)
     for slot, cs, cse, csw in rows:

@@ -99,7 +99,7 @@ class TestFormatNumberString(unittest.TestCase):
 
 
 class TestFormatCop(unittest.TestCase):
-    """Opstart-pieken van de Weheat-COP (>6) zijn geen meting -> NULL, niet afgekapt."""
+    """Start-up spikes of the Weheat COP (>6) are not a measurement -> NULL, not clipped."""
 
     def test_normal_cop_passes(self):
         self.assertEqual(mod.format_cop("4.2"), mod.format_number_string("4.2"))

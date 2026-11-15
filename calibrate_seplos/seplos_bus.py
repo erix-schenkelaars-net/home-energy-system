@@ -1,17 +1,17 @@
-"""seplos_bus — read-only Seplos 16S Modbus-RTU primitieven voor calibrate_seplos (STAP b).
+"""seplos_bus — read-only Seplos 16S Modbus RTU primitives for calibrate_seplos (STEP b).
 
-BEWUST STANDALONE gedupliceerd uit read_seplos.py, zodat calibrate_seplos read_seplos
-VOLLEDIG ONGEMOEID laat (read_seplos is de enige RS485-bus-gebruiker + de veiligheidslaag;
-daar wijzigen we niets aan). Het gaat om het VASTE Seplos-wire-protocol — register 0x1000
-(pia, 18 woorden) en 0x1100 (pib, 26 woorden) + het PIC-frame met byte-offsets — dat
-verandert niet, dus het drift-risico van deze duplicatie is klein.
+DELIBERATELY STANDALONE, duplicated from read_seplos.py, so calibrate_seplos leaves read_seplos
+COMPLETELY ALONE (read_seplos is the only RS485 bus user + the safety layer; we change nothing
+there). It is the FIXED Seplos wire protocol -- register 0x1000 (pia, 18 words) and 0x1100 (pib,
+26 words) + the PIC frame with byte offsets -- which does not change, so the drift risk of this
+duplication is small.
 
-ALLEEN LEZEN. Geen enkele write naar de BMS. Levert per uitlezing:
-  - 16 celspanningen (mV), 4 NTC-cel-temps, omgevings- + MOSFET-temp,
-  - pack-spanning/-stroom, SoC, mode,
-  - de balancer-bits: PIC-byte 9/10 = "Cell equalization cells 1-8 / 9-16" (bit per cel).
+READ ONLY. Not a single write to the BMS. Delivers per readout:
+  - 16 cell voltages (mV), 4 NTC cell temperatures, ambient + MOSFET temperature,
+  - pack voltage/current, SoC, mode,
+  - the balancer bits: PIC byte 9/10 = "Cell equalization cells 1-8 / 9-16" (one bit per cell).
 
-calibrate_seplos draait alleen op de bus wanneer read_seplos GESTOPT is (geen contentie).
+calibrate_seplos only runs on the bus while read_seplos is STOPPED (no contention).
 """
 import time
 
@@ -28,7 +28,7 @@ MODBUS_RESPONSE_TIMEOUT = 1.0
 MODBUS_RETRY_DELAY = 0.2
 
 
-# --- protocol-primitieven (verbatim uit read_seplos, zonder de debug-infra) ---
+# --- protocol primitives (verbatim from read_seplos, without the debug infrastructure) ---
 def crc16(data) -> int:
     crc = 0xFFFF
     for b in data:
@@ -82,7 +82,7 @@ def modbus_read(ser, start, count):
 
 
 def read_pic(ser):
-    """Het vaste PIC-status-frame -> byte-buffer (zonder CRC) of None."""
+    """The fixed PIC status frame -> byte buffer (without CRC) or None."""
     frame = bytes.fromhex("00 01 12 00 00 90 38 CF")
     ser.reset_input_buffer()
     ser.write(frame)
@@ -105,12 +105,12 @@ def open_serial(port=PORT):
     return serial.Serial(port, BAUD, parity=PARITY, timeout=TIMEOUT)
 
 
-# --- pure parse (unit-getest zonder hardware) ---
+# --- pure parse (unit tested without hardware) ---
 def parse_pack(pia, pib, pic):
-    """Ruwe register-woorden + PIC-bytes -> snapshot-dict. Geen I/O; puur.
+    """Raw register words + PIC bytes -> snapshot dict. No I/O; pure.
 
-    balancing_cells = de celnummers waarvan de equalization-bit aan staat (PIC-byte 9 = cel 1-8,
-    byte 10 = cel 9-16; bit i (LSB=laagste cel) van die byte).
+    balancing_cells = the cell numbers whose equalization bit is set (PIC byte 9 = cells 1-8,
+    byte 10 = cells 9-16; bit i (LSB = lowest cell) of that byte).
     """
     cells = [int(v) for v in pib[0:16]]                      # mV
     cell_temps = [round(temp(v), 1) for v in pib[16:20]]
@@ -118,7 +118,7 @@ def parse_pack(pia, pib, pic):
     eq_hi = pic[10] if pic and len(pic) > 10 else 0
     balancing = ([i + 1 for i in range(8) if eq_lo & (1 << i)] +
                  [i + 9 for i in range(8) if eq_hi & (1 << i)])
-    # PIC-byte 5/6 = "Cell voltage HIGH alarm (cel 1-8 / 9-16)" — de BMS-eigen Vhigh-melding (bit per cel).
+    # PIC byte 5/6 = "Cell voltage HIGH alarm (cells 1-8 / 9-16)": the BMS's own Vhigh alarm (one bit per cell).
     vh_lo = pic[5] if pic and len(pic) > 6 else 0
     vh_hi = pic[6] if pic and len(pic) > 6 else 0
     vhigh = ([i + 1 for i in range(8) if vh_lo & (1 << i)] +
@@ -129,18 +129,18 @@ def parse_pack(pia, pib, pic):
         "env_temp": round(temp(pib[24]), 1) if len(pib) > 24 else None,
         "pow_temp": round(temp(pib[25]), 1) if len(pib) > 25 else None,
         "voltage": round(pia[0] / 100.0, 2),
-        "current": round(s16(pia[1]) / 100.0, 2),           # + = laden, - = ontladen (read_seplos-conventie)
+        "current": round(s16(pia[1]) / 100.0, 2),           # + = charging, - = discharging (read_seplos convention)
         "soc": round(pia[5] / 10.0, 1),
         "mode": pic[11] if pic and len(pic) > 11 else None,
         "eq_lo": eq_lo,
         "eq_hi": eq_hi,
         "balancing_cells": balancing,
-        "vhigh_cells": vhigh,               # BMS-eigen "cel-Vhigh alarm" (welke cellen)
+        "vhigh_cells": vhigh,               # the BMS's own "cell Vhigh alarm" (which cells)
     }
 
 
 def read_pack(ser):
-    """Volledige uitlezing (pia + pib + pic) -> snapshot-dict, of None bij een korte/foute frame."""
+    """Full readout (pia + pib + pic) -> snapshot dict, or None on a short/bad frame."""
     pia = modbus_read(ser, 0x1000, 18)
     pib = modbus_read(ser, 0x1100, 26)
     pic = read_pic(ser)

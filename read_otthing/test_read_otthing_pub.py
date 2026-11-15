@@ -259,12 +259,12 @@ class TestParsePayload(unittest.TestCase):
             self.assertIn(k, result)
 
     def test_invalid_ot_frame_flow_128_dropped(self):
-        # 2026-10-30 15:00:16: OT f8.8 0x8000 -> 128.0 aanvoer in HA; mag niet in energy belanden
+        # 2026-10-30 15:00:16: OT f8.8 0x8000 -> 128.0 flow in HA; must not end up in energy
         p = self._full_payload()
         p["slave"]["flow_t"] = 128.0
         result = mod.parse_payload(p)
         self.assertIsNone(result["honeywell_ot_boiler_flow_t_c"])
-        self.assertAlmostEqual(result["honeywell_ot_boiler_return_t_c"], 40.0)   # rest blijft
+        self.assertAlmostEqual(result["honeywell_ot_boiler_return_t_c"], 40.0)   # the rest stays
 
     def test_implausible_return_outside_room_dropped(self):
         p = self._full_payload()
@@ -280,7 +280,7 @@ class TestParsePayload(unittest.TestCase):
             self.assertIsNone(result[k], k)
 
     def test_setpoints_not_range_checked(self):
-        # setpoints vallen buiten de check: een flowsetpoint 0 (WP uit) is geldig
+        # setpoints are outside the check: a flow setpoint 0 (heat pump off) is valid
         p = self._full_payload()
         p["heatercircuit"][0]["flowsetpoint"] = 0
         self.assertEqual(mod.parse_payload(p)["honeywell_ot_flow_setpoint_c"], 0.0)
@@ -341,17 +341,17 @@ class TestOnMessage(unittest.TestCase):
 
 
 class TestMasterUnwrap(unittest.TestCase):
-    """Firmware wrapt master-velden als {"result","data"} (otvalues.cpp OTValue::getJson).
-    _md pakt data uit als result waar is, en honoreert de scalar-vorm (oude firmware)."""
+    """The firmware wraps master fields as {"result","data"} (otvalues.cpp OTValue::getJson).
+    _md unwraps data when result is true, and accepts the scalar form (old firmware)."""
 
     def test_md_unwraps_valid(self):
         self.assertEqual(mod._md({"result": True, "data": 21.0}), 21.0)
 
     def test_md_invalid_result_is_none(self):
-        self.assertIsNone(mod._md({"result": False, "data": 21.0}))  # niet ge-ACK't -> niet vertrouwen
+        self.assertIsNone(mod._md({"result": False, "data": 21.0}))  # not ACKed -> do not trust
 
     def test_md_scalar_passthrough(self):
-        self.assertEqual(mod._md(20.5), 20.5)                        # oude firmware zonder wrapper
+        self.assertEqual(mod._md(20.5), 20.5)                        # old firmware without the wrapper
 
     def test_md_data_without_result_defaults_trusted(self):
         self.assertEqual(mod._md({"data": 19.0}), 19.0)
@@ -384,9 +384,9 @@ class TestMasterUnwrap(unittest.TestCase):
 
 
 class TestRoomunit(unittest.TestCase):
-    """roomunit = de FYSIEKE Honeywell-klokthermostaat (OTThing slave-interface, Master-mode).
-    In Master is dit de thermostaat die de mens bedient; de master-groep is de OTThing->WP-kant.
-    Live zijn 't plain scalars; _md() houdt het robuust mocht firmware ze wrappen."""
+    """roomunit = the PHYSICAL Honeywell clock thermostat (OTThing slave interface, Master mode).
+    In Master this is the thermostat a person operates; the master group is the OTThing->heat pump
+    side. Live they are plain scalars; _md() keeps it robust should a firmware wrap them."""
 
     def _payload(self, **ru):
         base = {"ch_set_t": 65, "room_t": 21.1, "room_set_t": 21,
@@ -417,7 +417,7 @@ class TestRoomunit(unittest.TestCase):
         self.assertIsNone(d["otthing_roomunit_ch_enable"])
 
     def test_wrapped_roomunit_also_works(self):
-        # robuustheid: als een firmware-variant de roomunit-velden {"result","data"}-wrapt
+        # robustness: in case a firmware variant wraps the roomunit fields as {"result","data"}
         d = mod.parse_payload(self._payload(room_set_t={"result": True, "data": 22.0}))
         self.assertEqual(d["otthing_roomunit_set_t_c"], 22.0)
 

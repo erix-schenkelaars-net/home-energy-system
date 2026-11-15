@@ -1,29 +1,29 @@
 #!/bin/bash
 # cleanup_logs.sh — pi5new / pi5
-# Verwijdert debug_*.log files op basis van de DATUM IN DE BESTANDSNAAM (niet mtime).
+# Deletes debug_*.log files by the DATE IN THE FILE NAME (not mtime).
 #
-# Sinds entrypoint.sh per KALENDERDAG roteert (debug_$(date +%F).log) draagt elk bestand
-# zijn eigen dag in de naam. Op mtime opruimen faalde op het ACTIEVE bestand: dat werd elke
-# paar seconden geschreven, dus -mtime +N matchte het nooit → één bestand groeide onbeperkt
-# (read_seplos stond op 1,35 GB, 3 weken in één file). Op filename-datum opruimen is robuust:
-# het actieve bestand van vandaag blijft, alles ouder dan MAX_DAYS gaat weg.
+# Since entrypoint.sh rotates per CALENDAR DAY (debug_$(date +%F).log), every file carries its
+# own day in its name. Cleaning up by mtime failed on the ACTIVE file: it was written every few
+# seconds, so -mtime +N never matched it -> one file grew without limit (read_seplos reached
+# 1.35 GB, three weeks in one file). Cleaning up by the file-name date is robust: today's active
+# file stays, everything older than MAX_DAYS goes.
 #
 # Cron (root): 0 7 * * * /home/pi/docker/cleanup_logs.sh >> /home/pi/docker/logs/debug_cleanup_$(date +\%F).log 2>&1
 
 DOCKER_ROOT=/home/pi/docker
 MAX_DAYS=7
-CUTOFF=$(date -d "${MAX_DAYS} days ago" +%Y-%m-%d)   # bestanden gedateerd VÓÓR deze dag gaan weg
+CUTOFF=$(date -d "${MAX_DAYS} days ago" +%Y-%m-%d)   # files dated BEFORE this day are deleted
 TOTAL=0
 KEPT=0
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting log cleanup (delete files dated before ${CUTOFF})"
 
-# Alle logs/ subdirs: direct onder DOCKER_ROOT (diepte 1) én onder container-dirs (diepte 2).
+# All logs/ subdirs: directly under DOCKER_ROOT (depth 1) and under the container dirs (depth 2).
 while IFS= read -r f; do
-    # Pak de laatste YYYY-MM-DD uit de bestandsnaam (werkt voor debug_, debug_collect_, debug_cleanup_).
+    # Take the last YYYY-MM-DD from the file name (works for debug_, debug_collect_, debug_cleanup_).
     d=$(basename "$f" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | tail -1)
     if [ -z "$d" ]; then
-        # Geen leesbare datum in de naam -> val terug op mtime.
+        # No readable date in the name -> fall back to mtime.
         if [ -n "$(find "$f" -mtime +${MAX_DAYS} 2>/dev/null)" ]; then
             sudo rm -f "$f" && TOTAL=$((TOTAL + 1))
         fi

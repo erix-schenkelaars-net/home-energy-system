@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-wp_tools.py — meetlat en replay voor wp_control (draait in de container: alleen lezen, geen sturing).
+wp_tools.py — yardstick and replay for wp_control (runs in the container: read only, no control).
 
   python3 wp_tools.py report START END
-      Per dag: buitentemp, WP-kWh, COP, aanvoer, starts, WP-gewogen prijs vs daggemiddelde, uren I
-      op cap; daarna de COP per buitentemp-bin. De vaste meetlat vóór en na elke regelwijziging.
+      Per day: outside temperature, heat pump kWh, COP, flow, starts, heat-pump-weighted price vs
+      the day average, hours with I at its cap; then the COP per outside-temperature bin. The fixed
+      yardstick before and after every control change.
 
   python3 wp_tools.py replay START END [--every 15]
-      Stuurt de gelogde kamer/setpoint/buitentemp/compressor-stand uit `energy` door de ECHTE
-      room_comp_pi / decide_heat, twee keer: OUD (Ki 0,5, geen opbouw-poort, uit bij sp+0,8) en NIEUW
-      (de huidige build_cfg-standaarden + poort + uitrol-drempel). OPEN-LOOP: de kamer reageert niet
-      op de nieuwe aanvoer, dus dit toont hoe I en het aanvoerdoel anders hadden gelopen, niet het
-      klimaat dat daaruit was gevolgd. Kolom I_log vs I_oud controleert dat de replay klopt.
-      De regels draaien op de GELOGDE setpoints; sp_new toont ernaast wat het huidige schema + de
-      prijs-overlay op dat moment hadden gevraagd (alleen ter vergelijking, niet gesimuleerd).
+      Feeds the logged room/setpoint/outside temperature/compressor state from `energy` through the
+      REAL room_comp_pi / decide_heat, twice: OLD (Ki 0.5, no build-up gate, off at sp+0.8) and NEW
+      (the current build_cfg defaults + gate + coast threshold). OPEN LOOP: the room does not react
+      to the new flow, so this shows how I and the flow target would have run differently, not the
+      climate that would have followed. Column I_log vs I_old checks that the replay is right.
+      The rules run on the LOGGED setpoints; sp_new shows next to it what the current schedule + the
+      price overlay would have asked at that moment (for comparison only, not simulated).
 
-START/END = 'YYYY-MM-DD' of 'YYYY-MM-DD HH:MM'.
+START/END = 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'.
 """
 
 import sys
@@ -86,7 +87,7 @@ FROM {t} WHERE ts >= %s AND ts < %s AND wp_shadow_room_set_c IS NOT NULL ORDER B
 
 
 def _sim(rows, cfg, gated, wins):
-    """Eén replay-run over de rijen -> lijst (i, flow, heat, gate) per rij."""
+    """One replay run over the rows -> list of (i, flow, heat, gate) per row."""
     first = rows[0]
     i_st = {"i": float(first[5] or 0.0)}
     h_st = {} if first[7] is None else {"heat": bool(first[7])}
@@ -99,8 +100,8 @@ def _sim(rows, cfg, gated, wins):
         headroom = None if base is None else cfg["flow_cap"] - base
         running = flame != 0
         boost, i = wp.room_comp_pi(room, sp, i_st, cfg, headroom, running, ts if gated else None)
-        # het nominale (bump-loze) setpoint is niet gelogd; na het oplaadblok was het oud én nieuw
-        # nooit boven 22,0, dus alles daarboven is een bump (cap 23)
+        # the nominal (bump-free) setpoint is not logged; after the charging block it was never above
+        # 22.0 in either old or new, so anything above that is a bump (cap 23)
         off = (wp.heat_off_above(ts, sp, wins.get(ts.date()), cfg, min(sp, 22.0)) if gated
                else cfg["heat_off_above"])
         heat = wp.decide_heat(room, sp, h_st, cfg["heat_on_below"], off)

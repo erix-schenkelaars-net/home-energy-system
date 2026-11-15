@@ -23,17 +23,17 @@ MAX_POWER_KW = 3.0
 # Totale AC -> batterij -> AC efficiency
 ROUND_TRIP_EFFICIENCY = 0.83
 
-# Verdeel round-trip efficiency over laden/ontladen
+# Split the round-trip efficiency over charging/discharging
 CHARGE_EFFICIENCY = np.sqrt(ROUND_TRIP_EFFICIENCY)
 DISCHARGE_EFFICIENCY = np.sqrt(ROUND_TRIP_EFFICIENCY)
 
 INTERVAL_HOURS = 0.25
 
-# Economische kosten van batterijdegradatie
+# Economic cost of battery degradation
 # €1200 / (6000 cycli * 10 kWh)
 DEGRADATION_COST_PER_KWH = 0.01786
 
-# None = geen dagelijkse cycluslimiet
+# None = no daily cycle limit
 MAX_CYCLES_PER_DAY = None
 
 
@@ -249,7 +249,7 @@ class Battery:
 
         self.day_throughput += grid_energy
 
-        # Kosten energie
+        # Energy cost
         self.gross_revenue -= (
             grid_energy *
             price_eur_kwh
@@ -486,7 +486,7 @@ def passive_strategy(df):
         # ----------------------------------------------------
         # UP_AND_DOWN
         #
-        # GEEN PASSIEVE ACTIE
+        # NO PASSIVE ACTION
         # ----------------------------------------------------
 
         elif condition == "UP_AND_DOWN":
@@ -537,16 +537,16 @@ def passive_strategy(df):
 #
 # PERFECT FORESIGHT
 #
-# BELANGRIJK:
-# Ook hier wordt UP_AND_DOWN NIET als gewone
-# laad/verkoopprijs gebruikt.
+# IMPORTANT:
+# Here too UP_AND_DOWN is NOT used as a normal
+# charge/sell price.
 #
-# We gebruiken alleen:
+# We only use:
 #
 # UP   -> shortage
 # DOWN -> surplus
 #
-# en zoeken achteraf de optimale batterijplanning.
+# and search for the optimal battery schedule in hindsight.
 #
 # ============================================================
 
@@ -634,7 +634,7 @@ def perfect_foresight(df):
             # ----------------------------------------------
             # CHARGE
             #
-            # Alleen wanneer TenneT DOWN is
+            # Only when TenneT is DOWN
             # ----------------------------------------------
 
             if (
@@ -687,7 +687,7 @@ def perfect_foresight(df):
             # ----------------------------------------------
             # DISCHARGE
             #
-            # Alleen wanneer TenneT UP is
+            # Only when TenneT is UP
             # ----------------------------------------------
 
             if (
@@ -890,7 +890,7 @@ def plot_soc(
 
 
 # ============================================================
-# PRIJS DUURCURVE
+# PRICE DURATION CURVE
 # ============================================================
 
 def price_duration_curve(df):

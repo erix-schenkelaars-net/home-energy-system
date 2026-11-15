@@ -1143,10 +1143,10 @@ class TestPvDeadString(unittest.TestCase):
         self.assertEqual(ctrl.pv_dead_string(267, 3), 2)   # 3 V < DEAD(5) + ander produceert
 
     def test_low_but_not_dead_is_no_fault(self):
-        self.assertEqual(ctrl.pv_dead_string(267, 50), 0)  # 50 V = laag/schaduw, niet "echt 0"
+        self.assertEqual(ctrl.pv_dead_string(267, 50), 0)  # 50 V = low/shade, not "really 0"
 
     def test_live_must_exceed_threshold(self):
-        self.assertEqual(ctrl.pv_dead_string(80, 0), 0)    # producerende string moet > 100 V
+        self.assertEqual(ctrl.pv_dead_string(80, 0), 0)    # a producing string must be > 100 V
 
     def test_none_reading_no_fault(self):
         self.assertEqual(ctrl.pv_dead_string(None, 285), 0)
@@ -1200,8 +1200,8 @@ class TestPvFaultStep(unittest.TestCase):
         self.assertIsNone(since)                       # fout weg -> timer gewist
         t2 = self.t0 + timedelta(hours=3)
         since2, _, action2, _ = ctrl.pv_fault_step(267, 0, since, latched, t2)
-        self.assertEqual(since2, t2)                   # timer herstart vanaf t2, niet t0
-        self.assertIsNone(action2)                     # dus nog geen trigger
+        self.assertEqual(since2, t2)                   # timer restarts from t2, not t0
+        self.assertIsNone(action2)                     # so no trigger yet
 
 
 if __name__ == "__main__":

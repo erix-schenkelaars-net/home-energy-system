@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Standalone helper (raakt bestaande scripts niet aan).
+"""Standalone helper (does not touch existing scripts).
 
-Haalt de 15-minuten EPEX-prijzen (base_with_vat = spot + 21% BTW, excl.
-energiebelasting — zelfde bron als de optimizer) op via de bestaande
-EnergyZero public API, voor een datumbereik, en schrijft een CSV:
+Fetches the 15-minute EPEX prices (base_with_vat = spot + 21% VAT, excl. energy tax; the same
+source as the optimizer) from the EnergyZero public API for a date range and writes a CSV:
 
     datetime,markttarief_kwh
     2025-10-01 00:00,0.0834
     2025-10-01 00:15,0.0812
     ...
 
-Gebruik:
-    python3 fetch_quarter_prices_csv.py [START] [END] [UITVOER.csv]
-Defaults: START=2025-10-01, END=vandaag, UITVOER=quarter_prices.csv
-Tijd = lokale tijd Europe/Amsterdam (DST-correct), zoals in de DB.
+Usage:
+    python3 fetch_quarter_prices_csv.py [START] [END] [OUTPUT.csv]
+Defaults: START=2025-10-01, END=today, OUTPUT=quarter_prices.csv
+Time = local time Europe/Amsterdam (DST-correct), as in the DB.
 """
 import csv
 import sys
@@ -68,7 +67,7 @@ def main():
         except Exception as e:
             empty.append(f"{d} (fout: {e})")
             print(f"{d}  FOUT: {e}", flush=True)
-        time.sleep(0.3)          # wees vriendelijk voor de API
+        time.sleep(0.3)          # be kind to the API
         d += timedelta(days=1)
 
     rows.sort()

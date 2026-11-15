@@ -135,11 +135,11 @@ DB_NAME   = os.environ["DB_NAME"]
 DB_TABLE  = os.environ["DB_TABLE"]
 
 # ---------------- DEBUG TABLE ----------------
-# battery_debugging houdt de per-cel 5-min min/max celspanning bij (debug-only, geen
-# regel-consumer). Losgekoppeld van read_resol: read_seplos bezit z'n eigen 5-min-rij
-# via ts (UNIQUE, = energy.ts-bucket). De eerste write in een bucket doet een INSERT
-# (seed), elke volgende ~2s-write accumuleert de worst-case via ON DUPLICATE KEY UPDATE
-# met LEAST/GREATEST — geen COALESCE/sentinel/NULL-default nodig. Reset = nieuwe bucket.
+# battery_debugging keeps the per-cell 5-min min/max cell voltage (debug only, no control
+# consumer). Decoupled from read_resol: read_seplos owns its own 5-min row via ts (UNIQUE, = the
+# energy.ts bucket). The first write in a bucket does an INSERT (seed), every following ~2 s write
+# accumulates the worst case via ON DUPLICATE KEY UPDATE with LEAST/GREATEST -- no
+# COALESCE/sentinel/NULL default needed. Reset = a new bucket.
 DB_DEBUG_TABLE   = "battery_debugging"
 _DEBUG_CELL_COLS = [f"seplos_cel{n}_voltage_{k}_v"
                     for n in range(1, 17) for k in ("min", "max")]
@@ -688,22 +688,22 @@ def update_db(**v):
         )
         c = db.cursor()
 
-        # Diverse kolommen accumuleren de WORST-CASE over de 5-min DB-rij via
-        # LEAST/GREATEST, i.p.v. de 2s-momentopname te overschrijven — zo mist de
-        # grafiek de dips/pieken niet meer:
-        #   - laagste soc (diepste dip), vmin, temp_cell_min -> LEAST
-        #   - hoogste vmax, vdelta, temp_cell_max, temp_env/pow -> GREATEST
-        # De per-cel min/max celspanning staat NIET meer hier maar in battery_debugging
-        # (debug-only, losgekoppeld). De aggregaat vmin/vmax hier blijft consistent:
-        # MIN(cel*_min) in battery_debugging == seplos_cell_voltage_min_v op dezelfde ts.
+        # Several columns accumulate the WORST CASE over the 5-min DB row via LEAST/GREATEST,
+        # instead of overwriting with the 2 s snapshot -- so the chart no longer misses the
+        # dips/peaks:
+        #   - lowest soc (deepest dip), vmin, temp_cell_min -> LEAST
+        #   - highest vmax, vdelta, temp_cell_max, temp_env/pow -> GREATEST
+        # The per-cell min/max cell voltage is NO LONGER here but in battery_debugging (debug
+        # only, decoupled). The aggregate vmin/vmax here stays consistent:
+        # MIN(cell*_min) in battery_debugging == seplos_cell_voltage_min_v at the same ts.
         # Own 5-min ts-bucket (UNIQUE), same as battery_debugging below: the INSERT starts the
         # interval and the ON DUPLICATE branch accumulates into it until the bucket rolls. The
         # reset is now intrinsic to the new bucket -- it no longer depends on read_resol
         # inserting a row with NULL seplos columns, which silently failed whenever read_resol
         # missed a cycle. Temp-sentinels are -999 so negative ambient temps accumulate correctly.
-        # LET OP: seplos_soc_pct heeft column-default 0 (niet NULL), dus de accumulatie moet
-        # die 0 als "leeg" behandelen -> NULLIF(...,0), anders latcht LEAST de rij op 0.
-        # Een echte SOC van exact 0.0% is onbereikbaar (LP-floor 20% + LFP).
+        # NOTE: seplos_soc_pct has column default 0 (not NULL), so the accumulation must treat
+        # that 0 as "empty" -> NULLIF(...,0), else LEAST latches the row at 0.
+        # A real SOC of exactly 0.0% is unreachable (LP floor 20% + LFP).
         sql = f"""
         INSERT INTO {DB_TABLE} (ts,
             seplos_alarm_active, seplos_warning_active, seplos_voltage_v, seplos_current_a,
@@ -774,10 +774,10 @@ def update_db(**v):
         ))
         db.commit()
 
-        # --- battery_debugging: per-cel 5-min min/max celspanning ---------------------
-        # Eigen 5-min-rij op ts-bucket (UNIQUE), losgekoppeld van read_resol. Elke cel
-        # levert dezelfde 2s-waarde voor z'n _min_v én _max_v; ON DUPLICATE KEY UPDATE
-        # met LEAST/GREATEST accumuleert de worst-case tot de bucket rolt.
+        # --- battery_debugging: per-cell 5-min min/max cell voltage -------------------
+        # Its own 5-min row on the ts bucket (UNIQUE), decoupled from read_resol. Each cell gives
+        # the same 2 s value for its _min_v and _max_v; ON DUPLICATE KEY UPDATE with
+        # LEAST/GREATEST accumulates the worst case until the bucket rolls.
         now = datetime.now()
         ts_bucket = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
         cell_v = [round(mv / 1000.0, 3) for mv in v["cells"]]
@@ -817,10 +817,11 @@ def _get_current_lp_action() -> str | None:
 
 
 def read_sph_voltage():
-    """Nieuwste ONAFHANKELIJKE SPH-pakspanning uit de DB (door read_growatt geschreven, ~60 s
-    cadans). Voor de cross-check op een vdelta-event: is de Seplos-klemspanning betrouwbaar?
-    Baseline (2026-09-04) waren beide binnen 20 mV eens. Returnt (V, bron-ts) of (None, None).
-    Best-effort — mag de BMS-lus NOOIT laten crashen, dus alles in try/except."""
+    """Newest SPH pack voltage from the DB (written by read_growatt, ~60 s cadence). For the
+    cross-check on a vdelta event: is the Seplos terminal voltage reliable? Baseline (2026-09-04):
+    both agreed within 20 mV. Returns (V, source ts) or (None, None). Best effort -- must NEVER
+    crash the BMS loop, so everything is in try/except. (NB 2026-11-09: the SPH voltage is the
+    BMS value over CAN, so not truly independent.)"""
     try:
         db = mysql.connector.connect(host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
                                      db=DB_NAME, connection_timeout=3)
@@ -866,7 +867,7 @@ def main():
         LP_ACTION_INTERVAL   = 30.0   # seconds between battery_schedule queries
         last_vdelta_taper_active = False
         last_vmin_taper_active   = False
-        sph_logged_this_event    = False   # SPH-cross-check 1x per limiet-event loggen, niet elke poll
+        sph_logged_this_event    = False   # log the SPH cross-check once per limit event, not every poll
         vdelta_taper_count  = 0   # consecutive readings >= VDELTA_TAPER_START_MV
         vmin_taper_count    = 0   # consecutive readings <= VMIN_TAPER_START_MV
         TAPER_DEBOUNCE      = 5   # readings (~10 s) before taper + alert activate
@@ -1104,20 +1105,21 @@ def main():
             dbg(2, DEBUG_MAIN, "MAIN", f"active FET states     {active_FET_states}")
             dbg(2, DEBUG_MAIN, "MAIN", f"active hard faults    {active_hard_faults}")
             if charge_limit == MAX_CHARGE_LIMIT and discharge_limit == MAX_DISCHARGE_LIMIT:
-                sph_logged_this_event = False          # limieten terug op normaal -> volgend event mag weer loggen
+                sph_logged_this_event = False          # limits back to normal -> the next event may log again
             if charge_limit != MAX_CHARGE_LIMIT or discharge_limit != MAX_DISCHARGE_LIMIT:
                 dbg(1, DEBUG_MAIN, "MAIN", f"⛔ cel#{vmin_idx}={vmin} mV, cel#{vmax_idx}={vmax} mV, vdelta {vmax-vmin} mV, tmax {tmax} °C, soc {soc} %")
                 dbg(1, DEBUG_MAIN, "MAIN", f"⛔ charge_limit_A        {charge_limit} A discharge_limit_A {-discharge_limit} A")
-                # BURST: alle 16 cellen + onafhankelijke klemspanning gelijktijdig, om te scheiden of
-                # een bank-inzakking (bv. cel10-16, 2026-09-02 21:07) ECHT is of een sense-artefact.
-                # gap≈0 -> celsom == klem -> spanning zakt echt; gap≈+0,85V -> meting leest laag, klem niet.
+                # BURST: all 16 cells + the independent terminal voltage at once, to tell whether a
+                # bank sag (e.g. cells 10-16, 2026-09-02 21:07) is REAL or a sense artefact.
+                # gap ~0 -> cell sum == terminal -> the voltage really sags; gap ~+0.85 V -> the
+                # measurement reads low, the terminal does not.
                 _csum = sum(cell_v) / 1000.0
                 dbg(1, DEBUG_MAIN, "MAIN",
                     f"🔬 BURST cells_mv={cell_v} sum={_csum:.2f}V term={pack_voltage:.2f}V "
                     f"gap={pack_voltage - _csum:+.3f}V I={pack_current:.1f}A")
-                # Cross-check tegen het TWEEDE, onafhankelijke apparaat (Growatt/SPH). 1x per event,
-                # en pas NA de beschermings-write hierboven, zodat de DB-query de taper nooit vertraagt.
-                # sph≈term -> twee apparaten eens, Seplos-klem betrouwbaar als BURST-referentie.
+                # Cross-check against the SECOND device (Growatt/SPH). Once per event, and only AFTER
+                # the protection write above, so the DB query never delays the taper.
+                # sph ~ term -> two devices agree, the Seplos terminal is reliable as BURST reference.
                 if not sph_logged_this_event:
                     sph_logged_this_event = True
                     _sphv, _sphts = read_sph_voltage()

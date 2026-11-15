@@ -2,22 +2,22 @@ services:
   calibrate_seplos:
     build: .
     container_name: calibrate_seplos
-    # profiles => start NIET mee met `docker compose up` / rebuild-all.
-    # Handmatig draaien:
-    #   read-only DB-monitor (stap a):  docker compose run --rm calibrate_seplos
-    #   directe bus-uitlezing (stap b):  docker compose run --rm -e CAL_MODE=bus calibrate_seplos
-    #   (NB: `CAL_MODE=bus docker compose run ...` werkt NIET — een shell-prefix bereikt de
-    #    container niet; CAL_MODE staat niet in `environment:`, dus geef hem mee met `-e`.)
-    #   (stap b VEREIST dat read_seplos gestopt is: enige RS485-bus-gebruiker.)
+    # profiles => does NOT start with `docker compose up` / rebuild-all.
+    # Run by hand:
+    #   read-only DB monitor (step a):  docker compose run --rm calibrate_seplos
+    #   direct bus readout (step b):    docker compose run --rm -e CAL_MODE=bus calibrate_seplos
+    #   (NB: `CAL_MODE=bus docker compose run ...` does NOT work: a shell prefix does not reach the
+    #    container; CAL_MODE is not in `environment:`, so pass it with `-e`.)
+    #   (step b REQUIRES read_seplos to be stopped: it is the only RS485 bus user.)
     profiles: ["calibrate"]
     network_mode: "host"
-    privileged: true                  # nodig voor /dev/tty_seplos in bus-mode (ongebruikt in db-mode)
+    privileged: true                  # needed for /dev/tty_seplos in bus mode (unused in db mode)
     environment:
       - TZ=Europe/Amsterdam
     env_file:
       - ../.env
     volumes:
-      - .:/app                        # bind-mount: code-edit werkt op `run` (geen build nodig)
+      - .:/app                        # bind mount: a code edit applies on `run` (no build needed)
       - /dev:/dev                     # RS485-device (bus-mode)
       - ./logs:/logs
       - ../common:/app/common:ro

@@ -2,12 +2,12 @@
 """
 backfill_cost_dryrun.py
 =======================
-DRY-RUN: herbereken cost_elec_var_eur voor een gegeven datum
-vanuit de al aanwezige cumulatieve P1-teller kolommen.
+DRY RUN: recalculate cost_elec_var_eur for a given date from the cumulative P1 meter
+columns already present.
 
-Geen schrijfacties — toont alleen verschil huidige vs herberekende waarde.
+No writes: only shows the difference between the current and the recalculated value.
 
-Gebruik:
+Usage:
   python3 backfill_cost_dryrun.py [YYYY-MM-DD]   (default: 2026-06-19)
 """
 
@@ -56,7 +56,7 @@ def main():
 
     for i, row in enumerate(rows):
         if i == 0:
-            continue   # eerste rij: geen vorige rij beschikbaar
+            continue   # first row: no previous row available
 
         prev = rows[i - 1]
         curr = row
@@ -65,7 +65,7 @@ def main():
         d_imp = max(0.0, curr["cum_imp"] - prev["cum_imp"])
         d_exp = max(0.0, curr["cum_exp"] - prev["cum_exp"])
 
-        # Sla rijen over waar teller niet beschikbaar was
+        # Skip rows where the meter was not available
         if curr["cum_imp"] is None or prev["cum_imp"] is None:
             continue
 

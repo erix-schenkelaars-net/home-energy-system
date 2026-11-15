@@ -1,7 +1,7 @@
-"""Pub-test voor sph_standby.py — de standby-bevestigingslogica.
+"""Pub test for sph_standby.py: the standby confirmation logic.
 
-Draait op de host: control_growatt_quarter (pymodbus e.d.) wordt gestubt vóór de import,
-zodat we de pure standby_ok()-beslissing testen zonder hardware.
+Runs on the host: control_growatt_quarter (pymodbus etc.) is stubbed before the import, so we test
+the pure standby_ok() decision without hardware.
 """
 import sys
 import unittest
@@ -14,18 +14,18 @@ import sph_standby as s  # noqa: E402
 
 class TestStandbyOk(unittest.TestCase):
     def test_confirms_only_when_command_AND_measured_are_idle(self):
-        # commando goed (battery-first, AC uit) + ECHT gemeten ~0 -> bevestigd
+        # command right (battery first, AC off) + REALLY measured ~0 -> confirmed
         self.assertTrue(s.standby_ok(prio=1, ac=0, power_w=5.0, current_a=0.1))
         self.assertTrue(s.standby_ok(1, 0, -80.0, -1.5))
 
     def test_rejects_when_sph_still_active_despite_command(self):
-        # DIT is het punt: commando lijkt goed, maar de SPH laadt/ontlaadt nog écht -> NIET ok
-        self.assertFalse(s.standby_ok(1, 0, 2990.0, 56.0))    # laadt nog
-        self.assertFalse(s.standby_ok(1, 0, -1850.0, -35.0))  # ontlaadt nog
+        # THIS is the point: the command looks right, but the SPH really still charges/discharges -> NOT ok
+        self.assertFalse(s.standby_ok(1, 0, 2990.0, 56.0))    # still charging
+        self.assertFalse(s.standby_ok(1, 0, -1850.0, -35.0))  # still discharging
 
     def test_rejects_wrong_command_state(self):
         self.assertFalse(s.standby_ok(0, 0, 0.0, 0.0))        # load-first i.p.v. battery-first
-        self.assertFalse(s.standby_ok(1, 1, 0.0, 0.0))        # AC-charge staat aan
+        self.assertFalse(s.standby_ok(1, 1, 0.0, 0.0))        # AC charge is on
 
     def test_threshold_edges(self):
         self.assertTrue(s.standby_ok(1, 0, s.IDLE_W, s.IDLE_A))

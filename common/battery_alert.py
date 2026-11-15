@@ -1,5 +1,5 @@
 """
-battery_alert.py — shared alert helper for read_seplos and control_growatt.
+battery_alert.py — shared alert helper for read_seplos, control_growatt and wp_control.
 
 Every trigger and clear event gets its own row in alert_latch so the
 full history is preserved. WordPress banner shows all unacknowledged rows.
@@ -7,7 +7,7 @@ full history is preserved. WordPress banner shows all unacknowledged rows.
 Usage:
     from common.battery_alert import alert_trigger, alert_clear
     alert_trigger('vdelta_taper', 'Vdelta 28 mV @ SOC 19%')
-    alert_clear(  'vdelta_taper', 'Vdelta terug op 12 mV')
+    alert_clear(  'vdelta_taper', 'Vdelta terug op 12 mV')   # messages are user-facing: Dutch
 
 DB credentials are read from env vars (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME).
 """
@@ -78,12 +78,12 @@ def _mqtt(active: bool, alert_key: str, message: str) -> None:
 
 
 def alert_active(alert_key: str) -> bool:
-    """Is deze alert nu actief? Leest de nieuwste latch-rij voor de key (active 1/0).
+    """Is this alert active now? Reads the newest latch row for the key (active 1/0).
 
-    De lees-kant van dit gedeelde kanaal: read_seplos zet 'vdelta_taper' aan/uit via
-    alert_trigger/alert_clear, control_growatt peilt hier of er een taper loopt om zijn
-    onafhankelijke SPH-pakspanning tijdens het event te samplen. Best-effort -> False bij
-    een DB-fout: faalt veilig (geen burst i.p.v. een crash in de inverterbesturing)."""
+    The read side of this shared channel: read_seplos sets 'vdelta_taper' on/off via
+    alert_trigger/alert_clear, and control_growatt polls here whether a taper is running so it can
+    sample its independent SPH pack voltage during the event. Best effort -> False on a DB error:
+    fails safe (no burst rather than a crash in the inverter control)."""
     try:
         import mysql.connector
         db = mysql.connector.connect(

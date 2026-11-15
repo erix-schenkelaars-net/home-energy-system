@@ -31,7 +31,7 @@ import time
 from datetime import datetime
 import pytz
 
-# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+# add both the script dir and its parent so the import works in both places (tests included).
 for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
     if _p not in sys.path:
         sys.path.insert(0, _p)

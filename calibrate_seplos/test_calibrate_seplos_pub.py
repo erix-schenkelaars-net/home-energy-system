@@ -1,7 +1,7 @@
-"""Pub-tests voor calibrate_seplos (STAP a). Draaien op de host: geen DB, geen bus.
+"""Pub tests for calibrate_seplos (STEP a). Run on the host: no DB, no bus.
 
-Conform repo-conventie: heavy/device-imports met MagicMock stubben VÓÓR de import,
-env-vars met neutrale waarden zetten, en de DB-verbinding mocken (nooit echt schrijven).
+Per repo convention: stub heavy/device imports with MagicMock BEFORE the import, set env vars to
+neutral values, and mock the DB connection (never really write).
 """
 import os
 import sys
@@ -58,18 +58,18 @@ class TestBalanceDone(unittest.TestCase):
     def test_needs_tight_spread_and_zero_current(self):
         self.assertTrue(cal.balance_done(5, 0.5))
         self.assertTrue(cal.balance_done(8, -1.0))
-        self.assertFalse(cal.balance_done(20, 0.5))    # spreiding te groot
-        self.assertFalse(cal.balance_done(5, 10.0))    # nog stroom
+        self.assertFalse(cal.balance_done(20, 0.5))    # spread too large
+        self.assertFalse(cal.balance_done(5, 10.0))    # still current
         self.assertFalse(cal.balance_done(None, 0.0))
 
 
 class TestPhase(unittest.TestCase):
     def test_phases(self):
         self.assertEqual(cal.phase_of(None, None, None), "unknown")
-        self.assertEqual(cal.phase_of(3200, 15.0, 30), "charge")     # laden, onder balancer-start
+        self.assertEqual(cal.phase_of(3200, 15.0, 30), "charge")     # charging, below balancer start
         self.assertEqual(cal.phase_of(3200, 0.0, 30), "idle")
         self.assertEqual(cal.phase_of(3550, 5.0, 40), "absorb")      # boven balancer-start
-        self.assertEqual(cal.phase_of(3650, 0.5, 5), "done")         # spreiding klein + stroom ~0
+        self.assertEqual(cal.phase_of(3650, 0.5, 5), "done")         # small spread + current ~0
 
 
 class TestWriteRowShape(unittest.TestCase):
@@ -89,12 +89,12 @@ class TestWriteRowShape(unittest.TestCase):
         n_cols = sql.split("(", 1)[1].split(")", 1)[0].count(",") + 1
         n_ph = sql.count("%s")
         self.assertEqual(n_cols, n_ph)          # kolommen == placeholders
-        self.assertEqual(len(vals), n_ph)       # waarden == placeholders
+        self.assertEqual(len(vals), n_ph)       # values == placeholders
         conn.commit.assert_called_once()
 
 
 def _fake_frames():
-    """Neppe pia/pib/pic zoals de Seplos ze zou leveren."""
+    """Fake pia/pib/pic as the Seplos would deliver them."""
     pia = [0] * 18
     pia[0], pia[1], pia[5] = 5340, 1230, 900        # 53.40 V, +12.30 A, 90.0 %
     pib = [0] * 26
@@ -125,14 +125,14 @@ class TestSeplosBusParse(unittest.TestCase):
     def test_negative_current_is_discharge(self):
         import seplos_bus
         pia, pib, pic = _fake_frames()
-        pia[1] = 65536 - 1850                            # -18.50 A (ontladen)
+        pia[1] = 65536 - 1850                            # -18.50 A (discharging)
         p = seplos_bus.parse_pack(pia, pib, pic)
         self.assertEqual(p["current"], -18.5)
 
     def test_bms_vhigh_alarm_bits(self):
         import seplos_bus
         pia, pib, pic = _fake_frames()
-        self.assertEqual(seplos_bus.parse_pack(pia, pib, pic)["vhigh_cells"], [])   # default geen alarm
+        self.assertEqual(seplos_bus.parse_pack(pia, pib, pic)["vhigh_cells"], [])   # default no alarm
         pic = bytearray(pic)
         pic[5] = 0x04                                    # bit 2 -> cel 3
         pic[6] = 0x01                                    # bit 0 -> cel 9

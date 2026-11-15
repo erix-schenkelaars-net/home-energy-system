@@ -1,11 +1,11 @@
-"""Meet de WP-verwarmings-forecast-bias vs werkelijk, met zon + temp ernaast -- om de
-gain-correctie (voorstel #2) op te ijken.
+"""Measure the heat pump heating forecast bias vs actual, with sun + temperature alongside -- to
+calibrate the gain correction (proposal #2).
 
-Reconstrueert het LIVE HP-model (schedule-aware setpoint, 05-18-venster) uit
-battery_optimizer_LP_quarter, zodat de forecast hier precies is wat de optimizer reserveert.
-Zet de dag-forecast-WP naast het gemeten Sparrow-verbruik, en lijnt de bias uit met clear-sky-PV
-(zonne-gain-proxy, panel-onafhankelijk) + buitentemp. Draai 'm over een paar dagen; zodra er genoeg
-data is regresseren we  bias ~ a + b*clearsky + c*temp  -> de gain-term.
+Rebuilds the LIVE heat pump model (schedule-aware setpoint, 05-18 window) from
+battery_optimizer_LP_quarter, so the forecast here is exactly what the optimizer reserves. Puts the
+day forecast for the heat pump next to the measured Sparrow consumption and lines the bias up with
+clear-sky PV (solar gain proxy, independent of the panels) + outside temperature. Run it over a few
+days; once there is enough data we regress  bias ~ a + b*clearsky + c*temp  -> the gain term.
 
     docker exec battery_optimizer python3 /app/wp_forecast_bias.py [--start YYYY-MM-DD]
 """
@@ -21,7 +21,7 @@ SLOT_H = 0.25
 
 
 def _db():
-    # container heeft de env al; val terug op ../.env voor een host-run
+    # the container already has the env; fall back to ../.env for a run on the host
     host = os.getenv("DB_HOST")
     if not host:
         for line in open("/app/../.env"):
@@ -40,7 +40,7 @@ def _db():
 
 
 def hp_total_kwh(forecast_temp: float, hour: int) -> float:
-    """Gemodelleerde TOTALE WP-stroom voor dit slot (kWh), = _hp_kwh(forecast, geplande setpoint)."""
+    """Modelled TOTAL heat pump electricity for this slot (kWh), = _hp_kwh(forecast, planned setpoint)."""
     if hour not in opt.HP_ACTIVE_HOURS:
         return 0.0
     sp = opt.HP_SETPOINT_RAMP.get(hour, opt.HP_SETPOINT_DAY_C)
@@ -65,7 +65,7 @@ def main() -> None:
     args = ap.parse_args()
     conn = _db(); cur = conn.cursor()
 
-    # forecast WP + zon + temp per dag uit de uitgevoerde (applied) slots
+    # heat pump forecast + sun + temperature per day from the applied slots
     cur.execute("""SELECT DATE(slot_dt), slot_dt, forecast_temp_c, pv_clearsky_kwh, cloud_cover_pct
                    FROM battery_schedule WHERE applied=1 AND slot_dt>=%s ORDER BY slot_dt""",
                 (args.start,))
@@ -81,15 +81,16 @@ def main() -> None:
         if cc is not None and 8 <= sdt.hour <= 17:
             clouds.setdefault(d, []).append(float(cc))
 
-    # werkelijk WP per dag (meterdelta + power-integraal)
+    # actual heat pump per day (meter delta + power integral)
     cur.execute("""SELECT DATE(ts), MAX(sparrow_electricity_kwh)-MIN(sparrow_electricity_kwh),
                    SUM(sparrow_input_power_w)*5/60/1000
                    FROM energy WHERE ts>=%s GROUP BY 1""", (args.start,))
     act = {str(d): (float(m or 0), float(p or 0)) for d, m, p in cur.fetchall()}
 
-    # Ochtend-buffer-warmte (05:00-06:30, start van de stook): bulk boven ~30 C die de lus mee kan
-    # nemen -> verdringt WP-stroom. 1000 L -> 1.163 kWh/K. Vangt het vertraagde zon->buffer->ochtend-
-    # effect dat de user noemt. buffer-lagen = resol_temp_6(top)/_2/_3/_4; T_FLOOR ~ bruikbare ondergrens.
+    # Morning buffer heat (05:00-06:30, start of heating): the bulk above ~30 C that the loop can take
+    # along -> displaces heat pump electricity. 1000 L -> 1.163 kWh/K. Captures the delayed
+    # sun->buffer->morning effect the user mentioned. Buffer layers = resol_temp_6 (top)/_2/_3/_4;
+    # T_FLOOR ~ the usable lower limit.
     TANK_KWH_PER_K, T_FLOOR = 1.163, 30.0
     cur.execute("""SELECT DATE(ts),
                    AVG((resol_temp_6_c+resol_temp_2_c+resol_temp_3_c+resol_temp_4_c)/4)

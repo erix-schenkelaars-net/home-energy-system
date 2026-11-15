@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""calibrate_seplos — read-only kalibratie-monitor (STAP a).
+"""calibrate_seplos — read-only calibration monitor (STEP a).
 
-Bedoeld voor de maandelijkse top-balance-kalibratie van het 16S EVE-MB31-pak met een
-externe Wanptek-lader parallel aan de SPH5000. Deze stap (a) draait NAAST read_seplos en
-leest **alleen de database** (die read_seplos al vult) — dus GEEN RS485-bus, geen contentie,
-geen wijziging aan bestaande code. Zo veilig te testen terwijl alles normaal draait.
+For the monthly top-balance calibration of the 16S EVE MB31 pack with an external Wanptek
+charger in parallel with the SPH5000. This step (a) runs ALONGSIDE read_seplos and reads **only
+the database** (which read_seplos already fills) -- so NO RS485 bus, no contention, no change to
+existing code. Safe to test while everything runs normally.
 
-Bewaakt:
-  - cel-max-spanning       -> kalibratie-guards (MB31 3.65V eind-lading, 3.80V BMS-lock;
-                              Seplos cel-OVP stopt laden @3650, balancer start @3400 / Δ50mV),
-  - SPH die ten onrechte meedoet (sph_bat_act_charge_discharge_power_w moet ~0 in standby),
-  - balans (cel-delta) + pack-stroom  -> fase-inschatting en "klaar"-detectie,
-en logt een tijdreeks naar `calibration_log` met een **adaptieve cadans** die versnelt naar
-de top toe (op cel-max, niet op de onbetrouwbare SoC).
+Watches:
+  - max cell voltage       -> calibration guards (MB31 3.65 V end of charge, 3.80 V BMS lock;
+                              Seplos cell OVP stops charging at 3650, balancer starts at 3400 / d50 mV),
+  - the SPH wrongly taking part (sph_bat_act_charge_discharge_power_w must be ~0 in standby),
+  - balance (cell delta) + pack current  -> phase estimate and "done" detection,
+and logs a time series to `calibration_log` with an **adaptive cadence** that speeds up towards
+the top (on max cell voltage, not on the unreliable SoC).
 
-STAP a is read-only t.o.v. het pak: schrijft uitsluitend naar de eigen `calibration_log`.
-De echte hoge-cadans bus-uitlezing (per-NTC-temps, balancer-bits, 1 s) komt in STAP b.
+STEP a is read-only towards the pack: it writes only to its own `calibration_log`. The real
+high-cadence bus readout (per-NTC temperatures, balancer bits, 1 s) comes in STEP b.
 """
 import os
 import sys
@@ -28,31 +28,31 @@ import mysql.connector
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except Exception:  # pragma: no cover - dotenv wordt in de test gestubt
+except Exception:  # pragma: no cover - dotenv is stubbed in the test
     pass
 
 log = logging.getLogger("calibrate_seplos")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# --- Veiligheids-/kalibratie-constantes (EVE-MB31-cel + Seplos 16S-BMS-spec) ------------
-# MB31: end-of-charge 3.65 V, BMS-lock 3.80 V. Seplos: cel-OVP stopt laden @3650 mV,
-# passieve balancer start bij cel > 3400 mV én spreiding > 50 mV, stopt < 30 mV.
+# --- Safety/calibration constants (EVE MB31 cell + Seplos 16S BMS spec) ---------------
+# MB31: end of charge 3.65 V, BMS lock 3.80 V. Seplos: cell OVP stops charging at 3650 mV,
+# the passive balancer starts at cell > 3400 mV and spread > 50 mV, stops < 30 mV.
 CELL_TARGET_MV         = int(os.environ.get("CAL_CELL_TARGET_MV", "3600"))    # hold-/laaddoel per cel (CV 57,6V = 3,60V)
 CELL_WARN_MV           = int(os.environ.get("CAL_CELL_WARN_MV", "3620"))      # ONDER BMS-OVP(3650): vroege waarschuwing
 CELL_HARDSTOP_MV       = int(os.environ.get("CAL_CELL_HARDSTOP_MV", "3645"))  # nét onder BMS-OVP(3650): cut de Wanptek vóór de BMS
 BALANCE_START_MV       = int(os.environ.get("CAL_BALANCE_START_MV", "3400"))  # Seplos balancer-startspanning
 BALANCE_DONE_DELTA_MV  = int(os.environ.get("CAL_BALANCE_DONE_DELTA_MV", "8"))
 BALANCE_DONE_CURRENT_A = float(os.environ.get("CAL_BALANCE_DONE_CURRENT_A", "2.0"))
-SPH_IDLE_W             = float(os.environ.get("CAL_SPH_IDLE_W", "100"))       # |sph power| hierboven = SPH doet mee
-DB_POLL_FLOOR_S        = int(os.environ.get("CAL_DB_POLL_FLOOR_S", "30"))     # stap a: DB ververst ~5 min; niet sneller
+SPH_IDLE_W             = float(os.environ.get("CAL_SPH_IDLE_W", "100"))       # |sph power| above this = the SPH takes part
+DB_POLL_FLOOR_S        = int(os.environ.get("CAL_DB_POLL_FLOOR_S", "30"))     # step a: the DB refreshes every ~5 min; no faster
 
 
-# --- Pure beslis-functies (unit-getest; geen DB/bus nodig) -----------------------------
+# --- Pure decision functions (unit tested; no DB/bus needed) --------------------------
 def cadence_seconds(cell_max_mv):
-    """Adaptieve log-cadans o.b.v. de hoogste celspanning: sneller naar de top toe.
+    """Adaptive log cadence based on the highest cell voltage: faster towards the top.
 
-    In stap (a) begrenst DB_POLL_FLOOR_S dit alsnog (de DB ververst maar ~5-minutelijks);
-    de functie geeft de *gewenste* cadans die stap (b) op de bus wél kan halen.
+    In step (a) DB_POLL_FLOOR_S still limits this (the DB only refreshes every ~5 minutes); the
+    function gives the *desired* cadence that step (b) can reach on the bus.
     """
     if cell_max_mv is None:
         return 60
@@ -75,25 +75,25 @@ def cell_guard(cell_max_mv):
 
 
 def sph_interference(sph_power_w):
-    """True als de SPH ten onrechte laadt/ontlaadt (moet ~0 W zijn in standby)."""
+    """True when the SPH wrongly charges/discharges (must be ~0 W in standby)."""
     if sph_power_w is None:
         return False
     return abs(sph_power_w) > SPH_IDLE_W
 
 
 def balance_done(cell_delta_mv, current_a):
-    """Top-balance klaar: spreiding klein (<=drempel) én stroom ~0."""
+    """Top balance done: small spread (<= threshold) and current ~0."""
     if cell_delta_mv is None or current_a is None:
         return False
     return cell_delta_mv <= BALANCE_DONE_DELTA_MV and abs(current_a) <= BALANCE_DONE_CURRENT_A
 
 
 def phase_of(cell_max_mv, current_a, cell_delta_mv):
-    """Ruwe fase-inschatting voor het log (stap a, uit DB afgeleid)."""
+    """Rough phase estimate for the log (step a, derived from the DB)."""
     if cell_max_mv is None:
         return "unknown"
     if cell_max_mv >= BALANCE_START_MV and balance_done(cell_delta_mv, current_a):
-        return "done"                         # klaar ALLEEN aan de top (niet bij lage-SoC-rust)
+        return "done"                         # done ONLY at the top (not at low-SoC rest)
     if cell_max_mv >= BALANCE_START_MV:
         return "absorb"                       # cellen boven balancer-start -> balanceer-zone
     if current_a is not None and current_a > 1.0:
@@ -101,7 +101,7 @@ def phase_of(cell_max_mv, current_a, cell_delta_mv):
     return "idle"
 
 
-# --- DB-laag ---------------------------------------------------------------------------
+# --- DB layer --------------------------------------------------------------------------
 _CELLS = [f"seplos_cel{i}_voltage_min_v" for i in range(1, 17)]
 
 
@@ -113,7 +113,7 @@ def db_connect():
 
 
 def ensure_calibration_log(conn):
-    """Maakt de eigen tabel aan (CREATE IF NOT EXISTS — conform repo-conventie)."""
+    """Creates its own table (CREATE IF NOT EXISTS, per repo convention)."""
     cells_ddl = ",\n            ".join(f"cel{i}_mv INT" for i in range(1, 17))
     cur = conn.cursor()
     cur.execute(f"""
@@ -143,7 +143,7 @@ def ensure_calibration_log(conn):
             INDEX (ts)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """)
-    # Kolom toevoegen aan een reeds bestaande tabel (CREATE IF NOT EXISTS voegt geen kolommen toe).
+    # Add the column to an already existing table (CREATE IF NOT EXISTS does not add columns).
     try:
         cur.execute("ALTER TABLE calibration_log ADD COLUMN bms_vhigh VARCHAR(40) AFTER balancing_bits")
     except Exception:
@@ -153,7 +153,7 @@ def ensure_calibration_log(conn):
 
 
 def read_snapshot(conn):
-    """Nieuwste momentopname uit `energy` + de 16 cellen uit `battery_debugging`."""
+    """Newest snapshot from `energy` + the 16 cells from `battery_debugging`."""
     cur = conn.cursor(dictionary=True)
     cur.execute("""
         SELECT ts, seplos_cell_voltage_min_v, seplos_cell_voltage_max_v,
@@ -208,7 +208,7 @@ def write_log_row(conn, session_id, snap, phase, guard, note, source="db"):
 
 
 def read_latest_sph_power(conn):
-    """Nieuwste SPH-vermogen uit de DB (read_growatt vult dit) voor de interferentie-wachter."""
+    """Newest SPH power from the DB (read_growatt fills it) for the interference watch."""
     cur = conn.cursor()
     cur.execute("SELECT sph_bat_act_charge_discharge_power_w FROM energy "
                 "WHERE sph_bat_act_charge_discharge_power_w IS NOT NULL ORDER BY ts DESC LIMIT 1")
@@ -218,7 +218,7 @@ def read_latest_sph_power(conn):
 
 
 def snap_from_bus(pack, sph_power_w, ts=None):
-    """Normaliseer een seplos_bus-uitlezing naar de calibration_log-snapshot-vorm (+ balancer-bits)."""
+    """Normalise a seplos_bus readout to the calibration_log snapshot shape (+ balancer bits)."""
     valid = [c for c in pack["cells"] if c and c > 0]
     temps = [t for t in pack["cell_temps"] if t is not None]
     bits = f"lo=0x{pack['eq_lo']:02X} hi=0x{pack['eq_hi']:02X}"
@@ -244,8 +244,8 @@ def snap_from_bus(pack, sph_power_w, ts=None):
 
 
 def run_bus_mode():
-    """STAP b: directe RS485-uitlezing op hoge cadans. Vereist dat read_seplos GESTOPT is."""
-    import seplos_bus  # lazy: db-mode heeft pyserial niet nodig
+    """STEP b: direct RS485 readout at high cadence. Requires read_seplos to be STOPPED."""
+    import seplos_bus  # lazy: db mode does not need pyserial
     session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     log.info("calibrate_seplos STAP b (BUS-monitor, hoge cadans) — sessie %s", session_id)
     log.warning("VEREIST: read_seplos GESTOPT (enige bus-gebruiker) + SPH in standby.")
@@ -318,7 +318,7 @@ def run_db_mode():
             sph_bad = sph_interference(snap["sph_power_w"])
             note = "SPH-INTERFERENTIE" if sph_bad else ""
 
-            if snap["ts"] != last_ts:                 # alleen loggen bij een verse DB-rij
+            if snap["ts"] != last_ts:                 # only log on a fresh DB row
                 write_log_row(conn, session_id, snap, phase, guard, note)
                 last_ts = snap["ts"]
 
@@ -338,7 +338,7 @@ def run_db_mode():
         except KeyboardInterrupt:
             log.info("gestopt (sessie %s)", session_id)
             break
-        except Exception as e:  # nooit stilvallen op een transient DB-hik
+        except Exception as e:  # never stall on a transient DB hiccup
             log.warning("monitor-lus fout: %s", e)
             time.sleep(DB_POLL_FLOOR_S)
     conn.close()

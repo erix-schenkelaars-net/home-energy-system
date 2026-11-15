@@ -148,3 +148,15 @@ Reading the newest row is fine — it is writing to it that is the bug.
 
 No coordinates, no hostnames, no keys, no personal data — in code, tests, docs or screenshots.
 Real values come from `.env` (git-ignored); defaults in code are generic. Check before pushing.
+
+## Language: English
+
+Commit messages, code comments, docstrings, READMEs and `schema.sql` are written in English (decided
+2026-11-15). The repo is public and most readers do not read Dutch. Older commit messages stay as they
+are: rewriting pushed history is not worth broken links.
+
+Two exceptions, on purpose:
+- **Log text** stays as it is for now. It is runtime output that is grepped (`ontdooi-oploop`,
+  `[SCHADUW ...]`, `MELDING`), and READMEs refer to it; changing it is a separate, deliberate step.
+- **User-facing text** (WordPress pages, HA entity names, alert messages) is in Dutch, because that is
+  who reads it.

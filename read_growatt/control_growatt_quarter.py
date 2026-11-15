@@ -188,14 +188,14 @@ MQTT_PASSWORD      = os.environ.get("MQTT_PASSWORD", "")
 RELAY_TOPIC        = "zigbee2mqtt/PV MHCOZY 4 channel relais/set"  # configurable: Zigbee relay for PV contactors
 PV_CURTAIL_MIN_KWH = 0.05   # threshold below which curtailment is ignored
 
-# --- PV-string-foutalarm (puur op SPANNING, niet vermogen) -------------------
-# Eén string produceert (> PV_FAULT_LIVE_V) terwijl de ander "echt 0 V" geeft
-# (< PV_FAULT_DEAD_V = open circuit, bv. losgeschakelde DC/MC4/zekering) gedurende
-# PV_FAULT_HOLD_S onafgebroken → latch in alert_latch → WordPress-banner.
-# De 1-uurs hold filtert dag/nacht- en dageraad-ruis (dan is één string even laag).
-PV_FAULT_LIVE_V  = 100.0    # boven deze spanning telt een string als "producerend"
-PV_FAULT_DEAD_V  = 5.0      # onder deze spanning telt een string als "dood" (open)
-PV_FAULT_HOLD_S  = 3600     # pas alarmeren na 1 uur aangehouden fout
+# --- PV string fault alarm (purely on VOLTAGE, not power) ---------------------
+# One string produces (> PV_FAULT_LIVE_V) while the other gives "really 0 V" (< PV_FAULT_DEAD_V =
+# open circuit, e.g. a disconnected DC switch/MC4/fuse) for PV_FAULT_HOLD_S without a break ->
+# latch in alert_latch -> WordPress banner. The 1-hour hold filters day/night and dawn noise (then
+# one string is briefly low).
+PV_FAULT_LIVE_V  = 100.0    # above this voltage a string counts as "producing"
+PV_FAULT_DEAD_V  = 5.0      # below this voltage a string counts as "dead" (open)
+PV_FAULT_HOLD_S  = 3600     # only alarm after the fault has held for 1 hour
 
 PVO_COUNTER       = 0
 soc_glob          = 50
@@ -561,15 +561,15 @@ def read_register(client, reg: Register):
 
 
 SPH_BURST_POLL_S   = 3     # hoe vaak de vdelta_taper-latch peilen in de sleep
-SPH_BURST_SAMPLE_S = 2     # samplinginterval van de SPH-pakspanning tijdens een taper
-SPH_BURST_CAP_S    = 180   # veiligheidscap: max burstduur als de latch blijft hangen
+SPH_BURST_SAMPLE_S = 2     # sampling interval of the SPH pack voltage during a taper
+SPH_BURST_CAP_S    = 180   # safety cap: max burst duration if the latch stays stuck
 
 def sleep_with_sph_burst(client, seconds):
-    """Slaap `seconds`, maar peil elke ~3 s de vdelta_taper-latch. Zolang die actief is,
-    lees ALLEEN REG_Battery_voltage elke ~2 s en log 'SPH-BURST' -- read-only, geen inverter-
-    writes, geen control. Legt de ONAFHANKELIJKE SPH-pakspanning vast tijdens een Seplos-taper,
-    naast de read_seplos-BURST (op tijdstip te vergelijken in de logs). Cap tegen een blijvende
-    latch. Best-effort: mag de inverterlus nooit breken."""
+    """Sleep `seconds`, but poll the vdelta_taper latch every ~3 s. While it is active, read ONLY
+    REG_Battery_voltage every ~2 s and log 'SPH-BURST' -- read only, no inverter writes, no control.
+    Records the SPH pack voltage during a Seplos taper, next to the read_seplos BURST (to compare by
+    timestamp in the logs). (NB 2026-11-09: the SPH voltage is the BMS value over CAN, so not truly
+    independent.) Capped against a stuck latch. Best effort: must never break the inverter loop."""
     end = time.time() + seconds
     while time.time() < end:
         try:
@@ -699,12 +699,12 @@ def set_in_standby(sph_client):
 # ---------------------------------------
 
 def pv_dead_string(pv1v, pv2v):
-    """Geef 1 of 2 terug (de DODE string) als precies één string dood is
-    (< PV_FAULT_DEAD_V = ~0 V, open circuit) terwijl de ander duidelijk produceert
-    (> PV_FAULT_LIVE_V); anders 0. None (geen meting) → 0 (geen oordeel).
+    """Return 1 or 2 (the DEAD string) when exactly one string is dead (< PV_FAULT_DEAD_V = ~0 V,
+    open circuit) while the other clearly produces (> PV_FAULT_LIVE_V); else 0. None (no
+    measurement) -> 0 (no verdict).
 
-    Puur op spanning: 's nachts zijn beide ~0 (→0), overdag beide hoog (→0); alleen
-    een echt losgekoppelde string (0 V) naast een producerende (>100 V) geeft 1 of 2."""
+    Purely on voltage: at night both are ~0 (->0), by day both high (->0); only a really
+    disconnected string (0 V) next to a producing one (>100 V) gives 1 or 2."""
     if pv1v is None or pv2v is None:
         return 0
     if pv1v > PV_FAULT_LIVE_V and pv2v < PV_FAULT_DEAD_V:
@@ -715,14 +715,14 @@ def pv_dead_string(pv1v, pv2v):
 
 
 def pv_fault_step(pv1v, pv2v, fault_since, latched, now, hold_s=PV_FAULT_HOLD_S):
-    """Pure toestandsmachine voor het PV-string-foutalarm — testbaar los van de I/O-lus.
+    """Pure state machine for the PV string fault alarm -- testable apart from the I/O loop.
 
-    In : huidige spanningen, de lopende staat (fault_since/latched) en `now` (datetime).
-    Uit: (new_fault_since, new_latched, action, dead_string)
-         action = 'trigger'  (fout nu > hold_s aangehouden en nog niet gelatcht),
-                  'clear'     (fout weg terwijl 'ie gelatcht was),
-                  None        (geen overgang).
-    De lus hoeft alleen op 'trigger'/'clear' alert_trigger/alert_clear aan te roepen."""
+    In : current voltages, the running state (fault_since/latched) and `now` (datetime).
+    Out: (new_fault_since, new_latched, action, dead_string)
+         action = 'trigger'  (fault has now held > hold_s and is not latched yet),
+                  'clear'     (fault gone while it was latched),
+                  None        (no transition).
+    The loop only has to call alert_trigger/alert_clear on 'trigger'/'clear'."""
     dead = pv_dead_string(pv1v, pv2v)
     if dead == 0:
         return (None, False, ('clear' if latched else None), 0)
@@ -1588,9 +1588,9 @@ def select_config(now: datetime, cfg: Conf) -> tuple[Conf | Schedule, Source, Op
 
 
 def cmd_to_action(cmd) -> str:
-    """Canonieke actie-string van het WERKELIJK uitgevoerde commando (ná de guards),
-    in dezelfde vocabulaire als battery_schedule.action. Zo kan het dashboard plan vs
-    uitvoering 1-op-1 vergelijken zonder zelf control-logica te herleiden."""
+    """Canonical action string of the command ACTUALLY executed (after the guards), in the same
+    vocabulary as battery_schedule.action. So the dashboard can compare plan vs execution one to
+    one without re-deriving control logic itself."""
     if cmd.priority == Priority.LOAD_FIRST:
         return "LOAD_FIRST"
     mode = cmd.mode.name if cmd.mode else "STANDBY"
@@ -1598,9 +1598,9 @@ def cmd_to_action(cmd) -> str:
 
 
 def store_control_action(action: str) -> None:
-    """Schrijf de uitgevoerde actie naar de laatste energy-rij (kolom control_action).
-    De 'intelligentie' (guards) is hier al opgelost -> de DB bevat de waarheid,
-    het dashboard leest 'm er dom uit. Faalt stil: control mag nooit breken op een DB-fout."""
+    """Write the executed action into the energy row (column control_action). The 'intelligence'
+    (guards) is already resolved here -> the DB holds the truth, the dashboard just reads it.
+    Fails silently: control must never break on a DB error."""
     try:
         db = mysql.connector.connect(host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
                                      db=DB_NAME, ssl_disabled=True, connection_timeout=5)
@@ -1679,8 +1679,8 @@ def main_loop():
     _last_db_created_at = None   # tracks last seen optimizer run timestamp
     _pv_panels_on      = True    # assumed ON at startup; avoids unnecessary switch on first tick
     _pv_soc_curtail    = False   # SoC-based curtailment latch (True = panels OFF due to SoC)
-    _pv_fault_since    = None    # datetime: wanneer één PV-string voor 't eerst dood werd gezien
-    _pv_fault_latched  = False   # True zodra het >1u-foutalarm is afgegeven (één trigger per fout)
+    _pv_fault_since    = None    # datetime: when one PV string was first seen dead
+    _pv_fault_latched  = False   # True once the >1 h fault alarm has been raised (one trigger per fault)
 
     # --------------------------------------------------
     # Build ActiveRun
@@ -1926,9 +1926,9 @@ def main_loop():
                             f"VMIN lock opgeheven: {vmin_glob} mV ≥ {VMIN_LOW_RESUME_MV} mV")
 
         # --------------------------------------------------
-        # PV-string-foutalarm: één string dood (open circuit) terwijl de ander
-        # produceert, > 1 uur aangehouden → alert_latch → WordPress-banner.
-        # Puur op spanning; faalt veilig als regs/metingen ontbreken (dead=0).
+        # PV string fault alarm: one string dead (open circuit) while the other produces, held
+        # > 1 hour -> alert_latch -> WordPress banner. Purely on voltage; fails safe when
+        # registers/measurements are missing (dead=0).
         # --------------------------------------------------
         _pv1v = regs.get("REG_PV1_VOLTS") if regs else None
         _pv2v = regs.get("REG_PV2_VOLTS") if regs else None

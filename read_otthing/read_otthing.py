@@ -26,7 +26,7 @@ import mysql.connector
 from pathlib import Path
 from dotenv import load_dotenv
 
-# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+# add both the script dir and its parent so the import works in both places (tests included).
 for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -87,17 +87,17 @@ def flt(value):
     except (ValueError, TypeError):
         return None
 
-# Plausibele bereiken per meetsoort (°C). Een OpenTherm f8.8-woord 0x8000 (ongeldig/leeg antwoord)
-# komt als 128.0 door; HA toonde 2026-10-30 15:00:16 een aanvoer van 128 °C en 10-29 15:45 83,2 °C,
-# telkens ~5 s rond het uitschakelen van de WP. Valt de 5-min-snapshot op zo'n frame, dan zou dat in
-# energy belanden en COP-/huismodel-fits vervuilen — en buiten/kamer zijn wp_control-inputs.
+# Plausible ranges per kind of measurement (C). An OpenTherm f8.8 word 0x8000 (invalid/empty reply)
+# comes through as 128.0; HA showed a flow of 128 C on 2026-10-30 15:00:16 and 83.2 C on 10-29 15:45,
+# each time ~5 s around the heat pump switching off. If the 5-min snapshot lands on such a frame it
+# would end up in energy and pollute the COP/house model fits -- and outside/room are wp_control inputs.
 RANGE_WATER   = (-10.0, 90.0)
 RANGE_OUTSIDE = (-40.0, 50.0)
 RANGE_ROOM    = (0.0, 40.0)
 
 
 def temp_c(value, rng, name):
-    """flt() + plausibiliteitscheck: buiten [lo, hi] -> None (met logregel), anders de float."""
+    """flt() + plausibility check: outside [lo, hi] -> None (with a log line), else the float."""
     v = flt(value)
     if v is None:
         return None
@@ -144,14 +144,14 @@ def on_message(client, userdata, msg):
 # PARSE PAYLOAD → DB DICT
 # ---------------------------
 def _md(v):
-    """Uitpakken van een OTThing MASTER-veld.
+    """Unwrap an OTThing MASTER field.
 
-    De OT-Thing-firmware (otvalues.cpp `OTValue::getJson`) wrapt elke OpenTherm-waarde als
-    {"result": <bool>, "data": <X>}, waar `result` = of het laatste OT-bericht ge-ACK't is
-    (READ_ACK/WRITE_ACK) → of de waarde geldig is. We geven `data` daarom ALLEEN terug als `result`
-    waar is; bij een niet-ge-ACK'te read → None (i.p.v. een stale/ongeldige waarde doorschrijven).
-    Een kale scalar (oudere firmware zonder wrapper) gaat ongewijzigd door. Dit herstelt de
-    honeywell_ot_thermo_*-kolommen: de wrapper brak de oude scalar-parser → ze stonden op NULL."""
+    The OT-Thing firmware (otvalues.cpp `OTValue::getJson`) wraps every OpenTherm value as
+    {"result": <bool>, "data": <X>}, where `result` = whether the last OT message was ACKed
+    (READ_ACK/WRITE_ACK) -> whether the value is valid. So we return `data` ONLY when `result` is
+    true; a read that was not ACKed -> None (rather than writing a stale/invalid value). A bare
+    scalar (older firmware without the wrapper) passes unchanged. This restored the
+    honeywell_ot_thermo_* columns: the wrapper broke the old scalar parser -> they were NULL."""
     if isinstance(v, dict) and "data" in v:
         return v["data"] if v.get("result", True) else None
     return v
@@ -188,7 +188,7 @@ def parse_payload(p):
         "honeywell_ot_boiler_air_pressure_fault":  boolean(ff.get("air_pressure_fault")),
         "honeywell_ot_boiler_water_over_temp":     boolean(ff.get("water_over_temp")),
 
-        # --- thermostat (master) --- master-velden zijn {"result","data"}-gewrapt, zie _md() ---
+        # --- thermostat (master) --- master fields are wrapped as {"result","data"}, see _md() ---
         "honeywell_ot_thermo_ch_set_t_c":          flt(_md(master.get("ch_set_t"))),
         "honeywell_ot_thermo_room_t_c":            temp_c(_md(master.get("room_t")), RANGE_ROOM, "master.room_t"),
         "honeywell_ot_thermo_room_set_t_c":        flt(_md(master.get("room_set_t"))),
@@ -206,19 +206,19 @@ def parse_payload(p):
         "honeywell_ot_heater0_override_on":        boolean(hc0.get("ovrdOn")),
         "honeywell_ot_heater0_override_flow":      boolean(hc0.get("ovrdTemp")),
         "honeywell_ot_heater0_suspended":          boolean(hc0.get("suspended")),
-        # de OTThing-BEREKENDE + naar de WP gestuurde aanvoer-target (curve-output, °C). In
-        # Repeater+override vervangt dit de Honeywell-TSet richting de WP. Shadow-vergelijking met
-        # wp_control's eigen curve-target (wp_shadow_flow_target_c). Zie [[heatpump-control-lever]].
+        # the flow target the OTThing CALCULATES and sends to the heat pump (curve output, C). In
+        # Repeater+override this replaces the Honeywell TSet towards the heat pump. Shadow comparison
+        # with wp_control's own curve target (wp_shadow_flow_target_c).
         "honeywell_ot_flow_setpoint_c":            flt(hc0.get("flowsetpoint")),
 
-        # --- roomunit = de FYSIEKE Honeywell-klokthermostaat (OTThing slave-interface, Master-mode).
-        #     DIT is in Master de thermostaat die de mens bedient; de master-groep hierboven is de
-        #     OTThing->WP-commandokant. Live zijn 't plain scalars, maar _md() houdt het robuust
-        #     mocht een firmware-variant ze ook {"result","data"}-wrappen.
-        "otthing_roomunit_set_t_c":    flt(_md(ru.get("room_set_t"))),   # kamer-setpoint (de mens draait eraan)
-        "otthing_roomunit_room_t_c":   temp_c(_md(ru.get("room_t")), RANGE_ROOM, "roomunit.room_t"),       # door de Honeywell gemeten kamertemp
-        "otthing_roomunit_ch_set_t_c": flt(_md(ru.get("ch_set_t"))),     # flow die de Honeywell zelf zou vragen (bump)
-        "otthing_roomunit_ch_enable":  boolean(rus.get("ch_enable")),    # Honeywell vraagt warmte
+        # --- roomunit = the PHYSICAL Honeywell clock thermostat (OTThing slave interface, Master mode).
+        #     In Master THIS is the thermostat a person operates; the master group above is the
+        #     OTThing->heat pump command side. Live they are plain scalars, but _md() keeps it robust
+        #     should a firmware variant wrap them as {"result","data"} too.
+        "otthing_roomunit_set_t_c":    flt(_md(ru.get("room_set_t"))),   # room setpoint (the knob a person turns)
+        "otthing_roomunit_room_t_c":   temp_c(_md(ru.get("room_t")), RANGE_ROOM, "roomunit.room_t"),       # room temperature measured by the Honeywell
+        "otthing_roomunit_ch_set_t_c": flt(_md(ru.get("ch_set_t"))),     # flow the Honeywell itself would ask for (bump)
+        "otthing_roomunit_ch_enable":  boolean(rus.get("ch_enable")),    # Honeywell asks for heat
     }
 
 

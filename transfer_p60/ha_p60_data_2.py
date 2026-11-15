@@ -25,7 +25,7 @@ import paho.mqtt.client as mqtt
 import mysql.connector
 from dotenv import load_dotenv
 
-# voeg zowel de scriptmap als z'n parent toe zodat de import in beide werkt (ook voor de tests).
+# add both the script dir and its parent so the import works in both places (tests included).
 for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -114,11 +114,11 @@ def format_number_string(value):
     return num_str[:6]
 
 
-# Weheat meldt bij het inschakelen kortstondig onzinnige COP's (tot 268 gezien): het
-# vermogen-in loopt nog op terwijl er al warmte uit het water komt. Boven COP_MAX is het geen
-# meting -> NULL, niet afkappen (een afgekapte 6 is net zo onecht en trekt gemiddeldes omhoog).
-# Bij ontdooien haalt de P60 warmte UIT het water (afgegeven vermogen negatief) en meldt dan een
-# negatieve COP (tot -390 gezien, 2026-11-07 03:40-09:35): ook geen meting -> NULL. 0 (stilstand) blijft.
+# At switch-on Weheat briefly reports nonsense COPs (up to 268 seen): the input power is still
+# ramping while heat already comes out of the water. Above COP_MAX it is not a measurement ->
+# NULL, not clipped (a clipped 6 is just as fake and pulls averages up). During a defrost the P60
+# takes heat OUT of the water (negative output) and reports a negative COP (down to -390 seen,
+# 2026-11-07 03:40-09:35): not a measurement either -> NULL. 0 (standstill) stays.
 COP_MAX = 6.0
 COP_MIN = 0.0
 

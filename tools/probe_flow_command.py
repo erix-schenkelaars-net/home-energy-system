@@ -1,45 +1,45 @@
 #!/usr/bin/env python3
 """
-probe_flow_command.py — eenmalig DIAGNOSE-testje: gehoorzaamt de Weheat P60 een
-flow-(water)setpoint die we via de OTThing (man-in-the-middle) op de OpenTherm-bus injecteren?
+probe_flow_command.py — one-off DIAGNOSTIC test: does the Weheat P60 obey a flow (water)
+setpoint that we inject onto the OpenTherm bus through the OTThing (man in the middle)?
 
-ACHTERGROND
------------
-De OTThing (Seegel Systeme, fw 2.55) zit tussen thermostaat en P60 en biedt een "flow
-temperature"-regeling: topic `chSetTemp1/set` (°C) + modus `chMode1/set` (off/heat/auto).
-In `auto` volgt de OTThing z'n eigen stooklijn; in `heat` dwingt 'ie een vaste flow-setpoint
-af en stuurt die als OpenTherm control-setpoint (ID 1) naar de P60 (de slave).
-
-Dit script:
-  1. leest de HUIDIGE retained commando's (chMode1/chSetTemp1) + een vers state-bericht → BASELINE.
-  2. (alleen met --live) publiceert `chMode1=heat` + `chSetTemp1=<target>`.
-  3. leest ~hold minuten lang LIVE mee op otthing/CE150C/state en print per sample:
-        bus-setpoint (master.ch_set_t)  |  echte flow (slave.flow_t)  |  ch_mode/flame/rel_mod
-     → zie je de bus-setpoint naar <target> springen ÉN de flow meestijgen + ch_mode aan,
-       dan gehoorzaamt de P60 de injectie. Blijft de flow plat terwijl de bus-setpoint wél
-       <target> is, dan negeert de P60 'm en houdt 'ie z'n eigen regime aan.
-  4. HERSTELT ALTIJD (ook bij Ctrl-C / fout): chMode1 terug naar de baseline (normaal `auto`)
-     en chSetTemp1 terug naar de baseline-waarde → terug naar weersafhankelijk bedrijf.
-
-VEILIGHEID
+BACKGROUND
 ----------
-  * DRY-RUN by default: zonder --live publiceert het NIETS, het toont alleen baseline + wat het
-    ZOU sturen. Zo zie je eerst of alles klopt.
-  * We gebruiken `chSetTemp1`/`chMode1` (de nette, omkeerbare HA-klimaatregeling), NOOIT de rauwe
-    `overrideChFlow1` die eeuwig latcht en de suspend-veiligheid omzeilt.
-  * In `heat`-modus negeert de regeling de kamertemp → dus: bescheiden target (clip 25–50 °C),
-    korte hold, en een operator erbij. Bij een harde kill (geen finally) blijft de retained
-    `heat` hangen → herstel dan handmatig:  chMode1/set = auto  (HA-klimaat "flow temperature"
-    op auto, of de OTThing-webUI 192.168.178.24).
-  * Abort als de kamer al warm is (> --room-cap), want flow opstoken terwijl de kamer op temp is
-    overhit alleen maar.
+The OTThing (Seegel Systeme, fw 2.55) sits between the thermostat and the P60 and offers a "flow
+temperature" control: topic `chSetTemp1/set` (C) + mode `chMode1/set` (off/heat/auto). In `auto`
+the OTThing follows its own heating curve; in `heat` it enforces a fixed flow setpoint and sends
+it as the OpenTherm control setpoint (ID 1) to the P60 (the slave).
 
-GEBRUIK
--------
+This script:
+  1. reads the CURRENT retained commands (chMode1/chSetTemp1) + a fresh state message -> BASELINE.
+  2. (only with --live) publishes `chMode1=heat` + `chSetTemp1=<target>`.
+  3. reads otthing/CE150C/state LIVE for ~hold minutes and prints per sample:
+        bus setpoint (master.ch_set_t)  |  real flow (slave.flow_t)  |  ch_mode/flame/rel_mod
+     -> if the bus setpoint jumps to <target> AND the flow rises with it + ch_mode on, the P60
+       obeys the injection. If the flow stays flat while the bus setpoint is <target>, the P60
+       ignores it and keeps its own regime.
+  4. ALWAYS RESTORES (also on Ctrl-C / error): chMode1 back to the baseline (normally `auto`) and
+     chSetTemp1 back to the baseline value -> back to weather-compensated operation.
+
+SAFETY
+------
+  * DRY RUN by default: without --live it publishes NOTHING, it only shows the baseline + what it
+    WOULD send. So you first see whether everything is right.
+  * We use `chSetTemp1`/`chMode1` (the clean, reversible HA climate control), NEVER the raw
+    `overrideChFlow1`, which latches forever and bypasses the suspend safety.
+  * In `heat` mode the control ignores the room temperature -> so: a modest target (clipped to
+    25-50 C), a short hold, and an operator present. On a hard kill (no finally) the retained
+    `heat` stays -> restore by hand:  chMode1/set = auto  (HA climate "flow temperature" to auto,
+    or the OTThing web UI).
+  * Abort when the room is already warm (> --room-cap): raising the flow while the room is at
+    temperature only overheats it.
+
+USAGE
+-----
   cd /home/pi/docker && set -a; . ./.env; set +a
-  # 1) eerst droog (laat baseline + plan zien, raakt niets):
+  # 1) dry first (shows the baseline + plan, touches nothing):
   python3 -I tools/probe_flow_command.py --target 40
-  # 2) echt meten (bij voorkeur op een koele ochtend dat je tóch warmte wilt):
+  # 2) measure for real (preferably on a cool morning when you want heat anyway):
   python3 -I tools/probe_flow_command.py --target 40 --hold 15 --live
 """
 
@@ -73,7 +73,7 @@ def _mk_client():
 
 
 def collect_baseline(timeout=8):
-    """Vang de retained commando-topics (chMode1/chSetTemp1) + het eerste state-bericht."""
+    """Catch the retained command topics (chMode1/chSetTemp1) + the first state message."""
     got = {"mode": None, "settemp": None, "state": None}
 
     def on_message(c, u, m):
@@ -104,7 +104,7 @@ def collect_baseline(timeout=8):
 
 
 def read_state_fields(state):
-    """Pluk de interessante velden uit een state-dict (defensief tegen ontbrekende sleutels)."""
+    """Pick the interesting fields from a state dict (defensive against missing keys)."""
     slave = state.get("slave") or {}
     master = state.get("master") or {}
     ss = slave.get("status") or {}
@@ -117,7 +117,7 @@ def read_state_fields(state):
 
     return {
         "ch_set_t": deep(master, "ch_set_t", "data"),   # commando-setpoint op de bus
-        "flow_t": slave.get("flow_t"),                   # ECHTE aanvoer die de ketel maakt
+        "flow_t": slave.get("flow_t"),                   # REAL flow the boiler makes
         "return_t": slave.get("return_t"),
         "ch_mode": ss.get("ch_mode"),                    # verwarmt de slave?
         "flame": ss.get("flame"),
@@ -134,7 +134,7 @@ def publish(topic, value, retain=True):
 
 
 def monitor(hold_min, target):
-    """Lees ~hold_min minuten live mee en print het verloop."""
+    """Read live for ~hold_min minutes and print the course."""
     end = time.time() + hold_min * 60
     last_print = 0
     latest = {"state": None}
@@ -198,7 +198,7 @@ def main():
         f"ch_mode={f0['ch_mode']}  vlam={f0['flame']}  mod%={f0['rel_mod']}  "
         f"kamer={f0['room_t']} (sp {f0['room_sp']})")
 
-    # veiligheids-abort: kamer al warm?
+    # safety abort: room already warm?
     room = f0["room_t"]
     if room is not None and room > args.room_cap and not args.force:
         log(f"ABORT: kamer {room} > room-cap {args.room_cap}. Flow opstoken overhit nu alleen. "
@@ -235,7 +235,7 @@ def main():
         except Exception as e:
             log(f"!!! HERSTEL FAALDE: {e}")
             log(f"!!! zet HANDMATIG terug:  {BASE}/chMode{ch}/set = {prior_mode}  "
-                f"(HA-klimaat op auto, of OTThing-webUI 192.168.178.24)")
+                f"(HA-klimaat op auto, of de OTThing-webUI)")
     return 0
 
 
