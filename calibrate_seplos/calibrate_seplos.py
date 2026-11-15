@@ -37,7 +37,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # --- Safety/calibration constants (EVE MB31 cell + Seplos 16S BMS spec) ---------------
 # MB31: end of charge 3.65 V, BMS lock 3.80 V. Seplos: cell OVP stops charging at 3650 mV,
 # the passive balancer starts at cell > 3400 mV and spread > 50 mV, stops < 30 mV.
-CELL_TARGET_MV         = int(os.environ.get("CAL_CELL_TARGET_MV", "3600"))    # hold-/laaddoel per cel (CV 57,6V = 3,60V)
+CELL_TARGET_MV         = int(os.environ.get("CAL_CELL_TARGET_MV", "3600"))    # hold/charge target per cell (CV 57.6 V = 3.60 V)
 CELL_WARN_MV           = int(os.environ.get("CAL_CELL_WARN_MV", "3620"))      # ONDER BMS-OVP(3650): vroege waarschuwing
 CELL_HARDSTOP_MV       = int(os.environ.get("CAL_CELL_HARDSTOP_MV", "3645"))  # just below the BMS OVP (3650): cut the Wanptek before the BMS does
 BALANCE_START_MV       = int(os.environ.get("CAL_BALANCE_START_MV", "3400"))  # Seplos balancer-startspanning
@@ -95,7 +95,7 @@ def phase_of(cell_max_mv, current_a, cell_delta_mv):
     if cell_max_mv >= BALANCE_START_MV and balance_done(cell_delta_mv, current_a):
         return "done"                         # done ONLY at the top (not at low-SoC rest)
     if cell_max_mv >= BALANCE_START_MV:
-        return "absorb"                       # cellen boven balancer-start -> balanceer-zone
+        return "absorb"                       # cells above balancer start -> balancing zone
     if current_a is not None and current_a > 1.0:
         return "charge"
     return "idle"

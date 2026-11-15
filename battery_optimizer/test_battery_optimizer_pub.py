@@ -2071,9 +2071,9 @@ class TestPriceBackfill(unittest.TestCase):
         n = mod.backfill_prices_from_db(_FakeConn(self._rows()), prices,
                                         self.TODAY, self.TOMORROW)
         self.assertEqual(n, 3)
-        self.assertAlmostEqual(prices[32], 0.413142)   # 08:00, niet 0.15
+        self.assertAlmostEqual(prices[32], 0.413142)   # 08:00, not 0.15
         self.assertAlmostEqual(prices[33], 0.361076)   # 08:15
-        self.assertAlmostEqual(prices[96], 0.250000)   # morgen 00:00
+        self.assertAlmostEqual(prices[96], 0.250000)   # tomorrow 00:00
 
     def test_live_values_are_never_overwritten(self):
         prices = {32: 0.99}                            # fresh live price for 08:00

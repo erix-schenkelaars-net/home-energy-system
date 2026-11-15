@@ -160,7 +160,7 @@ MYSQL_TABLE_NAME = os.environ["DB_TABLE"]
 # --- gedeelde kostenberekening (gevuld in init_cost_calc) ---
 _TARIFFS  = []
 _FIXED    = []
-_PREV_CUM = {"imp": None, "exp": None, "gas": None}   # vorige cumulatieve telwerkstand
+_PREV_CUM = {"imp": None, "exp": None, "gas": None}   # previous cumulative meter reading
 _PREV_TS  = None
 
 

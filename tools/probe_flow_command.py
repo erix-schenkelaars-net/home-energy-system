@@ -119,7 +119,7 @@ def read_state_fields(state):
         "ch_set_t": deep(master, "ch_set_t", "data"),   # command setpoint on the bus
         "flow_t": slave.get("flow_t"),                   # REAL flow the boiler makes
         "return_t": slave.get("return_t"),
-        "ch_mode": ss.get("ch_mode"),                    # verwarmt de slave?
+        "ch_mode": ss.get("ch_mode"),                    # is the slave heating?
         "flame": ss.get("flame"),
         "rel_mod": slave.get("rel_mod"),
         "room_t": hc0.get("roomtemp"),

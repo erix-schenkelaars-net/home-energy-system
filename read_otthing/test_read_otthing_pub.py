@@ -370,7 +370,7 @@ class TestMasterUnwrap(unittest.TestCase):
             "heatercircuit": [{"roomsetpoint": 21.0, "action": "idle"}],
         }
         d = mod.parse_payload(payload)
-        self.assertEqual(d["honeywell_ot_thermo_room_set_t_c"], 21.0)   # DE knop
+        self.assertEqual(d["honeywell_ot_thermo_room_set_t_c"], 21.0)   # THE knob
         self.assertEqual(d["honeywell_ot_thermo_room_t_c"], 21.1)
         self.assertEqual(d["honeywell_ot_thermo_ch_set_t_c"], 65.0)
         self.assertTrue(d["honeywell_ot_thermo_ch_enable"])

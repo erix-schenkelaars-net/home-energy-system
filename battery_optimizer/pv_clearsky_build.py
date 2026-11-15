@@ -54,9 +54,9 @@ LAT = float(os.environ.get("SYSTEM_LAT", "52.0"))
 LON = float(os.environ.get("SYSTEM_LON", "5.0"))
 
 MIN_PEAK_W = 500.0        # below this it is not a usable day
-MIN_SLOTS = 20            # minimaal aantal kwartieren met data
+MIN_SLOTS = 20            # minimum number of quarters with data
 MAX_TV = 1.25             # smoothness; 1.0 = a perfect bell curve (up and down)
-YIELD_QUANTILE = 0.75     # top-kwart dagopbrengst binnen de maand
+YIELD_QUANTILE = 0.75     # top-quarter day yield within the month
 MIN_ELEV = 10             # below this elevation the measurement is too noise-sensitive
 MIN_POINTS = 8            # minimum number of points for a fit of its own per degree
 LIFT_Q = 0.90             # percentile of the residuals -> upper bound

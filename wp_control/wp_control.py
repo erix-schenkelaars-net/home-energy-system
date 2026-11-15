@@ -1,14 +1,14 @@
 """
-wp_control.py — warmtepomp-aansturing (Weheat P60 via de OTThing) op pi5new.
+wp_control.py — heat pump control (Weheat P60 through the OTThing) on pi5new.
 
-Elke cyclus: setpoint (schema + Honeywell-bump) -> aan/uit (hysterese) -> aanvoer (weercurve +
-gedempte PI room-compensatie) -> retained MQTT naar de OTThing (chMode1, chSetTemp1, roomSetpoint1,
-overrideChOn1, roomMode1, outsideTemp). pi5new bezit de CH-enable; de Honeywell is alleen nog de
-bump-knop. Daarnaast: logging naar energy (wp_shadow_*/wp_cmd_*, buffer_valve_*) en telemetrie
-naar HA (wp_control/state).
+Every cycle: setpoint (schedule + Honeywell bump) -> on/off (hysteresis) -> flow (weather curve +
+damped PI room compensation) -> retained MQTT to the OTThing (chMode1, chSetTemp1, roomSetpoint1,
+overrideChOn1, roomMode1, outsideTemp). pi5new owns CH enable; the Honeywell is only the bump knob.
+In live planner mode the MILP planner (wp_planner.py) decides and these rules are the fallback.
+Also: logging to energy (wp_shadow_*/wp_cmd_*, buffer_valve_*) and telemetry to HA (wp_control/state).
 
-Werking, vereiste OTThing-instellingen en ALLE knoppen (WP_*) met hun standaard: zie README.md.
-Best-effort: een DB- of MQTT-fout mag de lus nooit breken.
+How it works, the required OTThing settings and ALL knobs (WP_*) with their defaults: see README.md.
+Best effort: a DB or MQTT error must never break the loop.
 """
 
 import json
@@ -26,40 +26,42 @@ import paho.mqtt.client as mqtt_client
 from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
 from common.battery_alert import alert_trigger, alert_clear, alert_active   # alert_latch + HA-push
 
-# ── logging (stdout-only; entrypoint tee't naar /logs/debug_YYYY-MM-DD.log) ──────────────
+# ── logging (stdout only; entrypoint tees it into /logs/debug_YYYY-MM-DD.log) ─────────────
 def dbg(area, msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}][{area}] {msg}", flush=True)
 
 
 # ── config ───────────────────────────────────────────────────────────────────────────
-# Dag/nacht-schema als breekpunten "HH:MM=temp,...". Elk breekpunt geldt TOT het volgende; vóór het
-# eerste breekpunt wrapt het naar het laatste (vorige dag). Zo is een getrapte ochtend-recovery
-# (zacht voor de WP → hoge COP) gewoon een paar punten. Nacht = de laagste blokken; geen comfort-bodem
-# (in bed), en geen cold-scaled voorverwarming meer — het schema is expliciet (fallback-thermostaat +
-# OTThing-suspend blijven het echte veiligheidsvangnet).
-# 's nachts 19, vanaf 02:00 elk half uur +0,5 naar 21,5 om 04:00. De oude ramp (04:30..06:30)
-# stookte pas vanaf 05:30 (de eerste stappen lagen onder de kamer) en liep door de ochtendpiek:
-# 10-27 was het pas om 09:55 21,5. Op een zachte nacht (kamer ~20,4) doen de eerste stappen niets
-# en start de WP rond 03:00-03:30, in de goedkope nachturen; op een koude nacht zijn het echte
-# stappen van 0,5 °C, zodat de aanvoer nooit hard springt (user: geen sprong). De extra stap om
-# 02:00 is voor ijskoude nachten: start de WP vanaf ~19 met een kleine vraag, dan schiet hij niet
-# door en staat daarna geen uur stil.
-# 2026-11-01 (met de bewoners, keuze "A"): 21,0 rond 08:30 — 's ochtends zit alleen de user beneden (nooit
-# koud), de vrouw des huizes staat 09:00-10:30 op; opwarmen vanaf 05:30 (vroeg stoken lekt ~1,2 %/u weg,
-# nacht-ochtendspread in de winter maar 1-2 ct). Gesloten-lus-simulatie 10-31: kamer 09:00 ~21,1, ochtend
-# EUR 0,09 (zacht) .. 0,33 (8 K kouder) goedkoper dan opwarmen vanaf 04:30. 21,5 vanaf 09:00; 13-17 = 22
-# (de middagwarmte die zij wil); 17:00 21 en 19:00 19. Halfuurlijkse stappen: nooit een sprong.
-# 2026-11-02 (user): opwarmen VÓÓR 07:00. Eerste meetochtend met schema A: de stap 05:30=20,0 lag onder
-# de inschakeldrempel (kamer 19,93 > 20,0-0,2), de WP startte pas 06:10 en stookte vooral 07-10 u, de
-# duurste uren (08-09 u EUR 0,51); kamer 08:30 20,8, 10:00 pas 21,0. Nu 04:00=20,5 (kamer na de nacht
-# ~20,0 -> start meteen) en 04:30=21,0: het opwarmen valt in de goedkope 04-07 u (~EUR 0,40).
+# Day/night schedule as breakpoints "HH:MM=temp,...". Each breakpoint holds UNTIL the next; before the
+# first breakpoint it wraps to the last one (previous day). So a stepped morning recovery (gentle for the
+# heat pump -> high COP) is just a few points. Night = the lowest blocks; no comfort floor (in bed), and no
+# cold-scaled preheating any more -- the schedule is explicit (the fallback thermostat + OTThing suspend
+# stay the real safety net).
+# 19 at night, from 02:00 +0.5 every half hour up to 21.5 at 04:00. The old ramp (04:30..06:30) only
+# started heating from 05:30 (the first steps were below the room) and ran into the morning peak: on
+# 10-27 it reached 21.5 only at 09:55. On a mild night (room ~20.4) the first steps do nothing and the
+# heat pump starts around 03:00-03:30, in the cheap night hours; on a cold night they are real 0.5 C
+# steps, so the flow never jumps hard (the user: no jumps). The extra step at 02:00 is for freezing
+# nights: if the heat pump starts from ~19 with a small demand, it does not overshoot and then sit idle
+# for an hour.
+# 2026-11-01 (with the household, choice "A"): 21.0 around 08:30 -- in the morning only the user is
+# downstairs (never cold), the rest of the household gets up 09:00-10:30; warm up from 05:30 (heating
+# early leaks ~1.2 %/h away, the night/morning price spread in winter is only 1-2 ct). Closed-loop
+# simulation 10-31: room 09:00 ~21.1, morning EUR 0.09 (mild) .. 0.33 (8 K colder) cheaper than warming
+# up from 04:30. 21.5 from 09:00; 13-17 = 22 (the afternoon warmth the household wants); 17:00 21 and
+# 19:00 19. Half-hourly steps: never a jump.
+# 2026-11-02 (user): warm up BEFORE 07:00. First measured morning with schedule A: the step 05:30=20.0
+# was below the switch-on threshold (room 19.93 > 20.0-0.2), the heat pump only started at 06:10 and
+# heated mostly 07-10 h, the dearest hours (08-09 h EUR 0.51); room 08:30 20.8, only 21.0 at 10:00.
+# Now 04:00=20.5 (room after the night ~20.0 -> starts at once) and 04:30=21.0: the warm-up falls in
+# the cheap 04-07 h (~EUR 0.40).
 DEFAULT_SCHEDULE = ("04:00=20.5,04:30=21.0,09:00=21.5,13:00=22.0,17:00=21.0,"
                     "19:00=19.0")
 
 
 def _hhmm_min(s, default=0):
-    """'HH:MM' -> minuten sinds middernacht; valt terug op `default` bij een typefout."""
+    """'HH:MM' -> minutes since midnight; falls back to `default` on a typo."""
     try:
         h, m = str(s).strip().split(":")
         return int(h) * 60 + int(m)
@@ -68,8 +70,8 @@ def _hhmm_min(s, default=0):
 
 
 def parse_schedule(s):
-    """'HH:MM=T,HH:MM=T,...' -> gesorteerde lijst [(minuten_sinds_middernacht, temp), ...].
-    Ongeldige/lege entries worden overgeslagen (robuust tegen een typefout in .env)."""
+    """'HH:MM=T,HH:MM=T,...' -> sorted list [(minutes_since_midnight, temp), ...].
+    Invalid/empty entries are skipped (robust against a typo in .env)."""
     out = []
     for part in (s or "").split(","):
         hhmm, sep, temp = part.strip().partition("=")
@@ -85,8 +87,8 @@ def parse_schedule(s):
 
 
 def parse_curve(s):
-    """'buiten:flow,buiten:flow,...' -> lijst [(buiten, flow), ...] AFLOPEND op buitentemp.
-    Ongeldige entries worden overgeslagen (robuust tegen een typefout in .env)."""
+    """'outside:flow,outside:flow,...' -> list [(outside, flow), ...] DESCENDING by outside temperature.
+    Invalid entries are skipped (robust against a typo in .env)."""
     out = []
     for part in (s or "").split(","):
         o, sep, f = part.strip().partition(":")
@@ -101,9 +103,10 @@ def parse_curve(s):
 
 
 def outside_for_curve(outside, cfg):
-    """PUUR: de buitentemp voor de curve. Zonder meting (HA-voeler en KNMI allebei weg) een vaste
-    aanname i.p.v. geen aanvoer — zonder aanvoer zou de WP uitgaan en daarna 60 min stilstaan.
-    De room-compensatie corrigeert een te lage aanname. Wordt NIET naar de OTThing gepubliceerd."""
+    """PURE: the outside temperature for the curve. Without a measurement (HA sensor and KNMI both
+    gone) a fixed assumption instead of no flow -- without a flow the heat pump would switch off and
+    then sit idle for 60 min. The room compensation corrects an assumption that is too low. NOT
+    published to the OTThing."""
     if outside is not None:
         return outside
     dbg("CTRL", f"geen buitentemp -> curve rekent met aanname {cfg['outside_fallback']} °C")
@@ -111,8 +114,9 @@ def outside_for_curve(outside, cfg):
 
 
 def curve_flow(outside, pts):
-    """PUUR: lineaire interpolatie van de weercurve -> gewenste aanvoer (°C), of None bij geen
-    buitentemp / lege curve. Buiten het bereik: clamp op het dichtstbijzijnde punt (geen extrapolatie)."""
+    """PURE: linear interpolation of the weather curve -> desired flow (C), or None without an
+    outside temperature / with an empty curve. Out of range: clamp to the nearest point (no
+    extrapolation)."""
     if outside is None or not pts:
         return None
     if outside >= pts[0][0]:
@@ -126,11 +130,11 @@ def curve_flow(outside, pts):
 
 
 def decide_heat(room, setpoint, state, on_below=0.2, off_above=0.3):
-    """PUUR + stateful: beslist WP aan/uit met hysterese rond het Honeywell-setpoint (= de wens van
-    de vrouw). Heat als kamer <= setpoint-on_below; stop als kamer >= setpoint+off_above; daartussen
-    de vorige stand aanhouden (geen snel pendelen). Bij ontbrekende data: vorige stand (een
-    transiënte leesfout mag niet flippen), default UIT. `state` = {heat: bool} dat tussen cycli
-    bewaard blijft. DIT lost de forced-heating van 10-22-avond op: kamer ruim boven setpoint -> uit."""
+    """PURE + stateful: decides heat pump on/off with hysteresis around the setpoint. Heat when
+    room <= setpoint - on_below; stop when room >= setpoint + off_above; in between keep the previous
+    state (no fast toggling). On missing data: previous state (a transient read error must not flip
+    it), default OFF. `state` = {heat: bool}, kept between cycles. THIS fixed the forced heating of
+    the evening of 10-22: room well above the setpoint -> off."""
     if room is None or setpoint is None:
         return bool(state.get("heat", False))
     if room <= setpoint - on_below:
@@ -143,28 +147,29 @@ def decide_heat(room, setpoint, state, on_below=0.2, off_above=0.3):
 
 
 def room_comp_boost(room, setpoint, kp, boost_max, neg_max=0.0):
-    """PUUR: P-room-compensatie -> extra aanvoer (°C) bovenop de curve. boost = clamp(kp*(setpoint -
-    kamer), -neg_max, boost_max); 0 bij ontbrekende data. Zo trekt een setpoint-sprong de aanvoer
-    omhoog i.p.v. op de curve te blijven; bij nadering krimpt de boost vanzelf naar 0 (steady-state =
-    de curve). Met neg_max > 0 zakt de aanvoer ONDER de curve zodra de kamer boven het setpoint zit
-    (user 2026-10-24: laag doordraaien i.p.v. uit); neg_max=0 = alleen positief (oude gedrag)."""
+    """PURE: P room compensation -> extra flow (C) on top of the curve. boost = clamp(kp*(setpoint -
+    room), -neg_max, boost_max); 0 on missing data. So a setpoint step pulls the flow up instead of
+    staying on the curve; when the room gets close the boost shrinks to 0 by itself (steady state =
+    the curve). With neg_max > 0 the flow drops BELOW the curve once the room is above the setpoint
+    (user 2026-10-24: keep running low instead of off); neg_max=0 = positive only (old behaviour)."""
     if room is None or setpoint is None:
         return 0.0
-    return round(max(-neg_max, min(kp * (setpoint - room), boost_max)), 1) + 0.0   # +0.0: geen -0.0
+    return round(max(-neg_max, min(kp * (setpoint - room), boost_max)), 1) + 0.0   # +0.0: no -0.0
 
 
 def i_buildup_gate(room, setpoint, state, cfg, now):
-    """PUUR + stateful: mag I nu OPBOUWEN? Alleen als de kamer echt vastzit (2026-11-01).
+    """PURE + stateful: may I BUILD UP now? Only when the room is really stuck (2026-11-01).
 
-    Tot 10-31 integreerde I elk tekort, ook het geplande tekort na een setpoint-stap (ochtendtrap,
-    prijs-opladen, bump) terwijl de kamer nog traag oploopt. I liep dan in 1-2 uur vol (cap 8) en
-    zakte alleen na een doorschieter: een ratel. 10-31 11:00-13:45: I 8 bij kamer = setpoint = 22,
-    aanvoer ~45 °C, waar de curve alléén 09:30-10:00 de kamer op 36,5 °C hield (~8 °C te heet).
+    Until 10-31 I integrated every shortfall, including the planned shortfall after a setpoint step
+    (morning staircase, price charging, bump) while the room was still slowly rising. I then filled up
+    in 1-2 hours (cap 8) and only drained after an overshoot: a ratchet. 10-31 11:00-13:45: I at 8 with
+    room = setpoint = 22, flow ~45 C, where the curve ALONE held the room at 36.5 C during 09:30-10:00
+    (~8 C too hot).
 
-    Opbouw mag alleen als (1) het setpoint minstens rc_i_hold_min minuten niet omhoog is gegaan en
-    (2) de kamer over het laatste uur niet stijgt (<= rc_i_trend K/u, gemeten over >= 45 min). Te
-    weinig historie (net gestart) = niet opbouwen. Houdt state['hist'] [[epoch, kamer], ...] en
-    state['sp_last'] / state['sp_up_at'] bij. -> (mag, reden)."""
+    Build-up is only allowed when (1) the setpoint has not gone up for at least rc_i_hold_min minutes
+    and (2) the room is not rising over the last hour (<= rc_i_trend K/h, measured over >= 45 min). Too
+    little history (just started) = no build-up. Keeps state['hist'] [[epoch, room], ...] and
+    state['sp_last'] / state['sp_up_at']. -> (allowed, reason)."""
     t = now.timestamp()
     sp_last = state.get("sp_last")
     if sp_last is not None and setpoint > sp_last + 0.05:
@@ -185,47 +190,47 @@ def i_buildup_gate(room, setpoint, state, cfg, now):
 
 
 def room_comp_pi(room, setpoint, state, cfg, headroom=None, running=True, now=None):
-    """PUUR + stateful: room-compensatie als GEDEMPTE PI -> extra aanvoer (°C) bovenop de curve.
+    """PURE + stateful: room compensation as a DAMPED PI -> extra flow (C) on top of the curve.
 
-    P (= room_comp_boost) reageert direct op het kamer-tekort; I bouwt het hardnekkige restant weg
-    zodat de kamer ECHT naar het setpoint klimt i.p.v. er net onder te blijven hangen (P-droop).
+    P (= room_comp_boost) reacts directly to the room shortfall; I removes the persistent remainder so
+    the room REALLY climbs to the setpoint instead of hanging just below it (P droop).
 
-    'Gedempt' = twee remmen tegen doorschieten/windup (de wens van de user): (1) overshoot-leak —
-    alleen BOVEN het setpoint bloedt de integrator extra af, oplopend tot de volle rc_damp_leak bij
-    setpoint + rc_damp_band; (2) anti-windup — zolang de boost tegen zijn plafond zit (rc_max óf de
-    ruimte `headroom` tot flow_cap) groeit I niet verder. Daarnaast telt een negatieve fout (kamer
-    boven setpoint) I gewoon af. i is begrensd op [0, rc_i_max] -> kan niet wegdrijven.
+    'Damped' = two brakes against overshoot/windup (the user's wish): (1) overshoot leak -- only
+    ABOVE the setpoint the integrator bleeds off extra, rising to the full rc_damp_leak at setpoint +
+    rc_damp_band; (2) anti-windup -- while the boost is at its ceiling (rc_max or the `headroom` up to
+    flow_cap) I does not grow further. Besides that a negative error (room above setpoint) simply
+    counts I down. i is bounded to [0, rc_i_max] -> cannot drift away.
 
-    Óp en onder het setpoint lekt I NIET (2026-10-26): I draagt dan precies de aanvoer die de
-    curve tekortkomt. Het oude lek (sterkst óp het setpoint) gooide die weg zodra de kamer er was:
-    I 4,7 -> 1,0 in 55 min terwijl de kamer 21,5 hield, doel onder het retourwater -> stop-risico.
+    At and below the setpoint I does NOT leak (2026-10-26): I then carries exactly the flow the curve
+    lacks. The old leak (strongest at the setpoint) threw that away as soon as the room got there:
+    I 4.7 -> 1.0 in 55 min while the room held 21.5, target below the return water -> stop risk.
 
-    running=False (compressor staat stil) = ook geen opbouw: de WP kan de extra aanvoer dan niet
-    leveren (stop + 60 min verplichte stilstand), dus het tekort is geen signaal dat de curve te
-    laag is. 10-27 07:55-08:55 liep I zo 7,2 -> 8,0 (cap) tijdens de stilstand; de herstart op
-    42 °C met volle I + zon gaf daarna 21,9 en de volgende stop. Afbouwen mag wel gewoon.
+    running=False (compressor idle) = no build-up either: the heat pump cannot deliver the extra flow
+    then (stop + 60 min mandatory standstill), so the shortfall is no sign that the curve is too low.
+    10-27 07:55-08:55 I ran up 7.2 -> 8.0 (cap) like that during the standstill; the restart at 42 C
+    with full I + sun then gave 21.9 and the next stop. Building down is still allowed.
 
-    now (2026-11-01) = de opbouw-poort aan (i_buildup_gate): opbouwen alleen als de kamer vastzit;
-    de reden staat dan in state['i_gate'] ('' = opbouw mag). now=None = zonder poort.
+    now (2026-11-01) = the build-up gate on (i_buildup_gate): build up only when the room is stuck;
+    the reason is then in state['i_gate'] ('' = build-up allowed). now=None = without the gate.
 
-    state['i'] = de integrator (°C aanvoer), bewaard tussen cycli (reset bij procesherstart).
-    headroom = flow_cap - curve-base (None -> alleen rc_max begrenst). Geeft (boost, i) terug."""
+    state['i'] = the integrator (C of flow), kept between cycles (reset on a process restart).
+    headroom = flow_cap - curve base (None -> only rc_max limits). Returns (boost, i)."""
     i = float(state.get("i", 0.0))
     if room is None or setpoint is None:
-        return 0.0, round(i, 3)                       # transiënte leesfout: houd I vast, geen boost
+        return 0.0, round(i, 3)                       # transient read error: hold I, no boost
     err = setpoint - room
     neg = cfg.get("rc_neg_max", 0.0)
     p = room_comp_boost(room, setpoint, cfg["rc_kp"], cfg["rc_max"], neg)   # P-term, -neg..rc_max
-    # effectief boost-plafond: door rc_max én door de fysieke ruimte tot de aanvoer-cap
+    # effective boost ceiling: from rc_max and from the physical room up to the flow cap
     ceil = cfg["rc_max"] if headroom is None else max(0.0, min(cfg["rc_max"], headroom))
     gate_ok = True
     if now is not None:
         gate_ok, state["i_gate"] = i_buildup_gate(room, setpoint, state, cfg, now)
-    # integreren: afbouwen (err<0) mag altijd; opbouwen alleen als de WP draait, we nog niet
-    # tegen het plafond zitten en de kamer echt vastzit
+    # integrate: building down (err<0) is always allowed; building up only while the heat pump runs,
+    # we are not at the ceiling yet and the room is really stuck
     if err < 0 or (running and gate_ok and (p + i) < ceil):
         i += cfg["rc_ki"] * err
-    # demping alleen bij doorschieten: 0 óp het setpoint .. volle leak bij setpoint + damp_band
+    # damping only on overshoot: 0 at the setpoint .. full leak at setpoint + damp_band
     overshoot = max(0.0, min(1.0, -err / cfg["rc_damp_band"]))
     i -= i * cfg["rc_damp_leak"] * overshoot
     i = max(0.0, min(i, cfg["rc_i_max"]))
@@ -235,19 +240,19 @@ def room_comp_pi(room, setpoint, state, cfg, headroom=None, running=True, now=No
 
 
 def regulated_flow(base, boost, cfg):
-    """PUUR: curve + room-comp -> aanvoer-target (°C), begrensd op [flow_min, flow_cap]. De bodem
-    houdt de WP bij een negatieve boost (kamer boven setpoint) op een lage maar zinnige aanvoer i.p.v.
-    eronder te duiken; None als er geen curve-basis is (geen buitentemp)."""
+    """PURE: curve + room comp -> flow target (C), bounded to [flow_min, flow_cap]. With a negative
+    boost (room above setpoint) the floor keeps the heat pump at a low but sensible flow instead of
+    diving below it; None when there is no curve base (no outside temperature)."""
     if base is None:
         return None
     return round(max(cfg["flow_min"], min(base + boost, cfg["flow_cap"])), 1)
 
 
 def limit_flow_drop(flow, state, max_drop):
-    """Aanvoerdoel mag per cyclus hooguit `max_drop` °C dalen (stijgen mag direct). Een plotse daling
-    — bv. het einde van een bump, of de P-term die wegvalt — zet het doel onder het retourwater: de
-    WP schiet er op z'n minimum overheen, stopt, en staat dan 60 min stil (10-24 15:45: 43 -> 35 in
-    20 min, retour 42). state['flow'] = het vorige doel; None (WP uit) = geen rem."""
+    """The flow target may fall by at most `max_drop` C per cycle (rising is immediate). A sudden drop
+    -- e.g. the end of a bump, or the P term falling away -- puts the target below the return water:
+    the heat pump overshoots it at its minimum, stops, and then sits idle for 60 min (10-24 15:45:
+    43 -> 35 in 20 min, return 42). state['flow'] = the previous target; None (heat pump off) = no brake."""
     last = state.get("flow")
     if flow is not None and last is not None and flow < last - max_drop:
         flow = round(last - max_drop, 1)
@@ -256,33 +261,33 @@ def limit_flow_drop(flow, state, max_drop):
 
 
 def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=None, below_floor=False):
-    """PUUR: begrens het aanvoerdoel van de planner tijdens een (her)start.
+    """PURE: limit the planner's flow target during a (re)start.
 
-    Wat de P60 laat doorschieten is het GAT tussen doel en water bij de start, niet de hoogte van het
-    doel: 11-02 18:05 gat ~5 K -> 2,0 kW, geen doorschieten; 11-03 21:10 gat ~3 K -> 1,4 kW; 11-04
-    05:15 gat ~13 K -> 7,8 kW, aanvoer 4 K over het doel; 14:10 gat ~22 K -> 9,7 kW. Twee plafonds:
+    What makes the P60 overshoot is the GAP between target and water at the start, not the height of
+    the target: 11-02 18:05 gap ~5 K -> 2.0 kW, no overshoot; 11-03 21:10 gap ~3 K -> 1.4 kW; 11-04
+    05:15 gap ~13 K -> 7.8 kW, flow 4 K over the target; 14:10 gap ~22 K -> 9.7 kW. Two ceilings:
 
-    1. oploop (hele run): water bij de start + softstart_gap, daarna softstart_rate °C per 5 min
-       looptijd. Het water wordt één keer gemeten (bij de start, uit de DB) en daarna loopt het
-       plafond alleen met de tijd op: de aanvoer die de P60 maakt gaat niet terug in het doel (geen
-       ratel zoals 11-03). Zodra het plafond het planner-doel passeert doet het niets meer.
-    2. tekort (start + eerste softstart_min min): stooklijn(buiten) + softstart_kp * (gewenst -
-       kamer), gewenst = de kamer die de planner over een uur wil; hooguit softstart_neg °C onder de
-       stooklijn.
-    Vóór de start (WP nog uit) nooit onder water + gap, anders ziet de P60 geen vraag en start niet
-    (11-03 20:10: doel 29,5 bij water 34 -> een uur geen start). Nooit onder flow_min, nooit boven
-    het doel van de planner (dit kan alleen verlagen). Geeft (flow, toelichting of None).
+    1. ramp (whole run): water at the start + softstart_gap, then softstart_rate C per 5 min of run
+       time. The water is measured once (at the start, from the DB) and after that the ceiling only
+       rises with time: the flow the P60 makes does not feed back into the target (no ratchet as on
+       11-03). Once the ceiling passes the planner's target it does nothing any more.
+    2. shortfall (start + first softstart_min min): heating curve(outside) + softstart_kp * (wanted -
+       room), wanted = the room the planner wants in an hour; at most softstart_neg C below the curve.
+    Before the start (heat pump still off) never below water + gap, else the P60 sees no demand and
+    does not start (11-03 20:10: target 29.5 with water 34 -> no start for an hour). Never below
+    flow_min, never above the planner's target (this can only lower). Returns (flow, explanation or None).
 
-    below_floor: de kamer zit ONDER de comfortgrens -> geen oploop (alleen plafond 2). De oploop is
-    tegen doorschieten bij een herstart zonder haast; met een tekort werkte hij tegen het comfort in
-    (11-06 10:39: water 25 -> doel 28,5 en 1 °C/5 min, kamer zakte tot 20,9 bij grens 21,3)."""
+    below_floor: the room is BELOW the comfort floor -> no ramp (only ceiling 2). The ramp is against
+    overshoot on a restart without hurry; with a shortfall it worked against comfort (11-06 10:39:
+    water 25 -> target 28.5 and 1 C/5 min, the room dropped to 20.9 at a floor of 21.3)."""
     if flow is None or room is None or cfg["softstart_min"] <= 0:
         return flow, None
     t = 0.0 if not running else (on_min if on_min is not None else 1e9)
     caps, why = [], []
     if start_water is not None and not below_floor:
-        # na een lange stilstand meet de OTThing het afgekoelde water in de buitenunit (13-15 °C,
-        # nachten 10-24/11-02/11-03), niet het radiatorwater binnen, dat niet onder de kamer zakt
+        # after a long standstill the OTThing measures the cooled-down water in the outdoor unit
+        # (13-15 C, nights of 10-24/11-02/11-03), not the radiator water inside, which does not drop
+        # below the room
         start_water = max(start_water, room)
         ramp = start_water + cfg["softstart_gap"] + cfg["softstart_rate"] * t / 5
         caps.append(ramp)
@@ -304,21 +309,21 @@ def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=No
 
 
 def planner_flow_drop(flow, last_cmd, running, max_drop, land_below=None, land_step=None, land_floor=None):
-    """PUUR: het aanvoerdoel van de planner zakt hooguit `max_drop` °C per cyclus onder het VORIGE
-    commando zolang de WP draait (stijgen mag direct).
+    """PURE: the planner's flow target falls by at most `max_drop` C per cycle below the PREVIOUS
+    command while the heat pump runs (rising is immediate).
 
-    De planner rekent het doel per cyclus vers uit de geplande warmte; als die zakt (zon, prijs)
-    springt het doel mee omlaag terwijl het water nog warm is. De P60 ziet de aanvoer dan ver boven
-    het doel, stopt zelf en staat een uur stil (2026-11-05 09:44-10:06: 38,5 -> 32,5 -> 31,2 bij
-    aanvoer ~35 -> stop; 11-04 15:13: 50 -> 36 bij 42). Dezelfde rem als limit_flow_drop in het
-    regel-pad. Gerekend vanaf ons eigen vorige commando, niet vanaf de gemeten aanvoer, dus geen
-    ratel (11-03). Niet vóór een start (dan geldt de zachte herstart) en niet als last_cmd ontbreekt.
+    The planner computes the target fresh every cycle from the planned heat; when that drops (sun,
+    price) the target jumps down with it while the water is still warm. The P60 then sees the flow far
+    above the target, stops itself and sits idle for an hour (2026-11-05 09:44-10:06: 38.5 -> 32.5 ->
+    31.2 with flow ~35 -> stop; 11-04 15:13: 50 -> 36 with 42). The same brake as limit_flow_drop in the
+    rule path. Counted from our own previous command, not from the measured flow, so no ratchet
+    (11-03). Not before a start (the soft restart applies then) and not when last_cmd is missing.
 
-    Zachte landing: vanaf `land_below` zakt het doel met `land_step`, en nooit onder `land_floor`.
-    De P60 draait daar al op minimum en stopt als het doel ~3 °C onder het water ligt; zo stopte hij
-    5 keer van 11-05 t/m 11-08 (900 rpm, water 3,1-4,1 °C boven het doel). De planner vraagt bij 1,5 kW
-    ~30 °C, terwijl het water bij minimumvermogen op ~32,5 °C blijft: zonder bodem stopt hij alsnog.
-    Een doel dat al onder de bodem ligt wordt niet opgetild. Geeft (flow, toelichting of None)."""
+    Soft landing: from `land_below` the target falls by `land_step`, and never below `land_floor`. The
+    P60 already runs at minimum there and stops when the target is ~3 C below the water; it stopped
+    like that 5 times from 11-05 to 11-08 (900 rpm, water 3.1-4.1 C above the target). At 1.5 kW the
+    planner asks ~30 C, while the water stays at ~32.5 C at minimum power: without a floor it stops
+    anyway. A target already below the floor is not raised. Returns (flow, explanation or None)."""
     if flow is None or last_cmd is None or not running:
         return flow, None
     landing = land_below is not None and land_step is not None and last_cmd <= land_below
@@ -331,27 +336,27 @@ def planner_flow_drop(flow, last_cmd, running, max_drop, land_below=None, land_s
     return held, f"aanvoer-rem: plan {flow} -> {held}°C (vorig commando {last_cmd}, max -{step:g}°C/cyclus)"
 
 
-DEFROST_SOFT_MAX_MIN = 60     # zo lang na het einde van een ontdooiing loopt hooguit de oploop
+DEFROST_SOFT_MAX_MIN = 60     # the ramp runs at most this long after the end of a defrost
 
 
 def defrost_soft_flow(flow, defrost, now, water_now, cfg, below_floor=False, max_min=DEFROST_SOFT_MAX_MIN):
-    """PUUR: na een ontdooiing het aanvoerdoel laten oplopen als bij een zachte herstart (2026-11-15).
+    """PURE: after a defrost, let the flow target ramp up as on a soft restart (2026-11-15).
 
-    Tijdens het ontdooien trekt de P60 warmte uit het water: aanvoer/retour zakken naar 26-33 °C. Met
-    het doel van de planner (42-47 °C) ziet hij daarna een gat van 10-15 K en gaat naar vol vermogen
-    (11-14 06:25: 5460 rpm, 2,5 kW elektrisch, ~1 u lang; 11-15 07:50: 5100 rpm). Wat dat drijft is het
-    gat, niet de hoogte van het doel (zie soft_start_flow). Plafond:
+    During a defrost the P60 pulls heat out of the water: flow/return drop to 26-33 C. With the
+    planner's target (42-47 C) it then sees a gap of 10-15 K and goes to full power (11-14 06:25:
+    5460 rpm, 2.5 kW electric, ~1 h; 11-15 07:50: 5100 rpm). What drives that is the gap, not the
+    height of the target (see soft_start_flow). Ceiling:
 
-        max(water_eind + gap + rate * minuten-sinds-einde / 5,  water_nu + gap)
+        max(water_end + gap + rate * minutes_since_end / 5,  water_now + gap)
 
-    water_eind = de warmste van aanvoer/retour in de laatste ontdooi-rij (defrost["water_end"]). De
-    tweede term is er omdat het water na een ontdooiing sneller oploopt dan de oploop: 2,5-5 °C per
-    5 min in het eerste kwartier (11-15 04:25-04:40 en 07:45-08:00). Zonder die term zakt het doel
-    onder het water en stopt de P60 zichzelf -- een uur herstartblokkade, erger dan de piek. Geen ratel
-    als op 11-03: dit kan het doel alleen verlagen, nooit boven het planner-doel tillen.
+    water_end = the warmer of flow/return in the last defrost row (defrost["water_end"]). The second
+    term is there because the water climbs faster than the ramp after a defrost: 2.5-5 C per 5 min in
+    the first quarter (11-15 04:25-04:40 and 07:45-08:00). Without it the target drops below the water
+    and the P60 stops itself -- an hour of restart lockout, worse than the burst. No ratchet as on
+    11-03: this can only lower the target, never lift it above the planner's target.
 
-    Alleen binnen `max_min` na het einde, niet onder de comfortgrens (dan is er haast, zoals bij de
-    zachte herstart), en uit met WP_DEFROST_SOFTSTART=0. Geeft (flow, toelichting of None)."""
+    Only within `max_min` after the end, not below the comfort floor (then there is a hurry, as with
+    the soft restart), and off with WP_DEFROST_SOFTSTART=0. Returns (flow, explanation or None)."""
     if not cfg.get("defrost_soft") or flow is None or not defrost or below_floor:
         return flow, None
     water_end = defrost.get("water_end")
@@ -372,16 +377,17 @@ def defrost_soft_flow(flow, defrost, now, water_now, cfg, below_floor=False, max
 
 
 def start_kick_flow(flow, running, water, gap, cap):
-    """PUUR: zolang de planner wil stoken maar de compressor niet draait, ligt het doel minstens
-    `gap` boven het water dat de P60 nu meet, anders ziet hij geen vraag en start hij niet.
+    """PURE: while the planner wants to heat but the compressor is not running, the target is at least
+    `gap` above the water the P60 measures now, else it sees no demand and does not start.
 
-    In serie achter de WP zit een 50 L-vat (Weheat WBF50) zonder sensor (WP -> vat -> pomp -> CV -> klep ->
-    radiatoren). Na een stop blijft dat warm; bij groen licht laat de P60 eerst zijn pomp draaien
-    en meet dan dat vat-water. Lag ons doel daaronder, dan wachtte hij tot het vat via de
-    radiatoren was afgekoeld: 11-03 20:11 en 11-04 19:17 ~50 min, 11-05 15:48-16:40 bijna 2 uur
-    zonder warmte terwijl de planner dacht 1,5-2,75 kW te leveren. De meting telt alleen vóór de
-    compressor draait (dan stookt de P60 niet, dus geen terugkoppeling/ratel als op 11-03); daarna
-    nemen de oploop en de daalrem het over. Geeft (flow, toelichting of None)."""
+    In series behind the heat pump sits a 50 L vessel (Weheat WBF50) without a sensor (heat pump ->
+    vessel -> pump -> boiler -> valve -> radiators). After a stop it stays warm; on a green light the
+    P60 first runs its pump and then measures that vessel water. If our target was below it, it waited
+    until the vessel had cooled through the radiators: 11-03 20:11 and 11-04 19:17 ~50 min, 11-05
+    15:48-16:40 almost 2 hours without heat while the planner thought it delivered 1.5-2.75 kW. The
+    measurement only counts before the compressor runs (the P60 is not heating then, so no feedback/
+    ratchet as on 11-03); after that the ramp and the drop brake take over. Returns (flow,
+    explanation or None)."""
     if flow is None or running or water is None:
         return flow, None
     need = round(min(water + gap, cap), 1)
@@ -391,7 +397,7 @@ def start_kick_flow(flow, running, water, gap, cap):
 
 
 def live_water():
-    """De hoogste van aanvoer en retour uit het laatste OTThing-bericht (~5 s oud), of None."""
+    """The higher of flow and return from the latest OTThing message (~5 s old), or None."""
     vals = [v for v in (_otev_prev.get("flow"), _otev_prev.get("ret")) if isinstance(v, (int, float))]
     return max(vals) if vals else None
 
@@ -410,62 +416,62 @@ def build_cfg():
         "base_topic": base,
         "channel":   int(os.environ.get("WP_CHANNEL", "1")),
         "dry_run":   os.environ.get("WP_DRY_RUN", "1") not in ("0", "false", "False", ""),
-        # aparte vlag voor de buitentemp-publicatie; niet gezet => erft WP_DRY_RUN
+        # separate flag for publishing the outside temperature; not set => inherits WP_DRY_RUN
         "outside_dry_run": os.environ.get("WP_OUTSIDE_DRY_RUN",
                                           os.environ.get("WP_DRY_RUN", "1")) not in ("0", "false", "False", ""),
         "schedule":  parse_schedule(os.environ.get("WP_SCHEDULE", DEFAULT_SCHEDULE)),
         "interval":  int(os.environ.get("WP_CHECK_INTERVAL", "300")),
         "sched_table": os.environ.get("WP_SCHED_TABLE", "battery_schedule"),
-        # onafhankelijke HA-buitenvoeler (user 2026-10-22) = 1e keus voor outsideTemp; KNMI = fallback.
-        # entity-id staat in .env (WP_OUTSIDE_ENTITY), niet in code — publieke repo.
+        # independent HA outdoor sensor (user 2026-10-22) = first choice for outsideTemp; KNMI = fallback.
+        # The entity id lives in .env (WP_OUTSIDE_ENTITY), not in code -- public repo.
         "ha_url":     os.environ.get("HA_URL"),
         "ha_token":   os.environ.get("HA_TOKEN"),
         "ha_entity":  os.environ.get("WP_OUTSIDE_ENTITY", "sensor.outdoor_temperature"),
-        # 6 u (2026-11-02, was 2 u): de buitenvoeler meldt alleen bij verandering — 's nachts en bij stabiel
-        # weer gaten tot ~5 u. Geen melding = niet veranderd; met 2 u viel hij midden in het ochtend-
-        # opwarmen (07:49-10:44) onnodig terug op KNMI.
+        # 6 h (2026-11-02, was 2 h): the outdoor sensor only reports on change -- gaps of up to ~5 h at
+        # night and in stable weather. No report = unchanged; with 2 h it fell back to KNMI needlessly in
+        # the middle of the morning warm-up (07:49-10:44).
         "ha_max_age": int(os.environ.get("WP_OUTSIDE_MAX_AGE_S", "21600")),
-        # 6-punts weercurve (user 2026-10-22) "buiten:aanvoer,..." = wat pi5new ZOU sturen (shadow,
-        # nog DRY). Zelfde curve als in de OTThing; verschil met de OTThing-target = demping + later
-        # preheat/prijs/PV. Zie [[heatpump-control-lever]].
-        # 2026-11-02: punt 10 °C 35 -> 38. Eerste dag zonder I-ratel (Ki 0,15 + opbouwpoort): rond 10 °C
-        # buiten bleef de kamer 0,4-0,6 °C onder het setpoint (11:00: 20,9 bij 21,5, aanvoer ~39) — de
-        # oude hoge I had dat gat steeds dichtgedrukt. Hogere basis i.p.v. de I weer los.
+        # 6-point weather curve (user 2026-10-22) "outside:flow,..." -- the same curve as in the
+        # OTThing; the difference with the OTThing target = damping + preheat/price/PV.
+        # 2026-11-02: point 10 C 35 -> 38. First day without the I ratchet (Ki 0.15 + build-up gate):
+        # around 10 C outside the room stayed 0.4-0.6 C below the setpoint (11:00: 20.9 at 21.5, flow
+        # ~39) -- the old high I had kept pushing that gap shut. A higher base instead of letting I loose again.
         "curve": parse_curve(os.environ.get("WP_FLOW_CURVE",
                                             "20:28,10:38,0:42,-10:48,-25:50,-30:50")),
-        # pi5new-REGELING: wij beslissen aan/uit + aanvoer en sturen de WP (chMode1/chSetTemp1).
-        # control_live=0 -> alleen loggen (shadow); 1 -> echt sturen. Hysterese rond het Honeywell-
-        # setpoint voorkomt pendelen. overrideChFlow1 moet AAN staan zodat chSetTemp1 wint.
+        # pi5new CONTROL: we decide on/off + flow and drive the heat pump (chMode1/chSetTemp1).
+        # control_live=0 -> log only (shadow); 1 -> really drive it. Hysteresis around the setpoint
+        # prevents toggling. overrideChFlow1 must be ON so chSetTemp1 wins.
         "control_live":   os.environ.get("WP_CONTROL_LIVE", "0") not in ("0", "false", "False", ""),
         "heat_on_below":  float(os.environ.get("WP_HEAT_ON_BELOW", "0.2")),
-        # uit-grens ruim (0.8, user 2026-10-24): rond het setpoint moduleert de WP LAAG door (negatieve
-        # room-comp tot flow_min) i.p.v. een uur uit; een avond-setback (bv. 22->19) zit er ver boven -> uit.
+        # wide off threshold (0.8, user 2026-10-24): around the setpoint the heat pump keeps modulating
+        # LOW (negative room comp down to flow_min) instead of an hour off; an evening setback
+        # (e.g. 22->19) is far above it -> off.
         "heat_off_above": float(os.environ.get("WP_HEAT_OFF_ABOVE", "0.8")),
-        # tijdens de prijs-uitrol uit zodra de kamer net boven het uitrol-setpoint zit (2026-11-01)
+        # during the price coast: off as soon as the room is just above the coast setpoint (2026-11-01)
         "heat_off_above_coast": float(os.environ.get("WP_HEAT_OFF_ABOVE_COAST", "0.1")),
-        # room-compensatie (P): extra aanvoer bovenop de curve bij een kamer-achterstand, zodat een
-        # setpoint-sprong echt sneller opwarmt (anders blijft de aanvoer = curve). Gecapt op flow_cap.
+        # room compensation (P): extra flow on top of the curve when the room lags, so a setpoint step
+        # really warms up faster (else the flow stays = curve). Capped at flow_cap.
         "rc_kp":    float(os.environ.get("WP_ROOMCOMP_KP", "4")),
         "rc_max":   float(os.environ.get("WP_ROOMCOMP_MAX", "10")),
-        # gedempte I bovenop de P: ruimt de rest-droop op zodat de kamer ECHT naar het setpoint klimt
-        # i.p.v. er net onder te blijven hangen. rc_ki = integratiesnelheid (°aanvoer per cyclus per
-        # °C kamer-tekort); rc_i_max = harde begrenzing op de integrator; demping = de integrator
-        # bloedt af naarmate de kamer het setpoint nadert (rc_damp_leak, ramp over rc_damp_band °C) én
-        # bevriest zolang de aanvoer tegen zijn plafond zit (anti-windup). Zie room_comp_pi.
-        # 2026-10-26: Ki 0.3 -> 0.5. De demping lekte eerst rond het setpoint (I plafonneerde op ~0.8,
-        # kamer bleef 0.4 °C te laag), daarna sterkst óp het setpoint (I liep weg zodra de kamer er
-        # was). Nu lekt I alleen bij doorschieten: vol bij setpoint + band (0.2 °C).
-        # 2026-11-01: Ki 0.5 -> 0.15 (het huis reageert in uren: τ ≈ 87 u) + opbouw-poort: I bouwt
-        # alleen op als de kamer vastzit — niet binnen rc_i_hold_min na een setpoint-verhoging en
-        # niet zolang de kamer stijgt (> rc_i_trend K/u). Zie i_buildup_gate.
+        # damped I on top of P: clears the remaining droop so the room REALLY climbs to the setpoint
+        # instead of hanging just below it. rc_ki = integration speed (C of flow per cycle per C of room
+        # shortfall); rc_i_max = hard limit on the integrator; damping = the integrator bleeds off on
+        # overshoot (rc_damp_leak, ramped over rc_damp_band C) and freezes while the flow is at its
+        # ceiling (anti-windup). See room_comp_pi.
+        # 2026-10-26: Ki 0.3 -> 0.5. The damping first leaked around the setpoint (I capped at ~0.8, the
+        # room stayed 0.4 C too low), then strongest at the setpoint (I ran away once the room got
+        # there). Now I only leaks on overshoot: full at setpoint + band (0.2 C).
+        # 2026-11-01: Ki 0.5 -> 0.15 (the house responds over hours: tau ~ 87 h) + build-up gate: I only
+        # builds up when the room is stuck -- not within rc_i_hold_min after a setpoint increase and not
+        # while the room is rising (> rc_i_trend K/h). See i_buildup_gate.
         "rc_ki":        float(os.environ.get("WP_ROOMCOMP_KI", "0.15")),
         "rc_i_hold_min": float(os.environ.get("WP_ROOMCOMP_I_HOLD_MIN", "90")),
         "rc_i_trend":   float(os.environ.get("WP_ROOMCOMP_I_TREND", "0.05")),
         "rc_i_max":     float(os.environ.get("WP_ROOMCOMP_I_MAX", "8")),
         "rc_damp_band": float(os.environ.get("WP_ROOMCOMP_DAMP_BAND", "0.2")),
         "rc_damp_leak": float(os.environ.get("WP_ROOMCOMP_DAMP_LEAK", "0.2")),
-        # negatieve room-comp: kamer boven setpoint -> aanvoer tot rc_neg_max °C ONDER de curve, nooit
-        # onder flow_min. Zo draait de WP laag door i.p.v. aan/uit te pendelen.
+        # negative room comp: room above setpoint -> flow up to rc_neg_max C BELOW the curve, never below
+        # flow_min. So the heat pump keeps running low instead of toggling on/off.
         "rc_neg_max":   float(os.environ.get("WP_ROOMCOMP_NEG_MAX", "8")),
         # Planner (2026-11-03): off = rules only; shadow = plan + log, the rules still drive the heat pump;
         # live = the plan drives it, the rules take over on any planner error. Comfort floor per band.
@@ -473,36 +479,37 @@ def build_cfg():
         "comfort":   os.environ.get("WP_COMFORT_MIN", ""),
         "flow_min": float(os.environ.get("WP_FLOW_MIN", "28")),
         "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
-        "flow_max_drop": float(os.environ.get("WP_FLOW_MAX_DROP", "1.0")),  # °C per cyclus omlaag
-        "flow_land_below": float(os.environ.get("WP_FLOW_LAND_BELOW", "37")),  # zachte landing vanaf dit doel
-        "flow_land_step":  float(os.environ.get("WP_FLOW_LAND_STEP", "0.5")),  # °C per cyclus omlaag tijdens de landing
-        "flow_land_floor": float(os.environ.get("WP_FLOW_LAND_FLOOR", "32")),  # bodem van het doel zolang de WP draait
-        # zachte herstart (2026-11-04, alleen planner-live): zie soft_start_flow. 0 min = uit.
+        "flow_max_drop": float(os.environ.get("WP_FLOW_MAX_DROP", "1.0")),  # C per cycle down
+        "flow_land_below": float(os.environ.get("WP_FLOW_LAND_BELOW", "37")),  # soft landing from this target
+        "flow_land_step":  float(os.environ.get("WP_FLOW_LAND_STEP", "0.5")),  # C per cycle down during the landing
+        "flow_land_floor": float(os.environ.get("WP_FLOW_LAND_FLOOR", "32")),  # floor of the target while the heat pump runs
+        # soft restart (2026-11-04, planner live only): see soft_start_flow. 0 min = off.
         "softstart_min": float(os.environ.get("WP_SOFTSTART_MIN", "60")),
-        "softstart_kp":  float(os.environ.get("WP_SOFTSTART_KP", "4")),     # °C aanvoer per K tekort
-        "softstart_neg": float(os.environ.get("WP_SOFTSTART_NEG", "3")),    # max °C onder de stooklijn
-        "softstart_gap": float(os.environ.get("WP_SOFTSTART_GAP", "3")),    # startdoel = water + gap
-        "softstart_rate": float(os.environ.get("WP_SOFTSTART_RATE", "1")),  # °C oploop per 5 min looptijd
-        # na een ontdooiing dezelfde oploop vanaf het water (defrost_soft_flow); 0 = uit
+        "softstart_kp":  float(os.environ.get("WP_SOFTSTART_KP", "4")),     # C of flow per K of shortfall
+        "softstart_neg": float(os.environ.get("WP_SOFTSTART_NEG", "3")),    # max C below the heating curve
+        "softstart_gap": float(os.environ.get("WP_SOFTSTART_GAP", "3")),    # start target = water + gap
+        "softstart_rate": float(os.environ.get("WP_SOFTSTART_RATE", "1")),  # C of ramp per 5 min of run time
+        # after a defrost the same ramp from the water (defrost_soft_flow); 0 = off
         "defrost_soft":  os.environ.get("WP_DEFROST_SOFTSTART", "1").strip() not in ("0", "", "false", "no"),
-        # melding "Honeywell-knop te laag" (honeywell_low_step); 0 = uit
+        # alert "Honeywell knob too low" (honeywell_low_step); 0 = off
         "hw_low_alert":  os.environ.get("WP_HW_LOW_ALERT", "1").strip() not in ("0", "", "false", "no"),
-        "hw_low_margin": float(os.environ.get("WP_HW_LOW_MARGIN", "0.2")),   # K boven de knop (P60 stopt ~+0,5)
+        "hw_low_margin": float(os.environ.get("WP_HW_LOW_MARGIN", "0.2")),   # K above the knob (the P60 stops at ~+0.5)
         "hw_low_hold_s": float(os.environ.get("WP_HW_LOW_HOLD_S", "600")),
         "publish_outside": os.environ.get("WP_PUBLISH_OUTSIDE", "1") not in ("0", "false", "False", ""),
         "out_min":   float(os.environ.get("WP_OUTSIDE_MIN", "-40")),
         "out_max":   float(os.environ.get("WP_OUTSIDE_MAX", "50")),
-        # aanname als er geen buitentemp is (beter een gematigde aanvoer dan de WP uit + 60 min)
+        # assumption when there is no outside temperature (a moderate flow beats the heat pump off + 60 min)
         "outside_fallback": float(os.environ.get("WP_OUTSIDE_FALLBACK", "15")),
         "valve_log": os.environ.get("WP_VALVE_LOG", "1") not in ("0", "false", "False", ""),
         "valve_topic": os.environ.get("WP_VALVE_TOPIC",
                                       "zigbee2mqtt/230V smart switch 5 3-way retour-buffer-valve"),
         "valve_stale_s": int(os.environ.get("WP_VALVE_STALE_S", "660")),
-        # handmatige-override: kamerthermostaat staat (door user) op max ovr_threshold in alle periodes;
-        # vraagt hij meer -> iemand draaide eraan -> honoreer (gecapt op ovr_max) voor ovr_hold_s, dan nominaal
-        # prijs-overlay (2026-10-27, herzien 11-01): het huis voorladen in het goedkoopste blok
-        # (10-15 uur) tot 22,5 en daarna tot 19:00 uitrollen met een strakke uit-drempel; het
-        # schema houdt 13-17 op 22 (afgesproken met de bewoners). Nooit een nachtverlaging ophogen.
+        # manual override: the room thermostat sits (set by the user) at most at ovr_threshold in every
+        # period; if it asks more -> someone turned it -> honour it (capped at ovr_max) for ovr_hold_s,
+        # then nominal.
+        # price overlay (2026-10-27, revised 11-01): preload the house in the cheapest block (10-15 h)
+        # up to 22.5 and then coast until 19:00 with a tight off threshold; the schedule keeps 13-17 at
+        # 22 (agreed with the household). Never raise a night setback.
         "price_overlay":     os.environ.get("WP_PRICE_OVERLAY", "1") == "1",
         "price_cheap_sp":    float(os.environ.get("WP_PRICE_CHEAP_SP", "22.5")),
         "price_raise_from":  float(os.environ.get("WP_PRICE_RAISE_FROM", "21.0")),
@@ -515,31 +522,31 @@ def build_cfg():
         "ovr_threshold": float(os.environ.get("WP_OVERRIDE_THRESHOLD", "21.5")),
         "ovr_max":       float(os.environ.get("WP_OVERRIDE_MAX", "23.0")),
         "ovr_hold_s":    int(os.environ.get("WP_OVERRIDE_HOLD_S", "3600")),
-        # verlaging: knop omlaag onder wat de software wil -> die stand (min und_min) voor und_hold_s
+        # lowering: knob turned below what the software wants -> that setting (min und_min) for und_hold_s
         "und_min":       float(os.environ.get("WP_UNDERRIDE_MIN", "19.0")),
         "und_hold_s":    int(os.environ.get("WP_UNDERRIDE_HOLD_S", "3600")),
-        # OVERLAY #1 (cold-scaled preheat) -> chSetTemp1. ceil < OTThing-flowMax (50) houdt overshoot
-        # fysiek onmogelijk; conservatieve defaults, met data te tunen (zie compute_flow_target).
+        # OVERLAY #1 (cold-scaled preheat) -> chSetTemp1. ceil < the OTThing flowMax (50) keeps overshoot
+        # physically impossible; conservative defaults, to be tuned with data (see compute_flow_target).
         "flow": {
-            "mild":          float(os.environ.get("WP_FLOW_MILD", "35")),        # flow bij mild_ref buiten
-            "mild_ref":      float(os.environ.get("WP_FLOW_MILD_REF", "10")),    # referentie-buitentemp
-            "slope":         float(os.environ.get("WP_FLOW_COLD_SLOPE", "0.6")), # °flow per °C kouder
+            "mild":          float(os.environ.get("WP_FLOW_MILD", "35")),        # flow at mild_ref outside
+            "mild_ref":      float(os.environ.get("WP_FLOW_MILD_REF", "10")),    # reference outside temperature
+            "slope":         float(os.environ.get("WP_FLOW_COLD_SLOPE", "0.6")), # C of flow per C colder
             "floor":         float(os.environ.get("WP_FLOW_FLOOR", "28")),
             "ceil":          float(os.environ.get("WP_FLOW_CEIL", "48")),        # < flowMax 50
             "preheat_start": _hhmm_min(os.environ.get("WP_PREHEAT_START", "05:00")),
             "preheat_end":   _hhmm_min(os.environ.get("WP_PREHEAT_END",   "08:00")),
-            "preheat_boost": float(os.environ.get("WP_PREHEAT_BOOST", "4")),     # max extra °flow 's ochtends
-            "cold_ref":      float(os.environ.get("WP_PREHEAT_COLD_REF", "10")), # boost 0 bij/boven dit
-            "cold_span":     float(os.environ.get("WP_PREHEAT_COLD_SPAN", "12")),# koude-schaal-breedte
+            "preheat_boost": float(os.environ.get("WP_PREHEAT_BOOST", "4")),     # max extra C of flow in the morning
+            "cold_ref":      float(os.environ.get("WP_PREHEAT_COLD_REF", "10")), # boost 0 at/above this
+            "cold_span":     float(os.environ.get("WP_PREHEAT_COLD_SPAN", "12")),# width of the cold scale
         },
     }
 
 
-# ── de beslissing (PUUR — geen I/O; dit is wat de test aanvalt) ─────────────────────────
+# ── the decision (PURE -- no I/O; this is what the tests exercise) ─────────────────────
 def schedule_setpoint(now, schedule):
-    """Actieve setpoint (°C) + reden uit een breekpunt-schema op tijdstip `now`. Kiest het LAATSTE
-    breekpunt waarvan de tijd ≤ now; vóór het eerste breekpunt wrapt het naar het laatste (vorige
-    dag). Leeg schema -> veilige 20.0."""
+    """Active setpoint (C) + reason from a breakpoint schedule at time `now`. Picks the LAST breakpoint
+    whose time is <= now; before the first breakpoint it wraps to the last one (previous day). Empty
+    schedule -> a safe 20.0."""
     if not schedule:
         return 20.0, "schema leeg (fallback 20.0°C)"
     m = now.hour * 60 + now.minute
@@ -549,34 +556,34 @@ def schedule_setpoint(now, schedule):
             active = (mins, temp)
         else:
             break
-    if active is None:                   # vóór het eerste breekpunt -> wrap naar gisteren-laatst
+    if active is None:                   # before the first breakpoint -> wrap to yesterday's last
         active = schedule[-1]
     hh, mm = divmod(active[0], 60)
     return active[1], f"schema {active[1]}°C (vanaf {hh:02d}:{mm:02d})"
 
 
 def decide_setpoint(now, cfg):
-    """Nominale roomSetpoint uit het dag/nacht-breekpunt-schema (puur tijd). Zie schedule_setpoint.
-    Geen comfort-bodem en geen cold-scaled voorverwarming: het schema is de expliciete waarheid; het
-    veiligheidsvangnet bij software-uitval is de fysieke fallback-thermostaat + de OTThing-suspend."""
+    """Nominal roomSetpoint from the day/night breakpoint schedule (time only). See schedule_setpoint.
+    No comfort floor and no cold-scaled preheating: the schedule is the explicit truth; the safety net
+    when the software fails is the physical fallback thermostat + the OTThing suspend."""
     return schedule_setpoint(now, cfg["schedule"])
 
 
 def price_windows(prices, day, cfg):
-    """PUUR: kies voor `day` het blok om het huis met goedkope stroom op te laden en de uitrol daarna.
+    """PURE: pick for `day` the block to charge the house with cheap electricity, and the coast after it.
 
-    2026-11-01: opladen = voorladen tot price_cheap_sp (22,5) in het goedkoopste blok binnen
-    [price_cheap_from, price_cheap_to] = 10-15 uur; de uitrol (tot price_coast_to) verlaagt het
-    setpoint niet meer maar zet alleen de uit-drempel strak (heat_off_above): het schema houdt 13-17
-    op 22, het voorgeladen huis zakt ~0,15-0,2 °C/u en de WP blijft in de dure 15-21 uur uit.
+    2026-11-01: charging = preloading up to price_cheap_sp (22.5) in the cheapest block within
+    [price_cheap_from, price_cheap_to] = 10-15 h; the coast (until price_coast_to) no longer lowers the
+    setpoint but only makes the off threshold tight (heat_off_above): the schedule keeps 13-17 at 22,
+    the preloaded house drops ~0.15-0.2 C/h and the heat pump stays off in the expensive 15-21 h.
 
-    prices = {kwartier-slot_dt: €/kWh}. Opladen = het goedkoopste aaneengesloten blok van
-    price_cheap_hours dat binnen [price_cheap_from, price_cheap_to] valt; uitrollen = van het einde
-    daarvan tot price_coast_to (de avond-setback). Het huis is de accu: ~25 kWh warmte per °C, en
-    het zakt nu ~0,1 °C/uur, dus een halve graad extra draagt de WP stil door de avondpiek.
-    Alleen als het duurste price_peak_hours-blok in de uitrol minstens price_min_spread duurder is
-    dan het opladen; anders kost het extra stoken (hogere aanvoer, meer verlies) meer dan het
-    oplevert. Ontbrekende slots tellen niet mee. -> (venster-dict of None, reden)."""
+    prices = {quarter slot_dt: EUR/kWh}. Charging = the cheapest contiguous block of price_cheap_hours
+    within [price_cheap_from, price_cheap_to]; coasting = from its end until price_coast_to (the
+    evening setback). The house is the battery: ~25 kWh of heat per C, and it now drops ~0.1 C/hour,
+    so half a degree extra carries the heat pump idle through the evening peak. Only when the dearest
+    price_peak_hours block in the coast is at least price_min_spread dearer than the charging;
+    otherwise the extra heating (higher flow, more loss) costs more than it brings. Missing slots do
+    not count. -> (window dict or None, reason)."""
     q = timedelta(minutes=15)
     base = datetime(day.year, day.month, day.day)
     at = lambda hhmm: base + timedelta(minutes=_hhmm_min(hhmm))
@@ -616,11 +623,11 @@ def price_windows(prices, day, cfg):
 
 
 def price_overlay(now, nominal, reason, win, cfg):
-    """PUUR: het nominale schema-setpoint bijgesteld op het prijsvenster: in het oplaadblok omhoog
-    naar price_cheap_sp. Alleen overdag (nominaal >= price_raise_from): een nachtverlaging wordt
-    nooit opgehoogd. Sinds 2026-11-01 verlaagt de uitrol het setpoint NIET meer — 10-30 rolde de
-    middag uit op 21 terwijl de vrouw het 13-17 warm wil (klacht 15:20); de uitrol is nu alleen de
-    strakke uit-drempel in heat_off_above."""
+    """PURE: the nominal schedule setpoint adjusted for the price window: raised to price_cheap_sp in the
+    charging block. Daytime only (nominal >= price_raise_from): a night setback is never raised. Since
+    2026-11-01 the coast NO LONGER lowers the setpoint -- on 10-30 the afternoon coasted at 21 while the
+    household wants it warm 13-17 (complaint at 15:20); the coast is now only the tight off threshold
+    in heat_off_above."""
     if not win or nominal < cfg["price_raise_from"]:
         return nominal, reason
     if win["cheap_start"] <= now < win["cheap_end"] and cfg["price_cheap_sp"] > nominal:
@@ -630,24 +637,24 @@ def price_overlay(now, nominal, reason, win, cfg):
 
 
 def heat_off_above(now, sp, win, cfg, nominal):
-    """PUUR: de uit-drempel boven het setpoint voor decide_heat. Normaal heat_off_above (0,8: rond
-    het setpoint laag doordraaien i.p.v. uit). Tijdens de prijs-uitrol (na het oplaadblok tot
-    coast_end) heat_off_above_coast: het voorgeladen huis rolt uit en de WP blijft in de piek stil,
-    tenzij de kamer onder sp - heat_on_below zakt (comfort gaat voor). Niet bij een bump (sp boven
-    het nominale schema `nominal`): wie omhoog draait, wil nu warmte. 10-29: kamer 21,7 bij sp 21,0
-    bleef onder 21,0+0,8 -> HEAT in €0,73."""
+    """PURE: the off threshold above the setpoint for decide_heat. Normally heat_off_above (0.8: keep
+    running low around the setpoint instead of off). During the price coast (after the charging block
+    until coast_end) heat_off_above_coast: the preloaded house coasts and the heat pump stays idle in
+    the peak, unless the room drops below sp - heat_on_below (comfort first). Not during a bump (sp
+    above the nominal schedule `nominal`): whoever turns it up wants heat now. 10-29: room 21.7 at sp
+    21.0 stayed below 21.0+0.8 -> HEAT at EUR 0.73."""
     if win and win["cheap_end"] <= now < win["coast_end"] and sp <= nominal + 0.01:
         return cfg["heat_off_above_coast"]
     return cfg["heat_off_above"]
 
 
 STATE_FILE =os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_state.json")
-STATE_MAX_AGE_S = 900   # aan/uit-stand en I-term ouder dan dit zijn niet meer representatief
+STATE_MAX_AGE_S = 900   # an on/off state and I term older than this are no longer representative
 
 
 def save_state(ovr_state, heat_state, i_state, now, path=STATE_FILE):
-    """Bewaar wat een herstart anders kwijtraakt: een lopend bump- of verlagingsvenster, de aan/uit-stand van de
-    hysterese en de I-term. Best-effort."""
+    """Save what a restart would otherwise lose: a running bump or lowering window, the hysteresis
+    on/off state and the I term. Best effort."""
     until, und = ovr_state.get("ovr_until"), ovr_state.get("und_until")
     d = {"saved": now.isoformat(timespec="seconds"),
          "ovr_until": until.isoformat(timespec="seconds") if until else None,
@@ -664,9 +671,9 @@ def save_state(ovr_state, heat_state, i_state, now, path=STATE_FILE):
 
 
 def load_state(now, path=STATE_FILE, max_age_s=STATE_MAX_AGE_S):
-    """(ovr, heat, i) uit het bewaarde bestand, elk {} als er niets bruikbaars is. Het bump-venster
-    geldt tot z'n eigen eindtijd; aan/uit en I alleen als het bestand jonger is dan max_age_s.
-    Draait de knop intussen terug onder de drempel, dan breekt decide_with_override de bump af."""
+    """(ovr, heat, i) from the saved file, each {} when nothing usable is there. The bump window holds
+    until its own end time; on/off and I only when the file is younger than max_age_s. If the knob is
+    turned back below the threshold meanwhile, decide_with_override ends the bump."""
     try:
         with open(path) as f:
             d = json.load(f)
@@ -691,23 +698,23 @@ def load_state(now, path=STATE_FILE, max_age_s=STATE_MAX_AGE_S):
     return ovr, heat, i
 
 
-HW_LOW_KEY = "wp_hw_setpoint_low"     # alert_latch-sleutel; voorvoegsel wp_ = warmtepomptegel in WordPress (pv_ = PV, rest = accu)
+HW_LOW_KEY = "wp_hw_setpoint_low"     # alert_latch key; prefix wp_ = heat pump tile in WordPress (pv_ = PV, rest = battery)
 
 
 def honeywell_low_step(knob, room, threshold, margin, lowering_active, since, latched, now, hold_s):
-    """PUUR: toestandsmachine voor de melding "Honeywell-knop te laag" (2026-11-15).
+    """PURE: state machine for the alert "Honeywell knob too low" (2026-11-15).
 
-    De Honeywell geeft zijn knopstand als OpenTherm-ID16 door aan de P60 (de OTThing in Repeater laat ID16
-    ongemoeid, firmware 2.61..2.63). Komt de kamer ~0,5 boven die stand, dan stopt de P60 zelf -- ook als
-    wij nog stoken -- met een uur herstartblokkade (11-05 14:50, 11-09 04:10, 11-12 15:07; elke keer stond
-    de knop onder 22,5). Zolang de OTThing ID16 niet kan vervangen (feature request OT-Thing #72) is de
-    knop op `threshold` laten staan de remedie; deze melding vraagt erom.
+    The Honeywell passes its knob setting to the P60 as OpenTherm ID16 (the OTThing in Repeater leaves
+    ID16 alone, firmware 2.61..2.63). When the room gets ~0.5 above that setting the P60 stops itself --
+    even while we still ask for heat -- with an hour of restart lockout (11-05 14:50, 11-09 04:10,
+    11-12 15:07; each time the knob was below 22.5). Until the OTThing can replace ID16 (feature
+    request OT-Thing #72) the remedy is to leave the knob at `threshold`; this alert asks for that.
 
-    Risico = knop < threshold, kamer >= knop + margin, en geen lopende handmatige verlaging (dan wil de
-    gebruiker het juist koeler en is een stop onschuldig; het risico begint pas als dat uur voorbij is).
-    `hold_s` aangehouden -> 'trigger'. 'clear' pas als de knop weer op threshold staat: zakt alleen de
-    kamer, dan blijft het risico bij de volgende opwarming bestaan. Een ontbrekende lezing verandert niets.
-    Geeft (since, latched, action) met action 'trigger' | 'clear' | None."""
+    Risk = knob < threshold, room >= knob + margin, and no manual lowering running (then the user wants
+    it cooler and a stop is harmless; the risk only starts once that hour is over). Held for `hold_s`
+    -> 'trigger'. 'clear' only once the knob is back at threshold: if only the room drops, the risk is
+    still there at the next warm-up. A missing reading changes nothing.
+    Returns (since, latched, action) with action 'trigger' | 'clear' | None."""
     if knob is None or room is None:
         return since, latched, None
     if knob >= threshold - 0.05:
@@ -721,57 +728,56 @@ def honeywell_low_step(knob, room, threshold, margin, lowering_active, since, la
 
 
 def decide_with_override(now, thermostat_setp, state, cfg, price_win=None):
-    """PUUR: wrapt decide_setpoint met de handmatige-override-regel.
+    """PURE: wraps decide_setpoint with the manual override rule.
 
-    `thermostat_setp` = de door de FYSIEKE Honeywell gevraagde room-setpoint
-    (otthing_roomunit_set_t_c = roomunit.room_set_t, de ECHTE wand-knop in Master-mode). Dat is de knop/het schema,
-    ONAFHANKELIJK van wat wij injecteren (onze injectie loopt via slave.tr_override) → geen zelf-trigger.
+    `thermostat_setp` = the room setpoint asked by the PHYSICAL Honeywell (otthing_roomunit_set_t_c =
+    roomunit.room_set_t, the REAL wall knob). That is the knob/schedule, INDEPENDENT of what we inject
+    (our injection goes through slave.tr_override) -> no self-trigger.
 
-    Regel (user 2026-10-15): de kamerthermostaat staat op max `ovr_threshold` (bv. 21,5) in álle
-    periodes. Vraagt hij méér, dan heeft iemand aan de knop gedraaid → honoreer die nieuwe wens
-    (gecapt op `ovr_max`, bv. 23) gedurende `ovr_hold_s` (bv. 1 u); daarna weer het nominale algo.
-    Een NIEUWE/gewijzigde verhoging (≠ vorige meting) herstart het venster. **Draait de knop terug
-    naar ≤ drempel, dan eindigt de boost METEEN** (venster wissen) — niet het uur volmaken.
+    Rule (user 2026-10-15): the room thermostat sits at most at `ovr_threshold` (e.g. 21.5) in every
+    period. If it asks MORE, someone turned the knob -> honour that new wish (capped at `ovr_max`, e.g.
+    23) for `ovr_hold_s` (e.g. 1 h); then back to the nominal algorithm. A NEW/changed increase (!= the
+    previous reading) restarts the window. **If the knob goes back to <= threshold, the boost ends AT
+    ONCE** (window cleared) -- it does not run out the hour.
 
-    Verlaging (user 2026-10-27): draait iemand de knop OMLAAG tot onder wat de software nu wil
-    (schema + prijsvenster), dan geldt die stand — absoluut, met bodem `und_min` — voor `und_hold_s`.
-    Een nieuwe verlaging herstart het venster, elke draai omhoog beëindigt het (boven de drempel
-    wordt het een bump). Het venster maakt het nooit warmer dan het schema op dat moment.
-    Het Honeywell-klokprogramma zet maar één verlaging per 24 uur: 19:00 -> 19, gelijk aan onze
-    eigen avondverlaging, dus die valt niet onder "lager dan de software wil" en telt niet. Een
-    tweede geprogrammeerde verlaging in de Honeywell is NIET ondersteund: die zou als handmatige
-    draai gelden.
+    Lowering (user 2026-10-27): if someone turns the knob DOWN below what the software wants now
+    (schedule + price window), that setting holds -- absolute, with floor `und_min` -- for `und_hold_s`.
+    A new lowering restarts the window, any turn upwards ends it (above the threshold it becomes a
+    bump). The window never makes it warmer than the schedule at that moment. The Honeywell clock
+    program sets only one lowering per 24 hours: 19:00 -> 19, equal to our own evening setback, so that
+    is not "lower than the software wants" and does not count. A second programmed lowering in the
+    Honeywell is NOT supported: it would count as a manual turn.
 
-    Bij het openen van een bump-venster gaat `last_q` (de planner-warmte van de vorige cyclus, kW)
-    mee als `ovr_q`: de bump-cap van de planner zakt nooit onder wat er al geleverd werd (zie
+    When a bump window opens, `last_q` (the planner heat of the previous cycle, kW) is carried along as
+    `ovr_q`: the planner's bump cap never drops below what was already delivered (see
     wp_planner.heat_cap).
 
-    `state` = mutabele dict {ovr_until, ovr_target, ovr_q, und_until, und_target, last_setp, last_q} die tussen
-    cycli bewaard blijft. Bump en verlaging gaan vóór het prijsvenster (price_win, zie
-    price_overlay). Returnt (sp, reason)."""
+    `state` = mutable dict {ovr_until, ovr_target, ovr_q, und_until, und_target, last_setp, last_q},
+    kept between cycles. Bump and lowering come before the price window (price_win, see
+    price_overlay). Returns (sp, reason)."""
     thr, mx, hold = cfg["ovr_threshold"], cfg["ovr_max"], cfg["ovr_hold_s"]
     prev = state.get("last_setp")
     nominal, nominal_why = price_overlay(now, *decide_setpoint(now, cfg), price_win, cfg)
     moved = thermostat_setp is not None and prev is not None and abs(thermostat_setp - prev) > 0.05
     if moved and thermostat_setp > prev:
-        state["und_until"] = state["und_target"] = None      # omhoog draaien = klaar met koeler
+        state["und_until"] = state["und_target"] = None      # turning up = done with cooler
     elif moved and thermostat_setp < nominal:
         state["und_until"] = now + timedelta(seconds=cfg["und_hold_s"])
         state["und_target"] = round(max(thermostat_setp, cfg["und_min"]), 1)
-    # een (nieuwe) handmatige verhoging = boven de drempel én veranderd t.o.v. de vorige meting.
-    # `prev is not None` voorkomt dat een herstart-mét-knop-al-omhoog meteen een venster opent.
+    # a (new) manual increase = above the threshold and changed since the previous reading.
+    # `prev is not None` keeps a restart with the knob already up from opening a window at once.
     if (thermostat_setp is not None and thermostat_setp > thr
             and prev is not None and abs(thermostat_setp - prev) > 0.05):
         state["ovr_until"]  = now + timedelta(seconds=hold)
         state["ovr_target"] = round(min(thermostat_setp, mx), 1)
-        state["ovr_q"]      = state.get("last_q")   # wat de planner al leverde: de bump-cap zakt daar niet onder
+        state["ovr_q"]      = state.get("last_q")   # what the planner already delivered: the bump cap does not drop below it
     elif thermostat_setp is not None and thermostat_setp <= thr:
-        # knop terug op (of onder) de baseline → de gebruiker is klaar met de boost → direct nominaal.
-        # (een None-lezing wist het venster NIET: een transiënte read-fout mag een boost niet afbreken.)
+        # knob back at (or below) the baseline -> the user is done with the boost -> nominal at once.
+        # (a None reading does NOT clear the window: a transient read error must not end a boost.)
         state["ovr_until"] = None
         state["ovr_target"] = None
         state["ovr_q"] = None
-    if thermostat_setp is not None:      # een gemiste lezing wist het referentiepunt niet
+    if thermostat_setp is not None:      # a missed reading does not clear the reference point
         state["last_setp"] = thermostat_setp
 
     until = state.get("ovr_until")
@@ -787,16 +793,17 @@ def decide_with_override(now, thermostat_setp, state, cfg, price_win=None):
 
 
 def compute_flow_target(now, outside, cfg):
-    """OVERLAY #1 — cold-scaled preheat. -> gewenste WP-aanvoertemp (chSetTemp1) als float, of None
-    als er geen betrouwbare buitentemp is (dan stuurt pi5new niet en blijft de OTThing-fallback-curve).
+    """OVERLAY #1 -- cold-scaled preheat. -> desired heat pump flow temperature (chSetTemp1) as a float,
+    or None without a reliable outside temperature (then pi5new does not drive and the OTThing fallback
+    curve stays).
 
-    Doel: een MATIGE, continue aanvoer die vroeg draait i.p.v. de reactieve hoge catch-up die
-    overshoot+lockout gaf. 's Ochtends een KOUD-GESCHAALDE preheat-boost om de nacht-setback zacht
-    te herstellen. Alles gecapt < flowMax (fc['ceil']) → overshoot blijft fysiek onmogelijk.
+    Goal: a MODERATE, continuous flow that runs early instead of the reactive high catch-up that gave
+    overshoot + lockout. In the morning a COLD-SCALED preheat boost to recover gently from the night
+    setback. Everything capped < flowMax (fc['ceil']) -> overshoot stays physically impossible.
 
-      baseline = mild + slope * (mild_ref - buiten)                     (weersafhankelijk)
-      preheat  = boost * clamp((cold_ref - buiten)/cold_span, 0, 1)     in [start, end], anders 0
-                 (kouder → meer boost, mild → 0)
+      baseline = mild + slope * (mild_ref - outside)                    (weather compensated)
+      preheat  = boost * clamp((cold_ref - outside)/cold_span, 0, 1)    in [start, end], else 0
+                 (colder -> more boost, mild -> 0)
       flow     = clamp(baseline + preheat, floor, ceil)
     """
     if outside is None:
@@ -812,10 +819,10 @@ def compute_flow_target(now, outside, cfg):
 
 
 def parse_valve(payload):
-    """PUUR: een zigbee2mqtt-plug-payload -> (state, power_w). `state` = 1 bij "ON"
-    (bekrachtigd = retour via de buffer), 0 bij "OFF" (direct), anders None. `power_w` = float of
-    None. Faalt veilig naar (None, None) bij ongeldige JSON / onverwachte vorm, zodat een rare
-    boodschap nooit de lus breekt en nooit een valse klepstand logt."""
+    """PURE: a zigbee2mqtt plug payload -> (state, power_w). `state` = 1 on "ON" (energised = return
+    through the buffer), 0 on "OFF" (direct), else None. `power_w` = float or None. Fails safe to
+    (None, None) on invalid JSON / an unexpected shape, so an odd message never breaks the loop and
+    never logs a false valve state."""
     try:
         d = json.loads(payload) if isinstance(payload, (str, bytes, bytearray)) else payload
     except Exception:
@@ -834,19 +841,18 @@ def parse_valve(payload):
 
 # ── I/O ────────────────────────────────────────────────────────────────────────────────
 def read_latest(cfg):
-    """Nieuwste kamer/buiten uit de energy-tabel. Best-effort -> allemaal None bij een fout.
+    """Newest room/outside from the energy table. Best effort -> all None on an error.
 
-    Bron = de OTThing-velden, NIET de sparrow-velden. In MASTER-mode is de FYSIEKE Honeywell de
-    `roomunit`-groep (otthing_roomunit_*); honeywell_ot_thermo_* is daar juist de OTThing->WP-kant
-    (de circuit-setpoint, bv. 21), NIET de wand-setpoint die de mens bedient. Daarom lezen we de
-    roomunit-kolommen:
-      * buiten  = honeywell_ot_boiler_outside_t_c -> exact wat de OTThing-stooklijn gebruikt
-        (bron=MQTT/HA; de OTThing duwt deze zelf naar de P60 over OT).
-      * kamer   = otthing_roomunit_room_t_c -> de door de Honeywell gemeten kamertemp.
-      * setpoint= otthing_roomunit_set_t_c  -> de ECHTE wand-setpoint (de knop/comfort-dial).
-      * flame   = honeywell_ot_boiler_flame -> draait de compressor (in Repeater is de 'boiler' de WP);
-        None = onbekend.
-    NB: de snelle bump-detectie loopt straks via de MQTT-listener; dit DB-pad is de rustige 5-min-bron.
+    Source = the OTThing fields, NOT the sparrow fields. The PHYSICAL Honeywell is the `roomunit`
+    group (otthing_roomunit_*); honeywell_ot_thermo_* is the OTThing->heat pump side (the circuit
+    setpoint, e.g. 21), NOT the wall setpoint a person operates. So we read the roomunit columns:
+      * outside  = honeywell_ot_boiler_outside_t_c -> exactly what the OTThing heating curve uses
+        (source = MQTT/HA; the OTThing pushes it to the P60 over OT itself).
+      * room     = otthing_roomunit_room_t_c -> the room temperature measured by the Honeywell.
+      * setpoint = otthing_roomunit_set_t_c  -> the REAL wall setpoint (the knob/comfort dial).
+      * flame    = honeywell_ot_boiler_flame -> is the compressor running (in Repeater the 'boiler' is
+        the heat pump); None = unknown.
+    NB: the fast bump detection goes through the MQTT listener; this DB path is the calm 5-min source.
     """
     try:
         c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
@@ -868,12 +874,12 @@ def read_latest(cfg):
 
 
 def read_forecast_outside(cfg):
-    """Buitentemp-FORECAST voor het HUIDIGE 15-min-slot uit battery_schedule.forecast_temp_c
-    (KNMI HARMONIE AROME / Open-Meteo — unit-onafhankelijk, geen P60-inlaat-bias van ±3-4 °C
-    rond heating/defrost). Best-effort -> None. Staleness-guard: alléén de rij voor het huidige
-    slot; bestaat die niet (optimizer-gat), dan None -> we publiceren geen buitentemp (de
-    bestaande bron blijft dan gelden). Plausibiliteits-clip [out_min,out_max] tegen een
-    default/garbage-waarde (forecast_temp_c heeft default 0.0 in de optimizer)."""
+    """Outside temperature FORECAST for the CURRENT 15-min slot from battery_schedule.forecast_temp_c
+    (KNMI HARMONIE AROME / Open-Meteo -- independent of the unit, no P60 inlet bias of +-3-4 C around
+    heating/defrost). Best effort -> None. Staleness guard: ONLY the row for the current slot; if it
+    does not exist (optimizer gap), None -> we publish no outside temperature (the existing source
+    then stays). Plausibility clip [out_min, out_max] against a default/garbage value (forecast_temp_c
+    defaults to 0.0 in the optimizer)."""
     try:
         now = datetime.now()
         bucket = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
@@ -893,10 +899,10 @@ def read_forecast_outside(cfg):
 
 
 def read_day_prices(cfg, day):
-    """Kwartierprijzen (€/kWh incl. btw) voor `day` uit battery_schedule -> {slot_dt: prijs}. De
-    optimizer bewaart elke run, dus ook de al verstreken slots van vandaag staan erin. Per slot de
-    NIEUWSTE run: vóór de day-ahead-publicatie (~13:00) vult de optimizer morgen met de prijzen van
-    vandaag als plaatsvervanger, en die mogen niet meetellen. Best-effort -> {} (geen overlay)."""
+    """Quarter-hour prices (EUR/kWh incl. VAT) for `day` from battery_schedule -> {slot_dt: price}. The
+    optimizer keeps every run, so today's past slots are in there too. Per slot the NEWEST run: before
+    the day-ahead publication (~13:00) the optimizer fills tomorrow with today's prices as a stand-in,
+    and those must not count. Best effort -> {} (no overlay)."""
     try:
         start = datetime(day.year, day.month, day.day)
         c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
@@ -915,10 +921,10 @@ def read_day_prices(cfg, day):
 
 
 def parse_ha_state(text, now_epoch, max_age_s, out_min, out_max):
-    """PUUR: een HA /api/states/<entity>-JSON -> buitentemp (float, 1 decimaal), of None bij:
-    ongeldige JSON / niet-numerieke state ('unavailable'/'unknown') / buiten [out_min,out_max] /
-    ouder dan max_age_s (last_reported, anders last_updated). Crasht nooit en geeft nooit een valse
-    of bevroren buitentemp door. Dit is de kern die de test aanvalt (read_ha_outside = alleen I/O)."""
+    """PURE: an HA /api/states/<entity> JSON -> outside temperature (float, 1 decimal), or None on:
+    invalid JSON / non-numeric state ('unavailable'/'unknown') / outside [out_min, out_max] / older
+    than max_age_s (last_reported, else last_updated). Never crashes and never passes on a false or
+    frozen outside temperature. This is the core the tests exercise (read_ha_outside = I/O only)."""
     try:
         d = json.loads(text)
     except Exception:
@@ -935,17 +941,18 @@ def parse_ha_state(text, now_epoch, max_age_s, out_min, out_max):
     if stamp:
         try:
             if now_epoch - datetime.fromisoformat(stamp).timestamp() > max_age_s:
-                return None                # te oud -> geen bevroren waarde doorgeven
+                return None                # too old -> do not pass on a frozen value
         except (ValueError, TypeError):
-            pass                           # onparseerbare stempel -> waarde niet weggooien
+            pass                           # unparseable timestamp -> do not throw the value away
     return round(t, 1)
 
 
 def read_ha_outside(cfg):
-    """Buitentemp uit de onafhankelijke HA-sensor (cfg['ha_entity']) via de HA REST-API.
-    Best-effort -> None (dan valt de lus terug op de KNMI-forecast). De ECHTE voeler i.p.v. de
-    ochtends-onvolledige KNMI en de bedrijfs-vervuilde P60-inlaat (user 2026-10-22). stdlib urllib,
-    geen extra dependency; HA_URL/HA_TOKEN komen uit ../.env (al in de container)."""
+    """Outside temperature from the independent HA sensor (cfg['ha_entity']) through the HA REST API.
+    Best effort -> None (then the loop falls back to the KNMI forecast). The REAL sensor instead of the
+    KNMI data that is incomplete in the morning and the P60 inlet that operation pollutes (user
+    2026-10-22). stdlib urllib, no extra dependency; HA_URL/HA_TOKEN come from ../.env (already in the
+    container)."""
     url, token = cfg.get("ha_url"), cfg.get("ha_token")
     if not url or not token:
         return None
@@ -962,11 +969,11 @@ def read_ha_outside(cfg):
 
 
 def _mqtt_publish(topic, payload, cfg, dry_run, retain=False):
-    """Publiceer één MQTT-bericht (of log het alleen als `dry_run`). De aanroeper geeft de juiste
-    DRY_RUN-vlag mee (roomSetpoint en buitentemp zijn los te schakelen) en `retain`: True voor een
-    STATE die de OTThing continu leest (buitentemp — meteen present bij reconnect), False voor een
-    COMMAND (roomSetpoint — geen geretaind commando dat blijft hangen). Best-effort — een MQTT-fout
-    mag de lus nooit breken."""
+    """Publish one MQTT message (or only log it when `dry_run`). The caller passes the right DRY_RUN
+    flag (roomSetpoint and outside temperature can be switched separately) and `retain`: True for a
+    STATE the OTThing reads continuously (outside temperature -- present at once on reconnect), False
+    for a COMMAND (roomSetpoint -- no retained command that lingers). Best effort -- an MQTT error must
+    never break the loop."""
     if dry_run:
         dbg("MQTT", f"[DRY_RUN] zou publiceren: {topic} = {payload} (retain={retain})")
         return
@@ -980,33 +987,33 @@ def _mqtt_publish(topic, payload, cfg, dry_run, retain=False):
 
 
 def publish_setpoint(sp, cfg):
-    """Publiceer roomSetpoint<ch>/set (begrensde stuur-knop, een COMMAND). Gated door cfg['dry_run'].
-    retain=False: geen geretaind commando dat blijft overriden nadat wp_control stopt; elke 5 min vers."""
+    """Publish roomSetpoint<ch>/set (a bounded control knob, a COMMAND). Gated by cfg['dry_run'].
+    retain=False: no retained command that keeps overriding after wp_control stops; fresh every 5 min."""
     _mqtt_publish(f"{cfg['base_topic']}/roomSetpoint{cfg['channel']}/set", str(sp), cfg,
                   cfg["dry_run"], retain=False)
 
 
 def publish_outside(temp, cfg):
-    """Publiceer de schone forecast-buitentemp naar outsideTemp/set (een STATE die de curve continu
-    leest). Gated door de APARTE cfg['outside_dry_run']. retain=True: de OTThing heeft de waarde
-    meteen bij (re)connect i.p.v. tot 5 min te wachten; een iets oude waarde als wp_control uitvalt
-    is onschadelijk (de staleness-guard voorkomt dat we een ontbrekend slot publiceren)."""
+    """Publish the clean forecast outside temperature to outsideTemp/set (a STATE the curve reads
+    continuously). Gated by the SEPARATE cfg['outside_dry_run']. retain=True: the OTThing has the value
+    at once on (re)connect instead of waiting up to 5 min; a slightly old value when wp_control fails
+    is harmless (the staleness guard keeps us from publishing a missing slot)."""
     _mqtt_publish(f"{cfg['base_topic']}/outsideTemp/set", str(temp), cfg,
                   cfg["outside_dry_run"], retain=True)
 
 
-# ── retour-buffer-klep: lezen + loggen (fase 1 = GEEN besturing) ───────────────────────
-# De plug publiceert zelf state+power (op verandering/interval); een achtergrond-abonnement cachet
-# de laatste, en elke cyclus prikken we met een read-only /get zodat ook een stabiele klep een verse
-# rij krijgt. We schrijven alléén een verse waarde (stale -> eerlijke NULL), zodat een stille/offline
-# plug niet als een bevroren-maar-levende feed doorschrijft (vgl. de P60-feed-freeze-casus).
+# ── return buffer valve: read + log (phase 1 = NO control) ──────────────────────────────
+# The plug publishes state+power itself (on change/interval); a background subscription caches the
+# latest, and every cycle we poke it with a read-only /get so a stable valve also gets a fresh row.
+# We only write a fresh value (stale -> an honest NULL), so a silent/offline plug does not keep
+# writing like a frozen-but-live feed (cf. the P60 feed freeze case).
 _valve_cache = {"state": None, "power": None, "ts": None}
 _valve_lock = threading.Lock()
 
 
 def ensure_valve_columns(cfg):
-    """Zorg idempotent dat energy de buffer_valve_*-kolommen heeft (MariaDB ADD COLUMN IF NOT EXISTS).
-    Best-effort -> loggen en doorgaan (de upsert faalt dan gewoon tot de kolommen er zijn)."""
+    """Make sure, idempotently, that energy has the buffer_valve_* columns (MariaDB ADD COLUMN IF NOT
+    EXISTS). Best effort -> log and carry on (the upsert simply fails until the columns exist)."""
     try:
         c = mysql.connector.connect(ssl_disabled=True, connection_timeout=5, **cfg["db"])
         cur = c.cursor()
@@ -1033,8 +1040,8 @@ def _on_valve_msg(client, userdata, msg):
 
 
 def start_valve_listener(cfg):
-    """Achtergrond-MQTT-client die het plug-statustopic volgt en de cache bijwerkt. Best-effort ->
-    None bij een fout (de lus draait dan door zonder klep-logging)."""
+    """Background MQTT client that follows the plug status topic and updates the cache. Best effort ->
+    None on an error (the loop then runs on without valve logging)."""
     try:
         c = mqtt_client.Client()
         if cfg["mqtt_user"]:
@@ -1051,9 +1058,9 @@ def start_valve_listener(cfg):
 
 
 def request_valve(cfg):
-    """Prik de plug met een read-only /get zodat zigbee2mqtt een VERSE state+power publiceert — dan
-    krijgt ook een niet-veranderende klep elke 5 min een actuele rij. Dit is GEEN besturing (het
-    stuurt geen state), dus niet door DRY_RUN gated. Best-effort."""
+    """Poke the plug with a read-only /get so zigbee2mqtt publishes a FRESH state+power -- then a valve
+    that does not change also gets a current row every 5 min. This is NOT control (it sends no state),
+    so not gated by DRY_RUN. Best effort."""
     try:
         auth = {"username": cfg["mqtt_user"], "password": cfg["mqtt_pass"]} if cfg["mqtt_user"] else None
         mqtt_publish.single(f"{cfg['valve_topic']}/get", payload='{"state":""}',
@@ -1062,26 +1069,26 @@ def request_valve(cfg):
         dbg("VALVE", f"get-prik faalde: {e}")
 
 
-# ── thermostaat-bump-listener (snelle reactie op een draai aan de Honeywell) ──────────────
-# De 5-min DB-lus is prima voor de rustige flow-modulatie, maar traag voor een comfort-bump
-# (iemand draait de wandthermostaat omhoog). Daarom een APARTE achtergrond-MQTT-client op
-# <base>/state (update elke 1-2 s): die houdt de Honeywell-setpoint seconden-vers en wekt de
-# hoofdlus bij een draai-omhoog, zodat de WP binnen seconden reageert i.p.v. na ~5-10 min.
+# ── thermostat bump listener (fast reaction to a turn of the Honeywell) ──────────────────
+# The 5-min DB loop is fine for the calm flow modulation, but slow for a comfort bump (someone turns
+# the wall thermostat up). Hence a SEPARATE background MQTT client on <base>/state (updates every
+# 1-2 s): it keeps the Honeywell setpoint seconds-fresh and wakes the main loop on a turn upwards, so
+# the heat pump reacts within seconds instead of after ~5-10 min.
 _thermo_cache = {"setpoint": None, "ts": None, "bump_from": None}
 _thermo_lock  = threading.Lock()
 _bump_event   = threading.Event()
 
 
 def parse_roomunit_setpoint(payload):
-    """Pak roomunit.room_set_t (de FYSIEKE Honeywell-wand-setpoint in Master-mode) uit een
-    OTThing /state-payload. -> float of None; crasht niet op rare/partiele payloads."""
+    """Take roomunit.room_set_t (the PHYSICAL Honeywell wall setpoint) from an OTThing /state payload.
+    -> float or None; does not crash on odd/partial payloads."""
     try:
         d = json.loads(payload.decode() if isinstance(payload, (bytes, bytearray)) else payload)
     except Exception:
         return None
     ru = (d.get("roomunit") if isinstance(d, dict) else None) or {}
     v = ru.get("room_set_t")
-    if isinstance(v, dict):               # robuust tegen een {"result","data"}-firmwarevariant
+    if isinstance(v, dict):               # robust against a {"result","data"} firmware variant
         v = v.get("data") if v.get("result", True) else None
     try:
         return None if v is None else float(v)
@@ -1090,26 +1097,26 @@ def parse_roomunit_setpoint(payload):
 
 
 def is_bump(setp, prev, thr):
-    """True als iemand de Honeywell OMHOOG draaide, boven de drempel — de comfort-vraag die een
-    snelle reactie verdient. Een turn-DOWN is nooit urgent, die laten we de 5-min-cyclus oppakken."""
+    """True when someone turned the Honeywell UP, above the threshold -- the comfort request that
+    deserves a fast reaction. A turn DOWN is never urgent; the 5-min cycle picks that up."""
     return (setp is not None and prev is not None
             and setp > prev + 0.05 and setp > thr)
 
 
-# ── OT-gebeurtenislog: wat valt er eerst om bij een WP-stop? ─────────────────────────────
-# De 5-min DB-rij kan oorzaak en gevolg niet scheiden (10-27 07:55: compressor uit én Honeywell
-# max_rel_mod 100 -> 0 in dezelfde rij). De OTThing publiceert zijn volledige state elke 5 s; per
-# bericht vergelijken we de velden die een stop kunnen veroorzaken of verraden en loggen één regel
-# per verandering, met de hele momentopname erbij. ru_* = wat de Honeywell vraagt, m_* = wat de
-# OTThing (Repeater) naar de WP doorstuurt, de rest = wat de WP terugmeldt. Alleen loggen.
+# ── OT event log: what falls over first when the heat pump stops? ────────────────────────
+# The 5-min DB row cannot separate cause and effect (10-27 07:55: compressor off AND Honeywell
+# max_rel_mod 100 -> 0 in the same row). The OTThing publishes its full state every 5 s; per message
+# we compare the fields that can cause or reveal a stop and log one line per change, with the whole
+# snapshot alongside. ru_* = what the Honeywell asks, m_* = what the OTThing (Repeater) passes on to
+# the heat pump, the rest = what the heat pump reports back. Logging only.
 OT_EVENT_KEYS = ("flame", "ch_mode", "fault", "slave_status", "m_maxmod", "m_ch_en",
                  "ru_maxmod", "ru_ch_en", "action", "suspended")
-OT_CHSET_JUMP = 3.0      # ru_ch_set kruipt per graad; alleen een sprong (bv. 55 -> 65) is een gebeurtenis
+OT_CHSET_JUMP = 3.0      # ru_ch_set creeps by the degree; only a jump (e.g. 55 -> 65) is an event
 _otev_prev = {}
 
 
 def ot_event_snapshot(payload):
-    """PUUR: de stop-relevante velden uit een OTThing /state-payload -> dict, of None bij rommel."""
+    """PURE: the stop-relevant fields from an OTThing /state payload -> dict, or None on garbage."""
     try:
         d = json.loads(payload.decode() if isinstance(payload, (bytes, bytearray)) else payload)
     except Exception:
@@ -1137,8 +1144,8 @@ def ot_event_snapshot(payload):
 
 
 def ot_event_changes(prev, cur):
-    """PUUR: welke gebeurtenisvelden veranderden van prev naar cur -> lijst 'veld a->b'. Een lege
-    prev (eerste bericht) geeft niets; de aanroeper logt dan een beginstand."""
+    """PURE: which event fields changed from prev to cur -> list of 'field a->b'. An empty prev (first
+    message) gives nothing; the caller then logs an initial state."""
     if not prev:
         return []
     out = [f"{k} {prev.get(k)}->{cur.get(k)}" for k in OT_EVENT_KEYS if prev.get(k) != cur.get(k)]
@@ -1151,18 +1158,18 @@ def ot_event_changes(prev, cur):
     return out
 
 
-OT_TRACE_S = 600          # na groen licht (CH-enable naar de P60 uit -> aan) 10 min fijn loggen
+OT_TRACE_S = 600          # after a green light (CH enable to the P60 off -> on) log in detail for 10 min
 _ottrace = {}
 
 
 def enable_trace_line(prev, cur, state, now, window_s=OT_TRACE_S):
-    """PUUR: een [OTHR]-regel voor elk OTThing-bericht (~5 s) in de eerste window_s na groen licht,
-    anders None. Alleen loggen, de regeling gebruikt dit niet.
+    """PURE: an [OTHR] line for every OTThing message (~5 s) in the first window_s after a green light,
+    else None. Logging only; the control does not use this.
 
-    Waarom (2026-11-05): bij groen licht springt de P60-aanvoer binnen 5 min van ~20-31 naar
-    34-37 °C zonder compressor, gas of buffer (klep dicht, leiding koud). Een scherpe sprong die
-    langzaam uitzakt = een warme prop in de leidingen die de pomp doortrekt; een geleidelijke
-    stijging = er warmt iets actief op. De 5-min-rijen kunnen dat niet scheiden."""
+    Why (2026-11-05): on a green light the P60 flow jumps from ~20-31 to 34-37 C within 5 min without
+    compressor, gas or buffer (valve closed, pipe cold). A sharp jump that slowly sags = a warm plug of
+    water in the pipes that the pump pulls through (the 50 L vessel); a gradual rise = something is
+    actively heating. The 5-min rows cannot separate those."""
     if not prev:
         return None
     if prev.get("m_ch_en") is False and cur.get("m_ch_en") is True:
@@ -1180,8 +1187,8 @@ def enable_trace_line(prev, cur, state, now, window_s=OT_TRACE_S):
 
 
 def log_ot_events(payload):
-    """Vergelijk dit bericht met het vorige en log de veranderingen. ru_ch_set wordt alleen bij een
-    gelogde sprong als nieuwe referentie genomen, zodat langzaam kruipen geen sprong maskeert."""
+    """Compare this message with the previous one and log the changes. ru_ch_set is only taken as the
+    new reference on a logged jump, so slow creeping does not mask a jump."""
     cur = ot_event_snapshot(payload)
     if cur is None:
         return
@@ -1202,10 +1209,10 @@ def log_ot_events(payload):
 
 
 def _on_thermo_msg(client, userdata, msg):
-    """on_message: cache de verse Honeywell-setpoint (thread-safe) en wek de lus bij een bump."""
+    """on_message: cache the fresh Honeywell setpoint (thread-safe) and wake the loop on a bump."""
     try:
         log_ot_events(msg.payload)
-    except Exception as e:               # het gebeurtenislog mag de bump-detectie nooit breken
+    except Exception as e:               # the event log must never break the bump detection
         dbg("OTEV", f"faalde: {e}")
     setp = parse_roomunit_setpoint(msg.payload)
     if setp is None:
@@ -1218,20 +1225,20 @@ def _on_thermo_msg(client, userdata, msg):
     if is_bump(setp, prev, thr):
         dbg("CTRL", f"BUMP via MQTT: {prev} -> {setp}°C (wek de lus voor directe reactie)")
         with _thermo_lock:
-            _thermo_cache["bump_from"] = prev      # de lus ziet de dip zelf niet (tussen twee cycli)
+            _thermo_cache["bump_from"] = prev      # the loop does not see the dip itself (between two cycles)
         _bump_event.set()
 
 
 def take_bump_from():
-    """De stand vóór de laatste door de listener geziene bump (en wis hem), of None."""
+    """The setting before the last bump the listener saw (and clear it), or None."""
     with _thermo_lock:
         prev, _thermo_cache["bump_from"] = _thermo_cache["bump_from"], None
     return prev
 
 
 def start_thermo_listener(cfg):
-    """Achtergrond-MQTT-client op <base>/state. Best-effort -> None bij een fout (de lus draait dan
-    door op het 5-min DB-pad; de fallback-curve + Honeywell blijven sowieso het vangnet)."""
+    """Background MQTT client on <base>/state. Best effort -> None on an error (the loop then runs on
+    the 5-min DB path; the fallback curve + Honeywell stay the safety net anyway)."""
     topic = f"{cfg['base_topic']}/state"
     try:
         c = mqtt_client.Client(userdata={"thr": cfg["ovr_threshold"]})
@@ -1249,8 +1256,8 @@ def start_thermo_listener(cfg):
 
 
 def live_setpoint(cfg, now=None, max_age_s=90):
-    """De seconden-verse Honeywell-setpoint uit de MQTT-listener, of None als er nog niets is of de
-    listener stil ligt (> max_age_s) -> dan valt de lus terug op het 5-min DB-pad."""
+    """The seconds-fresh Honeywell setpoint from the MQTT listener, or None when there is nothing yet
+    or the listener is silent (> max_age_s) -> then the loop falls back to the 5-min DB path."""
     now = now or datetime.now()
     with _thermo_lock:
         setp, ts = _thermo_cache["setpoint"], _thermo_cache["ts"]
@@ -1260,9 +1267,9 @@ def live_setpoint(cfg, now=None, max_age_s=90):
 
 
 def write_valve(cfg, now=None):
-    """Schrijf de gecachete klepstand+power naar de energy-bucket (sole writer van buffer_valve_*).
-    Schrijft NIETS als er nog geen data is, of als de laatste melding ouder is dan valve_stale_s
-    (dan laten we de kolommen NULL = eerlijk 'geen verse meting' i.p.v. een bevroren waarde). Best-effort."""
+    """Write the cached valve state+power into the energy bucket (sole writer of buffer_valve_*). Writes
+    NOTHING when there is no data yet, or when the last report is older than valve_stale_s (then the
+    columns stay NULL = honestly 'no fresh measurement' instead of a frozen value). Best effort."""
     now = now or datetime.now()
     with _valve_lock:
         state, power, ts = _valve_cache["state"], _valve_cache["power"], _valve_cache["ts"]
@@ -1284,7 +1291,7 @@ def write_valve(cfg, now=None):
         dbg("VALVE", f"write_valve faalde: {e}")
 
 
-# ── shadow-logging (wat pi5new ZOU sturen; DRY-vergelijking met de OTThing) ───────────────
+# ── shadow logging (what pi5new WOULD send; dry comparison with the OTThing) ──────────────
 def ensure_shadow_columns(cfg):
     """Idempotent de wp_shadow_*-kolommen in energy (MariaDB ADD COLUMN IF NOT EXISTS). Best-effort."""
     try:
@@ -1305,11 +1312,11 @@ def ensure_shadow_columns(cfg):
 
 
 def write_shadow(cfg, room, room_set, outside, flow_target, heat=None, boost=None, i_term=None, now=None):
-    """Log naar de energy-bucket wat pi5new doet/zou-doen: de ingelezen kamer + setpoint (inputs),
-    de aanvoer-target (curve + room-comp), de aan/uit-beslissing (wp_cmd_heat), de toegepaste
-    room-comp-boost (wp_cmd_boost_c = P+I samen) en de integrator-stand apart (wp_cmd_i_c), om
-    Kp/Ki te tunen. Bij control_live=0 = shadow; bij live = wat we ECHT commandeerden. Schrijft
-    alleen eigen kolommen (upsert). Best-effort."""
+    """Log into the energy bucket what pi5new does/would do: the room + setpoint read in (inputs), the
+    flow target (curve + room comp), the on/off decision (wp_cmd_heat), the applied room comp boost
+    (wp_cmd_boost_c = P+I together) and the integrator separately (wp_cmd_i_c), for tuning Kp/Ki. With
+    control_live=0 = shadow; live = what we REALLY commanded. Writes only its own columns (upsert).
+    Best effort."""
     now = now or datetime.now()
     cols = ["wp_shadow_room_t_c", "wp_shadow_room_set_c", "wp_shadow_outside_c",
             "wp_shadow_flow_target_c", "wp_cmd_heat", "wp_cmd_boost_c", "wp_cmd_i_c"]
@@ -1399,8 +1406,9 @@ def write_plan(cfg, mode, dec=None, res=None, diag=None, now=None):
 HA_STATE_TOPIC = "wp_control/state"
 HA_PLAN_TOPIC  = "wp_control/plan"
 HA_HEATPLAN_TOPIC = "wp_control/heatplan"   # planner: the plan per quarter (state = heat now, attributes = series)
-# (sleutel, naam, eenheid). HA leidt de entity-id af van device + naam (sensor.wp_control_setpoint_pi5,
-# sensor.wp_control_aanvoer_curve_p_i, ...) — een naam wijzigen verandert dus niets aan een bestaande id.
+# (key, name, unit). HA derives the entity id from device + name (sensor.wp_control_setpoint_pi5,
+# sensor.wp_control_aanvoer_curve_p_i, ...) -- so changing a name does not change an existing id.
+# The names are user-facing (Dutch).
 HA_SENSORS = [
     ("setpoint", "Setpoint (pi5)", "°C"),
     ("setpoint_nominal", "Setpoint nominaal", "°C"),
@@ -1425,7 +1433,7 @@ HA_DEVICE_CLASS = {"°C": "temperature", "min": "duration", "kW": "power"}
 
 
 def ha_discovery_msgs():
-    """PUUR: (topic, payload) per HA-sensor; alle lezen uit één retained JSON op HA_STATE_TOPIC."""
+    """PURE: (topic, payload) per HA sensor; all of them read from one retained JSON on HA_STATE_TOPIC."""
     msgs = []
     for key, name, unit in HA_SENSORS:
         conf = {"name": name, "unique_id": f"wp_control_{key}",
@@ -1435,7 +1443,7 @@ def ha_discovery_msgs():
             conf.update(unit_of_measurement=unit, state_class="measurement",
                         device_class=HA_DEVICE_CLASS[unit])
         msgs.append((f"homeassistant/sensor/wp_control/{key}/config", json.dumps(conf)))
-    # het dagplan: state = het geplande setpoint nu, attributen = de hele dag per kwartier
+    # the day plan: state = the planned setpoint now, attributes = the whole day per quarter
     plan = {"name": "Dagplan setpoint", "unique_id": "wp_control_day_plan",
             "state_topic": HA_PLAN_TOPIC, "value_template": "{{ value_json.now }}",
             "json_attributes_topic": HA_PLAN_TOPIC,
@@ -1467,9 +1475,9 @@ def heatplan_payload(res, diag, now):
 
 
 def day_plan(now, cfg, price_win):
-    """PUUR: het setpoint dat de software vandaag per kwartier wil (schema + prijsvenster, zonder
-    bump of verlaging), voor de dag-grafiek in HA. -> payload-dict met times (lokaal ISO), setpoints
-    en now (het plan voor het lopende kwartier)."""
+    """PURE: the setpoint the software wants today per quarter (schedule + price window, without bump or
+    lowering), for the day chart in HA. -> payload dict with times (local ISO), setpoints and now (the
+    plan for the running quarter)."""
     base = datetime(now.year, now.month, now.day)
     times, sps = [], []
     for k in range(96):
@@ -1480,8 +1488,8 @@ def day_plan(now, cfg, price_win):
 
 
 def bump_minutes_left(ovr_state, now, key="ovr_until"):
-    """PUUR: hele minuten dat de lopende bump (of met key="und_until" de verlaging) nog geldt
-    (naar boven afgerond), 0 zonder."""
+    """PURE: whole minutes the running bump (or with key="und_until" the lowering) still holds (rounded
+    up), 0 without."""
     until = ovr_state.get(key)
     if until is None or until <= now:
         return 0
@@ -1490,9 +1498,9 @@ def bump_minutes_left(ovr_state, now, key="ovr_until"):
 
 def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_left=0, lower_left=0, planned=None,
              planner_mode=None):
-    """PUUR: de regel-tussenstappen voor het HA-dashboard. flow_p/flow_pi = curve + P (+ I), vóór de
-    begrenzing op [flow_min, flow_cap]; flow_target is wat er echt naar de WP gaat. sp_nominal = wat
-    de software nu wil zonder bump of verlaging (schema + prijsvenster)."""
+    """PURE: the control's intermediate steps for the HA dashboard. flow_p/flow_pi = curve + P (+ I),
+    before the limit to [flow_min, flow_cap]; flow_target is what really goes to the heat pump.
+    sp_nominal = what the software wants now without bump or lowering (schedule + price window)."""
     def r(x):
         return None if x is None else round(x, 1)
     has_base = base is not None
@@ -1510,8 +1518,8 @@ def ha_state(sp, room, outside, base, p, i, flow, heat, sp_nominal=None, bump_le
 
 
 def publish_ha(cfg, state, with_discovery=False, plan=None, heatplan=None):
-    """Telemetrie naar HA (geen sturing -> niet gated door dry-run). retain: HA heeft na een herstart
-    meteen de laatste waarden."""
+    """Telemetry to HA (no control -> not gated by dry run). retain: after a restart HA has the latest
+    values at once."""
     if with_discovery:
         for topic, payload in ha_discovery_msgs():
             _mqtt_publish(topic, payload, cfg, False, retain=True)
@@ -1523,16 +1531,16 @@ def publish_ha(cfg, state, with_discovery=False, plan=None, heatplan=None):
 
 
 def command_wp(cfg, heat, flow, sp=None):
-    """LIVE WP-aansturing door pi5new. heat -> chMode1=heat + chSetTemp1=<flow> (de WP volgt dat,
-    want overrideChFlow1 staat AAN); uit -> chMode1=off (WP-target -> 0 = veilige default, WP uit).
-    Gated door cfg['control_live'] (0 = alleen loggen). retain=True: de OTThing houdt de stand tussen
-    cycli. Best-effort via _mqtt_publish.
+    """LIVE heat pump control by pi5new. heat -> chMode1=heat + chSetTemp1=<flow> (the heat pump follows
+    it because overrideChFlow1 is ON); off -> chMode1=off (heat pump target -> 0 = safe default, heat
+    pump off). Gated by cfg['control_live'] (0 = log only). retain=True: the OTThing keeps the state
+    between cycles. Best effort through _mqtt_publish.
 
-    Elke cyclus claimt pi5new ook de CH-enable (2026-10-25, bewezen op de bus): overrideChOn1=ON laat
-    de OTThing het enable-bit van de Honeywell vervangen door z'n eigen getChOn() (= chMode≠off);
-    roomMode1=heat omdat roomMode=off getChOn() altijd false maakt. `sp` -> roomSetpoint1: de OTThing
-    room-suspend (setpoint+1,5) rekent dan met ONS setpoint (bron = MQTT in de OTThing-config), niet
-    met de Honeywell-knop — en blijft zo een vangnet als wp_control uitvalt."""
+    Every cycle pi5new also claims CH enable (2026-10-25, proven on the bus): overrideChOn1=ON makes the
+    OTThing replace the Honeywell's enable bit with its own getChOn() (= chMode != off); roomMode1=heat
+    because roomMode=off always makes getChOn() false. `sp` -> roomSetpoint1: the OTThing room suspend
+    (setpoint+1.5) then works with OUR setpoint (source = MQTT in the OTThing config), not with the
+    Honeywell knob -- and so stays a safety net if wp_control fails."""
     ch = cfg["channel"]
     dry = not cfg["control_live"]
     _mqtt_publish(f"{cfg['base_topic']}/roomMode{ch}/set", "heat", cfg, dry, retain=True)
@@ -1588,7 +1596,7 @@ def plan_cycle(cfg, now, room, ovr_state):
 def main():
     cfg = build_cfg()
     sched_txt = ",".join(f"{mm//60:02d}:{mm%60:02d}->{t}" for mm, t in cfg["schedule"]) or "(leeg)"
-    # roomSetpoint gaat live mee met command_wp zodra de regeling live is; WP_DRY_RUN telt dan niet meer
+    # roomSetpoint goes along with command_wp once the control is live; WP_DRY_RUN no longer counts then
     sp_live = cfg["control_live"] or not cfg["dry_run"]
     dbg("CONF", f"wp_control start — kanaal={cfg['channel']} "
                 f"schema=[{sched_txt}] interval={cfg['interval']}s "
@@ -1616,44 +1624,44 @@ def main():
     if cfg["valve_log"]:
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
-    ensure_shadow_columns(cfg)           # shadow-vergelijking met de OTThing (DRY)
+    ensure_shadow_columns(cfg)           # shadow comparison with the OTThing (DRY)
     if cfg["planner"] in ("shadow", "live"):
         ensure_plan_columns(cfg)
         dbg("CONF", f"PLANNER = {cfg['planner'].upper()} "
                     f"({'stuurt de WP, regels = terugval' if cfg['planner'] == 'live' else 'rekent mee + logt, regels sturen'})"
                     f" | comfort {cfg['comfort'] or '(standaard)'}")
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
-    # wacht kort op een verse Honeywell-stand: de DB-rij kan nog de stand van vóór een draai bevatten
+    # wait briefly for a fresh Honeywell setting: the DB row may still hold the setting from before a turn
     for _ in range(15):
         if live_setpoint(cfg) is not None:
             break
         sleep(1)
     ovr_state = {"ovr_until": None, "ovr_target": None, "ovr_q": None, "und_until": None, "und_target": None,
                  "last_setp": None, "last_q": None}
-    heat_state = {}                      # stateful hysterese voor de aan/uit-beslissing
-    i_state = {"i": 0.0}                 # gedempte-I integrator voor de room-comp
-    r_ovr, r_heat, r_i = load_state(datetime.now())   # een herstart verandert het gedrag niet
+    heat_state = {}                      # stateful hysteresis for the on/off decision
+    i_state = {"i": 0.0}                 # damped-I integrator for the room comp
+    r_ovr, r_heat, r_i = load_state(datetime.now())   # a restart does not change the behaviour
     ovr_state.update(r_ovr); heat_state.update(r_heat); i_state.update(r_i)
     dbg("CTRL", f"runtime-state hersteld: bump={ovr_state['ovr_target']}"
                 + (f" tot {ovr_state['ovr_until']:%H:%M}" if ovr_state["ovr_until"] else "")
                 + f" verlaging={ovr_state['und_target']}"
                 + (f" tot {ovr_state['und_until']:%H:%M}" if ovr_state["und_until"] else "")
                 + f" heat={heat_state.get('heat')} I={i_state['i']}")
-    hw_since = None                      # melding "Honeywell-knop te laag": sinds wanneer het risico loopt
-    hw_latched = alert_active(HW_LOW_KEY) if cfg["hw_low_alert"] else False   # geen dubbele melding na een herstart
+    hw_since = None                      # alert "Honeywell knob too low": since when the risk has been running
+    hw_latched = alert_active(HW_LOW_KEY) if cfg["hw_low_alert"] else False   # no duplicate alert after a restart
     ha_announced = False                 # HA-discovery één keer per proces-start
-    price_logged = None                  # het prijsvenster één keer per wijziging loggen
+    price_logged = None                  # log the price window once per change
     while True:
         if cfg["valve_log"]:
-            write_valve(cfg)              # schrijf de verse (door reports + vorige /get) gecachete stand
+            write_valve(cfg)              # write the fresh cached state (from reports + the previous /get)
         room, outside, sp_db, flame = read_latest(cfg)
         sp_live = live_setpoint(cfg)                 # seconden-verse Honeywell-setpoint (MQTT)
         sp_now = sp_live if sp_live is not None else sp_db
         src = "MQTT-live" if sp_live is not None else "DB-5min"
         bump_from = take_bump_from()
         if bump_from is not None:
-            ovr_state["last_setp"] = bump_from       # zodat een snelle dip+omhoog als bump telt
-        # alleen een live-stand mag een bump starten of beëindigen; de DB-rij loopt tot 5 min achter
+            ovr_state["last_setp"] = bump_from       # so a quick dip + up counts as a bump
+        # only a live reading may start or end a bump; the DB row lags up to 5 min
         price_win = None
         if cfg["price_overlay"]:
             today = datetime.now().date()
@@ -1678,10 +1686,10 @@ def main():
                 dbg("CTRL", f"✓ MELDING {HW_LOW_KEY} opgeheven: Honeywell weer op {sp_now} °C")
                 alert_clear(HW_LOW_KEY, f"Honeywell weer op {sp_now} °C")
         if not cfg["control_live"]:
-            publish_setpoint(sp, cfg)        # live gaat het setpoint mee met command_wp (retained)
+            publish_setpoint(sp, cfg)        # live, the setpoint goes along with command_wp (retained)
 
-        # schone buitentemp (KNMI-forecast, huidig slot) -> outsideTemp/set, vervangt P60-inlaat.
-        # Altijd lezen (ook voor overlay #1 hieronder); publiceren blijft gated door publish_outside.
+        # clean outside temperature (KNMI forecast, current slot) -> outsideTemp/set, replaces the P60
+        # inlet. Always read (also for overlay #1 below); publishing stays gated by publish_outside.
         ot = read_ha_outside(cfg)                    # 1e keus: onafhankelijke HA-buitenvoeler
         ot_src = "HA-sensor"
         if ot is None:
@@ -1696,30 +1704,30 @@ def main():
                             "-> outsideTemp niet gepubliceerd")
         ot = outside_for_curve(ot, cfg)
 
-        # (OVERLAY #1 cold-scaled preheat `compute_flow_target` bestaat nog als functie voor de latere
-        #  preheat-overlay bovenop de curve, maar wordt niet meer per cyclus gelogd — [REGEL] hieronder
-        #  logt de echte aanvoer. Zie [[wp-control-fase1]] voor de fase-2-overlay-stack.)
+        # (OVERLAY #1 cold-scaled preheat `compute_flow_target` still exists as a function for a later
+        #  preheat overlay on top of the curve, but is no longer logged per cycle -- [REGEL] below logs
+        #  the real flow.)
 
-        # pi5new-REGELING: beslis aan/uit (hysterese rond het gemanagede setpoint sp) + de curve-
-        # aanvoer op de HA-buitentemp, stuur de WP (chMode1/chSetTemp1), en log wat we doen.
-        # control_live=0 -> alleen loggen (shadow). room komt uit de roomunit (de Honeywell).
-        # BELANGRIJK: regel op de GEMANAGEDE setpoint `sp` (schema + handmatige-override met 1-uurs
-        # cap), NIET op de rauwe Honeywell-stand `sp_now`. Anders blijft een verlopen bump (vrouw liet
-        # de dial op 23 staan) de WP naar 23 stoken terwijl `gewenst` al terug op 21 (schema) is.
+        # pi5new CONTROL: decide on/off (hysteresis around the managed setpoint sp) + the curve flow on
+        # the HA outside temperature, drive the heat pump (chMode1/chSetTemp1), and log what we do.
+        # control_live=0 -> log only (shadow). room comes from the roomunit (the Honeywell).
+        # IMPORTANT: control on the MANAGED setpoint `sp` (schedule + manual override with a 1-hour cap),
+        # NOT on the raw Honeywell setting `sp_now`. Otherwise an expired bump (the dial left at 23)
+        # keeps heating the house towards 23 while `gewenst` is already back at 21 (schedule).
         base = curve_flow(ot, cfg["curve"])
-        headroom = None if base is None else (cfg["flow_cap"] - base)   # ruimte tot de cap = anti-windup
-        running = flame != 0                         # None (onbekend) -> gedrag als voorheen
+        headroom = None if base is None else (cfg["flow_cap"] - base)   # room up to the cap = anti-windup
+        running = flame != 0                         # None (unknown) -> behaviour as before
         now = datetime.now()
         boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom, running, now)
-        nominal = price_overlay(now, *decide_setpoint(now, cfg), price_win, cfg)[0]   # zonder bump
+        nominal = price_overlay(now, *decide_setpoint(now, cfg), price_win, cfg)[0]   # without bump
         off_above = heat_off_above(now, sp, price_win, cfg, nominal)
         heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], off_above)
         flow_raw = regulated_flow(base, boost, cfg)
-        last_cmd = heat_state.get("flow")    # het commando van de vorige cyclus, vóór de regels het overschrijven
+        last_cmd = heat_state.get("flow")    # the previous cycle's command, before the rules overwrite it
         if heat:
             flow = limit_flow_drop(flow_raw, heat_state, cfg["flow_max_drop"])
         else:
-            flow, heat_state["flow"] = flow_raw, None   # na een stop begint de rem opnieuw
+            flow, heat_state["flow"] = flow_raw, None   # after a stop the brake starts afresh
         if flow != flow_raw:
             dbg("CTRL", f"aanvoer-rem: {flow_raw} -> {flow}°C (max -{cfg['flow_max_drop']}°C/cyclus)")
         sp_cmd, planned = sp, None
@@ -1756,7 +1764,7 @@ def main():
                 else:
                     dbg("PLAN", "-> TERUGVAL: regel-gebaseerde beslissing")
         command_wp(cfg, heat, flow, sp_cmd)
-        # de planner-warmte van deze cyclus: opent de volgende cyclus een bump, dan zakt de cap hier niet onder
+        # this cycle's planner heat: if the next cycle opens a bump, the cap does not drop below it
         ovr_state["last_q"] = None if planned is None else (planned["q"] if planned["heat"] else 0.0)
         save_state(ovr_state, heat_state, i_state, datetime.now())
         p_term = room_comp_boost(room, sp, cfg["rc_kp"], cfg["rc_max"], cfg["rc_neg_max"])
@@ -1777,10 +1785,10 @@ def main():
         write_shadow(cfg, room=room, room_set=sp, outside=ot, flow_target=flow,
                      heat=heat, boost=boost, i_term=i_term)
 
-        # prik de klep-plug om een VERSE state+power te publiceren voor de volgende cyclus
+        # poke the valve plug to publish a FRESH state+power for the next cycle
         if cfg["valve_log"]:
             request_valve(cfg)
-        # wacht tot de volgende 5-min-cyclus OF tot een bump de lus wekt (snelle comfort-reactie)
+        # wait for the next 5-min cycle OR until a bump wakes the loop (fast comfort reaction)
         if _bump_event.wait(timeout=cfg["interval"]):
             _bump_event.clear()
             dbg("CTRL", "-> bump: directe her-evaluatie")

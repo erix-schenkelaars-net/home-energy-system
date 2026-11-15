@@ -40,7 +40,7 @@ CLEAR_DAY  = float(os.environ.get("CLEAR_DAY", "0.85"))   # day yield >= this * 
 # four in the actual/forecast ratio. The first run on this picked exactly those hourly days as
 # "clearest" and arrived at r_m *= 0.342. Using only the quarter-hour era removes that.
 QUARTER_ERA = os.environ.get("QUARTER_ERA", "2026-05-23")
-NOON, BLEND = 13.5, 0.75                                    # zelfde blend als pv_clearsky_calib
+NOON, BLEND = 13.5, 0.75                                    # same blend as pv_clearsky_calib
 CLAMP = (0.5, 1.15)
 
 

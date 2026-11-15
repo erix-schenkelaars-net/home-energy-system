@@ -116,7 +116,7 @@ def main():
         # verify() then confirms the REAL power/current ~0.
         c.write_sph5k_reg(client, c.REG_ADDR["REG_Remote_charge_and_discharge_power"],
                           c.to_uint16(c.REMOTE_HOLD_POWER))
-        time.sleep(3)                      # laat de SPH uitregelen vóór we meten
+        time.sleep(3)                      # let the SPH settle before we measure
         print("Verificatie (registers + ECHTE power/stroom teruggelezen):")
         if ok_set and verify(client):
             print("✓ SPH staat passief in standby — gemeten & geverifieerd. "

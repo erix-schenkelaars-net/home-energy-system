@@ -98,11 +98,11 @@ def _fake_frames():
     pia = [0] * 18
     pia[0], pia[1], pia[5] = 5340, 1230, 900        # 53.40 V, +12.30 A, 90.0 %
     pib = [0] * 26
-    pib[0:16] = list(range(3340, 3356))             # cellen 3340..3355 mV
+    pib[0:16] = list(range(3340, 3356))             # cells 3340..3355 mV
     pib[16:20] = [2981, 2981, 2991, 2971]           # 25.0/25.0/26.0/24.0 C
     pib[24], pib[25] = 2951, 3031                   # env 22.0 C, mosfet 30.0 C
     pic = bytearray(12)
-    pic[9], pic[10], pic[11] = 0x02, 0x00, 2        # cel 2 balanceert, mode 2
+    pic[9], pic[10], pic[11] = 0x02, 0x00, 2        # cell 2 balancing, mode 2
     return pia, pib, bytes(pic)
 
 
@@ -120,7 +120,7 @@ class TestSeplosBusParse(unittest.TestCase):
         self.assertEqual(p["env_temp"], 22.0)
         self.assertEqual(p["pow_temp"], 30.0)
         self.assertEqual(p["mode"], 2)
-        self.assertEqual(p["balancing_cells"], [2])      # bit 1 van eq_lo -> cel 2
+        self.assertEqual(p["balancing_cells"], [2])      # bit 1 of eq_lo -> cell 2
 
     def test_negative_current_is_discharge(self):
         import seplos_bus
@@ -134,8 +134,8 @@ class TestSeplosBusParse(unittest.TestCase):
         pia, pib, pic = _fake_frames()
         self.assertEqual(seplos_bus.parse_pack(pia, pib, pic)["vhigh_cells"], [])   # default no alarm
         pic = bytearray(pic)
-        pic[5] = 0x04                                    # bit 2 -> cel 3
-        pic[6] = 0x01                                    # bit 0 -> cel 9
+        pic[5] = 0x04                                    # bit 2 -> cell 3
+        pic[6] = 0x01                                    # bit 0 -> cell 9
         self.assertEqual(seplos_bus.parse_pack(pia, pib, bytes(pic))["vhigh_cells"], [3, 9])
 
 

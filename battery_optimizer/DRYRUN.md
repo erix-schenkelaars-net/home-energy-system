@@ -1,87 +1,87 @@
-# battery_optimizer — dry-run & replay handleiding
+# battery_optimizer — dry-run & replay guide
 
-Alle commando's draaien in de **`battery_optimizer`**-container (pi5new) en **schrijven niets naar
-de database** — behalve `--snapshot` (zie onderaan).
+All commands run in the **`battery_optimizer`** container (pi5new) and **write nothing to the
+database**, except `--snapshot` (see the bottom).
 
-Basisvorm:
+Basic form:
 
 ```bash
-docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py <vlaggen>
+docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py <flags>
 ```
 
-Datums = `YYYY-MM-DD`, tijdstippen = `YYYY-MM-DDThh:mm`.
+Dates = `YYYY-MM-DD`, times = `YYYY-MM-DDThh:mm`.
 
 ---
 
-## 1. ZONDER rolling — single-solve van een dag (`--replay`)
+## 1. WITHOUT rolling — a single solve of a day (`--replay`)
 
-Eén schone LP-oplossing van de hele dag (vanaf 00:00), met de opgeslagen PV/load/spot van die dag.
+One clean LP solution for the whole day (from 00:00), with that day's stored PV/load/spot.
 
 ```bash
-# hele dag vanaf 00:00
+# whole day from 00:00
 docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py --replay 2026-07-15
 
-# vanaf een bepaald tijdstip (met de echte SoC van dat moment)
+# from a given time (with the real SoC at that moment)
 docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py --replay 2026-07-15T06:00
 ```
 
-Print onderaan het volledige schema. Alleen de dag-totalen:
+Prints the full schedule at the bottom. Day totals only:
 
 ```bash
 docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py --replay 2026-07-15 \
   2>&1 | grep -E "cost=€|Schedule:"
 ```
 
-## 2. MET rolling — de 15-min lus nabootsen (`--rolling-replay`)
+## 2. WITH rolling — mimic the 15-min loop (`--rolling-replay`)
 
-Bootst de echte sturing na: solve → deadband toepassen → SoC 1 slot vooruit → herhaal.
-Neemt een **start** en een **eind**.
+Mimics the real control: solve → apply the deadband → SoC one slot ahead → repeat.
+Takes a **start** and an **end**.
 
 ```bash
 docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py \
   --rolling-replay 2026-07-15T00:00 2026-07-15T23:45
 ```
 
-Uitlezen:
+Reading the output:
 
 ```bash
-# per slot (plan -> uitgevoerd, cost, cum):
+# per slot (plan -> executed, cost, cum):
 docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py \
   --rolling-replay 2026-07-15T00:00 2026-07-15T23:45 2>&1 | grep "ROLL "
 
-# alleen de eindregel (dag-cum, aantal deadband-firings, eind-SoC):
+# only the final line (day cum, number of deadband firings, final SoC):
 docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py \
   --rolling-replay 2026-07-15T00:00 2026-07-15T23:45 2>&1 | grep "ROLL === done"
 ```
 
-## 3. Met vs zonder vergelijken
+## 3. Comparing with vs without
 
-Draai beide voor dezelfde datum en vergelijk de cum-kost:
+Run both for the same date and compare the cumulative cost:
 
-- `--replay 2026-07-15` → dag-cost uit de `Schedule:` / `cost=€`-regel.
-- `--rolling-replay 2026-07-15T00:00 2026-07-15T23:45` → dag-cost uit `ROLL === done`.
+- `--replay 2026-07-15` → day cost from the `Schedule:` / `cost=€` line.
+- `--rolling-replay 2026-07-15T00:00 2026-07-15T23:45` → day cost from `ROLL === done`.
 
-## 4. Varianten testen (env-vars)
+## 4. Testing variants (env vars)
 
-Zet ze vóór het commando met `-e`. Zonder = productiewaarden (LP-vloer 20%, deadband 23%).
+Set them before the command with `-e`. Without = production values (LP floor 20%, deadband 23%).
 
 ```bash
-# LP-vloer op 22% i.p.v. 20%
+# LP floor at 22% instead of 20%
 docker exec -e BAT_MIN_SOC_PCT=22 battery_optimizer \
   python3 /app/battery_optimizer_LP_quarter.py --replay 2026-07-15
 
-# deadband 20 vs 23 vergelijken (rolling)
+# compare deadband 20 vs 23 (rolling)
 docker exec -e DEADBAND_PCT=20 battery_optimizer python3 /app/battery_optimizer_LP_quarter.py \
   --rolling-replay 2026-07-15T00:00 2026-07-15T23:45 2>&1 | grep "ROLL === done"
 docker exec -e DEADBAND_PCT=23 battery_optimizer python3 /app/battery_optimizer_LP_quarter.py \
   --rolling-replay 2026-07-15T00:00 2026-07-15T23:45 2>&1 | grep "ROLL === done"
 ```
 
-## ⚠️ 5. `--snapshot DATE` — LET OP: schrijft WÉL
+## ⚠️ 5. `--snapshot DATE` — CAREFUL: this one DOES write
 
-Géén dry-run. Overschrijft de `predicted_grid_snapshot` van die datum met de rolling-projectie
-(de bron van de oranje predicted-lijn op het dashboard). Gebruik om de predicted-lijn van een dag
-te (her)genereren:
+Not a dry run. Overwrites that date's `predicted_grid_snapshot` with the rolling projection (the
+source of the orange predicted line on the dashboard). Use it to (re)generate a day's predicted
+line:
 
 ```bash
 docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py --snapshot 2026-07-15
@@ -89,5 +89,6 @@ docker exec battery_optimizer python3 /app/battery_optimizer_LP_quarter.py --sna
 
 ---
 
-**Onthouden:** alleen `--snapshot` schrijft; `--replay`, `--rolling-replay` en `--dry-run` zijn puur
-dry-run. De predicted-lijn op het dashboard komt uit de rolling-projectie (auto 1×/dag om 00:00).
+**Remember:** only `--snapshot` writes; `--replay`, `--rolling-replay` and `--dry-run` are pure dry
+runs. The predicted line on the dashboard comes from the rolling projection (automatically once a
+day at 00:00).
