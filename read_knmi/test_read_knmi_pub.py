@@ -311,6 +311,67 @@ class TestStore(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# G2. shading mask -- replaces the horizon factor when the optimizer has fitted one
+# ══════════════════════════════════════════════════════════════════════════════
+def _flat_mask(value, cap=1.3):
+    return {"cap": cap, "v": {(a, e): value for a in range(0, 360, 5) for e in range(0, 71)},
+            "fitted_at": dt.datetime(2026, 11, 10)}
+
+
+class TestShadeMask(unittest.TestCase):
+    MORNING = dt.datetime(2026, 11, 10, 9, 30)     # local; sun low in the south-east
+
+    def test_with_a_mask_the_mask_factor_is_used(self):
+        self.assertAlmostEqual(mod.slot_factor(_flat_mask(1.2), self.MORNING), 1.2)
+
+    def test_without_a_mask_the_old_horizon_factor_is_used(self):
+        self.assertEqual(mod.slot_factor(None, self.MORNING), mod._pv_horizon_factor(self.MORNING))
+
+    def test_store_applies_the_mask(self):
+        conn, cur = MagicMock(), MagicMock()
+        conn.cursor.return_value = cur
+        # 08:30 UTC = 09:30 CET
+        mod.store(conn, dt.datetime(2026, 11, 10, 8, 0), [(dt.datetime(2026, 11, 10, 8, 30), 1000.0)],
+                  _flat_mask(1.2))
+        rows = cur.executemany.call_args.args[1]
+        self.assertAlmostEqual(rows[0][3], 1.092 * 1.2, places=4)
+
+    def test_the_mask_never_lifts_pv_above_its_cap(self):
+        self.assertEqual(mod.slot_factor(_flat_mask(5.0, cap=1.3), self.MORNING), 1.3)
+
+    def test_cycle_loads_the_nowcast_mask_and_hands_it_to_store(self):
+        mask = _flat_mask(1.1)
+        slots = [(dt.datetime(2026, 11, 10, 8, 30), 500.0)]
+        with patch.object(mod, "latest_filename", return_value="f.grb2"), \
+             patch.object(mod, "download"), \
+             patch.object(mod, "parse", return_value=(dt.datetime(2026, 11, 10, 8, 0), slots)), \
+             patch.object(mod, "_db", return_value=MagicMock()), \
+             patch.object(mod, "ensure_table"), \
+             patch.object(mod, "PV_SHADE_MASK", True), \
+             patch.object(mod.ps, "load_mask", return_value=mask) as lm, \
+             patch.object(mod, "store", return_value=1) as st, \
+             patch.object(mod.os, "remove"):
+            mod.cycle()
+        self.assertEqual(lm.call_args.args[1], "nowcast")
+        self.assertIs(st.call_args.args[3], mask)
+
+    def test_switched_off_cycle_stores_without_a_mask(self):
+        slots = [(dt.datetime(2026, 11, 10, 8, 30), 500.0)]
+        with patch.object(mod, "latest_filename", return_value="f.grb2"), \
+             patch.object(mod, "download"), \
+             patch.object(mod, "parse", return_value=(dt.datetime(2026, 11, 10, 8, 0), slots)), \
+             patch.object(mod, "_db", return_value=MagicMock()), \
+             patch.object(mod, "ensure_table"), \
+             patch.object(mod, "PV_SHADE_MASK", False), \
+             patch.object(mod.ps, "load_mask") as lm, \
+             patch.object(mod, "store", return_value=1) as st, \
+             patch.object(mod.os, "remove"):
+            mod.cycle()
+        lm.assert_not_called()
+        self.assertIsNone(st.call_args.args[3])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # H.  cycle() — every failure must stay inside the loop
 # ══════════════════════════════════════════════════════════════════════════════
 class TestCycleContainsFailures(unittest.TestCase):

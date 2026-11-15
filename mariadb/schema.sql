@@ -533,10 +533,12 @@ CREATE TABLE IF NOT EXISTS `battery_debugging` (
 -- pv_knmi_nowcast
 -- ---------------------------------------------------------------------------
 -- KNMI satellite-based solar radiation nowcast (0-4h ahead, 15-min steps).
--- Written by read_knmi. ANALYSIS-ONLY: nothing reads this for control, it exists to
--- backtest KNMI against Solcast/CAMS and the real PV before it may ever be trusted.
+-- Written by read_knmi. Since 2026-08-05 battery_optimizer overlays it on the AROME PV for
+-- the first 0-4 h (PV_NOWCAST_OVERLAY); before that it was analysis-only.
 -- Keyed on (run_dt, slot_dt) so every run is kept, which allows measuring accuracy per
 -- lead time. Consumers wanting the freshest view take MAX(run_dt) per slot_dt.
+-- pv_kwh carries the "nowcast" shading mask (pv_shade_mask) since 2026-11-10; older runs
+-- carry the elevation-only horizon factor.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `pv_knmi_nowcast` (
   `run_dt`     datetime  NOT NULL COMMENT 'Nowcast run time (local time)',
@@ -547,6 +549,34 @@ CREATE TABLE IF NOT EXISTS `pv_knmi_nowcast` (
 
   PRIMARY KEY (`run_dt`,`slot_dt`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+-- ---------------------------------------------------------------------------
+-- pv_shade_mask
+-- ---------------------------------------------------------------------------
+-- PV correction factor per sun position: 5 deg azimuth x 1 deg elevation, one grid per
+-- forecast source ('arome' = KNMI-AROME tilted irradiance, cap 1.0; 'nowcast' = KNMI
+-- nowcast horizontal irradiance, cap 1.3). Written weekly by battery_optimizer
+-- (pv_shade_fit.py), read by the optimizer and read_knmi through common/pv_shade.py.
+-- Why per azimuth: the old correction knew only the sun's elevation and was calibrated in
+-- June (morning sun NE, behind trees). In winter the same elevation comes from the SE (open)
+-- and, in the afternoon, the SW (shaded) -- the forecast was 1.3-3x too low in the morning.
+-- Each grid is fitted on its own source's forecast against the real yield on clear days, so a
+-- factor holds the shading AND that source's own error by sun position; that is why the
+-- optimizer drops the per-elevation r-calibration when the 'arome' mask is active.
+-- Replaced as a whole per source in one transaction (DELETE + INSERT), so readers never see
+-- half a grid. weight ~0 = no clear-day data near that point yet: the factor is then the old
+-- elevation-only correction (the fit's prior). Older than 60 days = not used (fallback).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `pv_shade_mask` (
+  `source`    varchar(16) NOT NULL,
+  `az_deg`    smallint(6) NOT NULL,
+  `el_deg`    smallint(6) NOT NULL,
+  `factor`    float       NOT NULL,
+  `weight`    float       NOT NULL COMMENT 'sum of kernel weights: ~0 = prior only (no data here yet)',
+  `fitted_at` datetime    NOT NULL,
+  PRIMARY KEY (`source`,`az_deg`,`el_deg`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
 
 -- ---------------------------------------------------------------------------

@@ -65,19 +65,26 @@ Primary key `(run_dt, slot_dt)`, so every run is kept. That makes it possible to
 per lead time (a 4-hour-ahead forecast against a 15-minute-ahead one) rather than only the latest
 value. Consumers that want the freshest view take the row with the highest `run_dt` per `slot_dt`.
 
-The PV estimate uses the horizontal GHI, the array size and a calibration factor, and applies the
-same **local horizon correction** as the Solcast and CAMS caches (east ramp 5°→20° in the morning,
-west ramp 5°→9° in the evening) so the three sources stay comparable:
+The PV estimate uses the horizontal GHI, the array size and a calibration factor, times the
+**"nowcast" shading mask** — a factor per sun azimuth × elevation, fitted weekly by
+`battery_optimizer` on this very estimate against the real yield (`common/pv_shade.py`, table
+`pv_shade_mask`; see the battery_optimizer README). It may exceed 1 (cap 1.3): a horizontal estimate
+misses the tilt, which catches more than a flat surface in the morning. Without a (fresh) mask, or
+with `PV_SHADE_MASK=0`, the old elevation-only horizon correction is used (east ramp 5°→20°, west
+5°→9°):
 
 ```
-pv_kwh = (ghi_wm2 / 1000) × PANEL_TOTAL_KWP × PANEL_EFF_CAL × 0.25 h × horizon_factor
+pv_kwh = (ghi_wm2 / 1000) × PANEL_TOTAL_KWP × PANEL_EFF_CAL × 0.25 h × shade_factor
 ```
+
+Backtest 15 Jul - 9 Nov 2026 against the old horizon factor: quarter-hour MAE −5 % (summer),
+−6 % (Sep), −12 % (15 Oct - 9 Nov); morning yield/forecast 1.27 → 1.02 in late autumn.
 
 ## Why it is the way it is
 
-**Analysis-only** — the service writes to its own table and nothing reads it for control. It sits
-alongside the Solcast and CAMS caches as a comparison source, so its accuracy can be measured
-against the real `sph_pv_power` before it is ever trusted with a scheduling decision.
+**Steers the first hours** — started analysis-only, measured against the real `sph_pv_power`
+before it was trusted; since 2026-08-05 the optimiser uses it for the first 0-4 h of its PV
+forecast (`PV_NOWCAST_OVERLAY`).
 
 **A separate container** — parsing GRIB2 requires the ecCodes C library, a heavy dependency that
 has no business inside the optimiser image. Isolating it keeps the optimiser lean and lets this
@@ -93,9 +100,9 @@ falling through. Disabling the module forces the real `findlibs`, which locates 
 cell. At 30-minute intervals that is ~1.4 GB/day; matching the 15-minute nowcast cadence would
 double it. The file is deleted immediately after parsing; only the extracted values are kept.
 
-**The horizon correction lives here too** — it is duplicated from the optimiser rather than
-imported, to keep this container free of optimiser code. Both must move to `common/` if the
-geometry ever changes.
+**The shading mask comes from `common/`** (mounted read-only, stdlib only — this image has no
+numpy), the same lookup the optimiser uses; only the fit lives in the optimiser. The old horizon
+correction is still duplicated here as the fallback.
 
 ## Configuration
 
@@ -106,4 +113,5 @@ geometry ever changes.
 | `SYSTEM_LAT`, `SYSTEM_LON` | Site coordinates — the nearest grid cell is used |
 | `PANEL_TOTAL_KWP` | Total array size (default `6.24`) |
 | `PANEL_EFF_CAL` | Horizontal GHI → PV calibration factor (default `0.70`) |
+| `PV_SHADE_MASK` | `1` (default) = use the "nowcast" shading mask; `0` = old horizon factor |
 | `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | MariaDB credentials |

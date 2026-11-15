@@ -75,6 +75,25 @@ Two-path hierarchy:
 
 2. **Open-Meteo GHI fallback** — when KNMI GTI is unavailable, a clear-sky profile (Kasten-Young + Hottel air-mass model) calibrated on historical clear days is scaled by the GHI cloud-cover ratio. Performance ratio `PANEL_EFF_CAL = 0.70`.
 
+For the first 0-4 h the KNMI nowcast (`read_knmi`, table `pv_knmi_nowcast`) replaces the AROME value, blending back between 3 and 4 h (`PV_NOWCAST_OVERLAY`).
+
+#### Shading mask (since 2026-11-10)
+
+The AROME PV is corrected per slot by a factor looked up by **sun azimuth × sun elevation** (`common/pv_shade.py`, table `pv_shade_mask`). It replaces both older corrections, `_pv_horizon_factor` (elevation-only ramp) and the per-elevation clear-sky r-calibration. Both looked only at the sun's height and were set in summer, when the morning sun rises in the north-east behind trees. In November the morning sun is in the open south-east and the afternoon sun is low in the shaded south-west: on clear days the forecast was 1.3-3× too low at 9-10 h and 0.6-0.9× too high after 13 h, with the day total about right.
+
+`pv_shade_fit.py` fits two masks weekly from our own history (`PV_SHADE_REFIT_DAYS`), each on its own source against the real yield on clear days:
+
+| Source | Raw estimate it corrects | Cap | Replaces |
+|---|---|---|---|
+| `arome` | AROME tilted irradiance → PV (PR, temperature), no horizon factor, no r | 1.0 | horizon factor **and** r (the mask holds AROME's own bias; r on top counts it twice) |
+| `nowcast` | horizontal nowcast GHI × kWp × 0.70 | 1.3 | horizon factor in `read_knmi` (a horizontal estimate misses the tilt, which catches more in the morning) |
+
+Each grid point is a Gaussian-kernel average (σ 8° azimuth, 2.5° elevation) of the clear-day ratios, pulled towards the old elevation-only correction; where no clear day has put the sun yet (December's low southern sun), the old correction stays. Factors are clamped, the whole grid per source is replaced in one transaction, and a missing, unreadable or >60-day-old mask falls back to the old corrections. `PV_SHADE_MASK=0` switches it off (also in `read_knmi`).
+
+Backtest, each day predicted with a mask fitted on earlier days only (15 Jun - 9 Nov 2026): quarter-hour MAE AROME −3 % summer, −3 % Sep, −12 % 15 Oct - 9 Nov (clear days −26 %); nowcast −5 %, −6 %, −12 %; no period worse. A strict holdout (fit before 15 Oct, never seeing the winter sun) still gave −4 % / −9 %. Tried and rejected: applying the mask to direct light only (forecast clearness too unreliable), keeping r (+2 to +12 % too high), and a mask fitted on CAMS-measured irradiance — better geometry, but worse forecasts, because it drops the forecast's own bias. What is left is mostly cloud error on grey mornings, which no geometry fixes.
+
+`pv_correction_from_actuals.py` (the r re-calibration) is obsolete while the mask is active.
+
 ### Heat pump load correction
 
 The historical load profile is adjusted for forecast temperature using a building thermal model:
@@ -118,6 +137,8 @@ All via `../.env`. Key variables:
 | `BMW_VIN` | 17-char VIN for MQTT topics |
 | `CONTRACT_END_DATE` | Date when DYNAMIC_PRICE mode activates |
 | `SALDERING_END_DATE` | Date when net-metering (saldering) ends |
+| `PV_SHADE_MASK` | `1` (default) = PV shading mask per sun position; `0` = old horizon factor + r |
+| `PV_SHADE_REFIT_DAYS` | Refit interval of the shading masks in days (default `7`) |
 
 ## Why it is the way it is
 

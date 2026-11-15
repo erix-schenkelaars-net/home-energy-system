@@ -12,3 +12,4 @@ services:
     volumes:
       - .:/app
       - ./logs:/logs
+      - ../common:/app/common:ro

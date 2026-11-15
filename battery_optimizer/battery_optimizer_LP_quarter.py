@@ -47,6 +47,8 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.d
         sys.path.insert(0, _p)
 from common import energy_cost as ec          # gedeelde, canonieke kostenberekening
 from common import battery_constants as bc    # gedeelde accu/omvormer constanten
+from common import pv_shade as ps             # schaduwmasker per zonrichting x hoogte
+import pv_shade_fit                           # fit van dat masker (wekelijks, vanuit main)
 from scipy.optimize import milp, LinearConstraint, Bounds
 import paho.mqtt.client as paho_mqtt
 import requests
@@ -708,6 +710,16 @@ PV_CLEARSKY_CALIB = os.environ.get("PV_CLEARSKY_CALIB", "1") == "1"
 _PV_CALIB_PATH    = Path(__file__).resolve().parent / "pv_clearsky_calibration.json"
 PCS_BLEND_H       = 0.75   # ±uur rond zonne-middag waarover pcs_m->pcs_a wordt geblend (deuk weg)
 
+# --- Schaduwmasker per zonrichting x hoogte (common/pv_shade.py, gefit door pv_shade_fit.py) ---
+# Vervangt op de AROME-PV zowel _pv_horizon_factor als r: beide kijken alleen naar de zonshoogte,
+# en zijn in de zomer afgesteld (ochtendzon uit het NO achter bomen). In de winter komt de
+# ochtendzon uit het ZO (vrij) en staat de middagzon laag in het ZW (beschaduwd). Het masker is op
+# de AROME-voorspelling zelf gefit, dus bevat het ook AROME's eigen bias -> r overslaan.
+# Zonder (vers) masker in de DB: terug naar de oude horizonfactor + r.
+PV_SHADE_MASK       = os.environ.get("PV_SHADE_MASK", "1") == "1"
+PV_SHADE_REFIT_DAYS = float(os.environ.get("PV_SHADE_REFIT_DAYS", "7"))
+_SHADE_MASK: Optional[dict] = None   # gezet in main(); None = oude horizonfactor + r
+
 
 def _load_weather_cache() -> tuple[dict, dict[int, float]]:
     try:
@@ -1260,6 +1272,52 @@ def _pv_horizon_factor(dt_local: datetime) -> float:
     return (elev - PV_HORIZON_ELEV_ZERO) / (elev_full - PV_HORIZON_ELEV_ZERO)
 
 
+def _pv_geometry_factor(dt_local: datetime) -> float:
+    """Geometriefactor voor de AROME-PV van een slot: het schaduwmasker als dat geladen is,
+    anders de oude zonshoogte-horizonfactor."""
+    f = ps.factor(_SHADE_MASK, dt_local, LAT, LON)
+    return _pv_horizon_factor(dt_local) if f is None else f
+
+
+def apply_pv_calibration(pv: float, calib_r: float, pv_src_override: Optional[str],
+                         mask_active: bool) -> tuple[float, Optional[str]]:
+    """(pv, bronlabel) na de kalibratie op de AROME-PV van één slot.
+
+    - Nowcast/blend overschrijft al (0-4u): niets doen.
+    - Schaduwmasker actief: r NIET toepassen -- het masker is op de AROME-voorspelling gefit en
+      bevat AROME's bias al; r erbovenop telt die dubbel (backtest 11-2026: sep-okt +2 tot +12% te hoog).
+    - Anders de oude r-kalibratie per zonshoogte."""
+    if pv_src_override is not None:
+        return pv, pv_src_override
+    if mask_active:
+        return pv, "AROME_SHADE"
+    if calib_r != 1.0:
+        return pv * calib_r, "AROME_CALIB"
+    return pv, None
+
+
+def _panel_params() -> dict:
+    """PV-constanten voor pv_shade_fit: dezelfde formules als _hourly_pv en read_knmi."""
+    return {"kwp_e": PANEL_EAST_KWP, "kwp_w": PANEL_WEST_KWP, "pr": PANEL_PR_GTI,
+            "noct": PANEL_NOCT_C, "tcoef": PANEL_TEMP_COEFF, "peak": PEAK_MEASURED_KW,
+            "total_kwp": PANEL_EAST_KWP + PANEL_WEST_KWP, "eff_cal": PANEL_EFF_CAL}
+
+
+def load_shade_mask(conn, now: datetime, refit: bool) -> Optional[dict]:
+    """Het AROME-schaduwmasker voor deze run (None = oude correctie). `refit` alleen in live runs:
+    fit beide maskers opnieuw als ze ontbreken of ouder zijn dan PV_SHADE_REFIT_DAYS."""
+    if not PV_SHADE_MASK:
+        return None
+    if refit:
+        pv_shade_fit.maybe_refit(conn, now, _panel_params(), LAT, LON, PV_SHADE_REFIT_DAYS)
+    mask = ps.load_mask(conn, "arome", now)
+    if mask:
+        log.info("PV-schaduwmasker 'arome' actief (gefit %s)", mask["fitted_at"])
+    else:
+        log.info("PV-schaduwmasker niet beschikbaar -- oude horizonfactor + r")
+    return mask
+
+
 def _clearsky_ghi(terrestrial_wm2: float) -> float:
     """Clear-sky GHI (W/m²) with air-mass correction.
 
@@ -1396,7 +1454,7 @@ def estimate_pv_kwh_per_quarter(radiation: dict, dt: datetime, qtr: int) -> floa
     else:  # qtr == 3
         pv_h_interp = 0.625 * pv_curr + 0.375 * pv_next
 
-    morning_factor = _pv_horizon_factor(dt)
+    morning_factor = _pv_geometry_factor(dt)
     dbg(3, DEBUG_SOLAR, "SOLAR",
         f"PV-interp {dt.strftime('%d %H:%M')} qtr={qtr}"
         f"  prev={pv_prev:.3f}  curr={pv_curr:.3f}  next={pv_next:.3f}"
@@ -2564,9 +2622,7 @@ def optimise(  # noqa: C901
         # Alleen waar de nowcast NIET al overschrijft (0-4u = nowcast-waarheid). pv_clearsky = referentie.
         calib_r, pv_clearsky = pv_clearsky_calib(dt)
         pcs_east, pcs_west = pv_clearsky_split(dt)
-        if pv_src_override is None and calib_r != 1.0:
-            pv *= calib_r
-            pv_src_override = "AROME_CALIB"
+        pv, pv_src_override = apply_pv_calibration(pv, calib_r, pv_src_override, _SHADE_MASK is not None)
 
         # #5 weekdag/weekend-bewust profiel; #2 pessimisme; #1 in-day factor (alleen vandaag)
         db_load_h     = load_profile.get((d.weekday() >= 5, hour),
@@ -3908,7 +3964,7 @@ def apply_adaptive_floor(conn):
 
 
 def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_range: Optional[tuple] = None, snapshot_date: Optional[date] = None):
-    global BAT_MIN_SOC_PCT, BAT_MIN_KWH
+    global BAT_MIN_SOC_PCT, BAT_MIN_KWH, _SHADE_MASK
     log.info("=== Battery Optimizer LP %s start%s ===", WIP, "  [DRY-RUN]" if dry_run else "")
 
     now           = datetime.now()
@@ -3988,6 +4044,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     inday_factor = compute_inday_load_factor(conn, load_prof, now)
     cooling_facs = compute_cooling_factors(conn, load_prof, now, radiation)  # begrensd; {} = temp-blind
     nowcast_pv   = load_nowcast_overlay(conn, now)  # verse KNMI-nowcast voor de 0-4u PV-overlay
+    _SHADE_MASK  = load_shade_mask(conn, now, refit=(replay_at is None and snapshot_date is None and not dry_run))
     wp_plan      = load_wp_plan(conn, now) if replay_at is None else {}   # live WP-plan, niet in replays
 
     mode = "DYNAMIC_PRICE"

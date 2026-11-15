@@ -28,6 +28,13 @@ import requests
 from dotenv import load_dotenv
 import mysql.connector
 
+# common/ is mounted read-only at /app/common in the container and sits at the repo root on the
+# host; add both the script dir and its parent so the import works in both (and in the tests).
+for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from common import pv_shade as ps   # shading mask per sun azimuth x elevation (fitted by the optimizer)
+
 _TZ = ZoneInfo("Europe/Amsterdam")
 
 
@@ -55,6 +62,9 @@ TOTAL_KWP    = float(os.getenv("PANEL_TOTAL_KWP", "6.24"))  # 3.12 east + 3.12 w
 PANEL_EFF_CAL = float(os.getenv("PANEL_EFF_CAL", "0.70"))   # horizontal GHI->PV (CAMS-style, no tilt/horizon yet)
 FETCH_MINUTES = int(os.getenv("KNMI_FETCH_MINUTES", "30"))  # bandwidth: 30 MB/file
 SLOT_H        = 0.25
+# Shading mask "nowcast" (common/pv_shade.py): replaces the elevation-only horizon factor below.
+# Fitted weekly by battery_optimizer on this very estimate; absent or stale -> the old factor.
+PV_SHADE_MASK = os.getenv("PV_SHADE_MASK", "1") == "1"
 
 # ── local horizon correction (mirrors the optimizer + Solcast/CAMS caches so the KNMI
 #    line is comparable). East ramp 5°→20° (morning), west ramp 5°→9° (evening).
@@ -203,14 +213,20 @@ def parse(path):
 
 
 # ── store ───────────────────────────────────────────────────────────────────────
-def store(conn, run_dt, slots):
+def slot_factor(mask, slot_local):
+    """Shading-mask factor for the slot, or the old horizon factor without a mask."""
+    f = ps.factor(mask, slot_local, LAT, LON)
+    return _pv_horizon_factor(slot_local) if f is None else f
+
+
+def store(conn, run_dt, slots, mask=None):
     cur = conn.cursor()
     rows = []
     run_local = _to_local(run_dt)
     for vdt_utc, wm2 in slots:
         slot_local = _to_local(vdt_utc)
-        # horizontal GHI->PV, with the same local-horizon correction as Solcast/CAMS
-        pv_kwh = (wm2 / 1000.0) * TOTAL_KWP * PANEL_EFF_CAL * SLOT_H * _pv_horizon_factor(slot_local)
+        # horizontal GHI->PV, corrected for shading by the "nowcast" mask (or the old horizon factor)
+        pv_kwh = (wm2 / 1000.0) * TOTAL_KWP * PANEL_EFF_CAL * SLOT_H * slot_factor(mask, slot_local)
         rows.append((run_local, slot_local, round(wm2, 1), round(pv_kwh, 4)))
     cur.executemany("""
         INSERT INTO pv_knmi_nowcast (run_dt, slot_dt, ghi_wm2, pv_kwh)
@@ -240,15 +256,17 @@ def cycle():
         run_dt, slots = parse(tmp)
         conn = _db()
         ensure_table(conn)
-        n = store(conn, run_dt, slots)
+        mask = ps.load_mask(conn, "nowcast") if PV_SHADE_MASK else None
+        n = store(conn, run_dt, slots, mask)
         conn.close()
         # Log in local time: the GRIB times are UTC, but store() writes local — a log that
         # reports UTC would sit two hours off the rows it just wrote.
-        log.info("Stored %d slots  run=%s  %s..%s  GHI %.0f..%.0f W/m2  (%s)",
+        log.info("Stored %d slots  run=%s  %s..%s  GHI %.0f..%.0f W/m2  shade=%s  (%s)",
                  n, _to_local(run_dt).strftime("%H:%M"),
                  _to_local(slots[0][0]).strftime("%H:%M"),
                  _to_local(slots[-1][0]).strftime("%H:%M"),
-                 slots[0][1], slots[-1][1], fn)
+                 slots[0][1], slots[-1][1],
+                 f"mask {mask['fitted_at']:%m-%d}" if mask else "old horizon", fn)
     except requests.HTTPError as exc:
         code = exc.response.status_code if exc.response is not None else None
         if code == 429:

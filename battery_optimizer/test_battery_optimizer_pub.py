@@ -2172,6 +2172,148 @@ class TestWpPlanInLoad(unittest.TestCase):
         conn = MagicMock(); conn.cursor.side_effect = RuntimeError("down")
         self.assertEqual(mod.load_wp_plan(conn, datetime(2026, 11, 3, 13)), {})
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PV-schaduwmasker: fit (pv_shade_fit) en koppeling in de optimizer
+# ══════════════════════════════════════════════════════════════════════════════
+import pv_shade_fit as psf                    # noqa: E402
+from common import pv_shade as ps             # noqa: E402
+
+_PANEL = {"kwp_e": 3.12, "kwp_w": 3.12, "pr": 0.93, "noct": 47.0, "tcoef": 0.0048, "peak": 5.2,
+          "total_kwp": 6.24, "eff_cal": 0.70}
+
+
+class TestPvShadeRawFormulas(unittest.TestCase):
+
+    def test_arome_raw_matches_the_optimizer_hourly_formula_per_quarter(self):
+        """Fit and forecast must use the same estimate, or the mask corrects the wrong thing."""
+        radiation = {"2026-07-16T13:00": {"gti_east": 400.0, "gti_west": 300.0, "knmi_temp_c": 20.0}}
+        with patch.object(mod, "_pv_geometry_factor", return_value=1.0):
+            # flat neighbours absent -> the quarter equals the current hour
+            q = mod.estimate_pv_kwh_per_quarter(radiation, datetime(2026, 7, 16, 12, 15), 1)
+        self.assertAlmostEqual(psf.arome_raw_kwh(400.0, 300.0, 20.0, _PANEL), q, places=6)
+
+    def test_nowcast_raw_is_read_knmis_formula_without_horizon(self):
+        # (1000/1000) * 6.24 * 0.70 * 0.25 = 1.092, as in read_knmi's store()
+        self.assertAlmostEqual(psf.nowcast_raw_kwh(1000.0, _PANEL), 1.092, places=4)
+
+    def test_clear_days_need_65_percent_of_the_clear_sky_reference(self):
+        d1, d2 = datetime(2026, 11, 9, 12), datetime(2026, 11, 8, 12)
+        actual = {d1: 7.0, d2: 3.0}
+        clearsky = {d1: 10.0, d2: 10.0}
+        self.assertEqual(psf.clear_days(actual, clearsky), {d1.date()})
+
+
+class TestPvShadeFitGrid(unittest.TestCase):
+
+    def _samples(self):
+        """South-west below 15 deg is shaded (ratio 0.3); everywhere else the forecast is right."""
+        s = []
+        for az in range(90, 271, 2):
+            for el in range(4, 40):
+                s.append((float(el), float(az), 0.3 if (200 <= az <= 230 and el < 15) else 1.0))
+        return s
+
+    def test_it_learns_the_shade(self):
+        g = psf.fit_grid(self._samples(), cap=1.0)
+        self.assertLess(g[(215, 10)][0], 0.45)
+        self.assertGreater(g[(140, 10)][0], 0.9)       # the open south-east stays open
+
+    def test_it_keeps_the_old_correction_where_it_has_never_seen_the_sun(self):
+        g = psf.fit_grid(self._samples(), cap=1.0)
+        f, w = g[(20, 10)]                              # north-north-east: no samples at all
+        self.assertAlmostEqual(f, ps.prior_factor(10, 20), places=3)
+        self.assertLess(w, 1e-3)
+
+    def test_the_cap_holds(self):
+        g = psf.fit_grid([(20.0, 120.0, 2.0)] * 50, cap=1.3)
+        self.assertLessEqual(max(f for f, _ in g.values()), 1.3)
+
+    def test_no_samples_gives_the_old_correction_everywhere(self):
+        g = psf.fit_grid([], cap=1.0)
+        self.assertAlmostEqual(g[(100, 12)][0], ps.prior_factor(12, 100))
+        self.assertEqual(len(g), (360 // ps.AZ_STEP) * (ps.EL_MAX // ps.EL_STEP + 1))
+
+
+class TestPvShadeRefit(unittest.TestCase):
+    NOW = datetime(2026, 11, 10, 14, 0)
+
+    def test_a_fresh_mask_is_not_refitted(self):
+        conn = MagicMock()
+        with patch.object(psf, "ensure_table"), \
+             patch.object(psf, "mask_age_days", return_value=2.0), \
+             patch.object(psf, "collect_samples") as cs:
+            self.assertFalse(psf.maybe_refit(conn, self.NOW, _PANEL, 52.0, 5.0, 7))
+        cs.assert_not_called()
+
+    def test_an_old_or_missing_mask_is_refitted_for_both_sources(self):
+        conn = MagicMock()
+        with patch.object(psf, "ensure_table"), \
+             patch.object(psf, "mask_age_days", return_value=None), \
+             patch.object(psf, "collect_samples", return_value={"arome": [], "nowcast": []}), \
+             patch.object(psf, "write_mask") as wm:
+            self.assertTrue(psf.maybe_refit(conn, self.NOW, _PANEL, 52.0, 5.0, 7))
+        self.assertEqual(sorted(c.args[1] for c in wm.call_args_list), ["arome", "nowcast"])
+
+    def test_a_failing_fit_never_raises_and_keeps_the_old_mask(self):
+        conn = MagicMock()
+        with patch.object(psf, "ensure_table"), \
+             patch.object(psf, "mask_age_days", return_value=None), \
+             patch.object(psf, "collect_samples", side_effect=RuntimeError("db")), \
+             patch.object(psf, "write_mask") as wm:
+            self.assertFalse(psf.maybe_refit(conn, self.NOW, _PANEL, 52.0, 5.0, 7))
+        wm.assert_not_called()
+        conn.rollback.assert_called_once()
+
+    def test_write_replaces_the_whole_source_in_one_commit(self):
+        conn, cur = MagicMock(), MagicMock()
+        conn.cursor.return_value = cur
+        psf.write_mask(conn, "arome", {(120, 10): (0.8, 5.0)}, self.NOW)
+        self.assertIn("DELETE", cur.execute.call_args.args[0])
+        rows = cur.executemany.call_args.args[1]
+        self.assertEqual(rows, [("arome", 120, 10, 0.8, 5.0, self.NOW)])
+        conn.commit.assert_called_once()
+
+
+class TestPvShadeInOptimizer(unittest.TestCase):
+
+    def test_with_a_mask_r_is_skipped(self):
+        """The mask is fitted on the AROME forecast and holds its bias; r on top counts it twice."""
+        self.assertEqual(mod.apply_pv_calibration(1.0, 0.8, None, True), (1.0, "AROME_SHADE"))
+
+    def test_without_a_mask_r_is_applied_as_before(self):
+        self.assertEqual(mod.apply_pv_calibration(1.0, 0.8, None, False), (0.8, "AROME_CALIB"))
+        self.assertEqual(mod.apply_pv_calibration(1.0, 1.0, None, False), (1.0, None))
+
+    def test_the_nowcast_is_left_alone_either_way(self):
+        self.assertEqual(mod.apply_pv_calibration(1.0, 0.8, "KNMI_NOWCAST", True), (1.0, "KNMI_NOWCAST"))
+        self.assertEqual(mod.apply_pv_calibration(1.0, 0.8, "NOWCAST_BLEND", False), (1.0, "NOWCAST_BLEND"))
+
+    def test_geometry_factor_uses_the_mask_when_loaded(self):
+        t = datetime(2026, 11, 10, 9, 30)
+        mask = {"cap": 1.0, "v": {(a, e): 0.77 for a in range(0, 360, 5) for e in range(0, 71)}}
+        with patch.object(mod, "_SHADE_MASK", mask):
+            self.assertAlmostEqual(mod._pv_geometry_factor(t), 0.77)
+
+    def test_geometry_factor_falls_back_to_the_horizon_factor(self):
+        t = datetime(2026, 11, 10, 9, 30)
+        with patch.object(mod, "_SHADE_MASK", None):
+            self.assertEqual(mod._pv_geometry_factor(t), mod._pv_horizon_factor(t))
+
+    def test_switched_off_no_mask_is_loaded_and_nothing_is_fitted(self):
+        with patch.object(mod, "PV_SHADE_MASK", False), \
+             patch.object(mod.pv_shade_fit, "maybe_refit") as mr:
+            self.assertIsNone(mod.load_shade_mask(MagicMock(), datetime(2026, 11, 10), refit=True))
+        mr.assert_not_called()
+
+    def test_replays_do_not_refit(self):
+        with patch.object(mod, "PV_SHADE_MASK", True), \
+             patch.object(mod.pv_shade_fit, "maybe_refit") as mr, \
+             patch.object(mod.ps, "load_mask", return_value=None):
+            mod.load_shade_mask(MagicMock(), datetime(2026, 11, 10), refit=False)
+        mr.assert_not_called()
+
+
 class TestEnergyZeroFetch(unittest.TestCase):
     """Price fetch edge cases seen live on 2026-11-12."""
 
