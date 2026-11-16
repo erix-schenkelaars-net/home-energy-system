@@ -275,6 +275,19 @@ so the live water cannot ratchet it up (11-03). Not while the room is under the 
 applied after the 1 °C/cycle drop brake (the ramp sits at water + 3 by construction, so the drop is
 safe). The log shows `ontdooi-oploop: ...`; `WP_DEFROST_SOFTSTART=0` switches it off.
 
+**Soft climb during a bump** (2026-11-16). The planner caps a bump's heat (`WP_QMAX`) but sends a
+flow target, the steady-state flow for that heat, often the 50 °C cap. The P60 sets its power from the
+gap between target and water, so at 11-16 12:52 (target 38.4 → 50 °C, water 37 °C) it ran at 98 % /
+5460 rpm and 9.3 kW for 25 min while the plan said 6. Now, while a bump is active, the target is
+capped at
+
+    max(previous command + 1 °C,  live water + 3)          (before the start: live water + 3)
+
+so it climbs 1 °C per 5-min cycle from where it was, and never falls below the water (or the P60
+stops itself). Same gap and rate as the soft restart (`WP_SOFTSTART_GAP`, `WP_SOFTSTART_RATE`). It can
+only lower the planner's target, and it ignores the comfort floor: during a bump that floor is the bump
+target itself. The log shows `bump-oploop: ...`; `WP_BUMP_SOFTSTART=0` switches it off.
+
 Not done on purpose: dropping the target faster while the compressor runs high. On 2026-11-04 the
 P60 ran at 98 % when the target fell from 50 to 36 °C with water at 52 °C; within 10 min it was at
 16 % and stopped, followed by an hour of restart lockout. The 1 °C/cycle limit stays.
@@ -360,6 +373,7 @@ room keeps falling for a while longer than predicted.
 | `WP_DEFROST_RELAX_K` | `0.2` | after a defrost the floor is this much lower, so the missed heat is made up in cheap hours (0 = off) |
 | `WP_DEFROST_RELAX_H` | `4` | ... for this many hours after the defrost ended, then back by `WP_COMFORT_STEP_K` per quarter; a new defrost extends it, it never adds up |
 | `WP_DEFROST_SOFTSTART` | `1` | after a defrost the target ramps up from the water like a soft restart (`ontdooi-oploop` in the log); `0` = off |
+| `WP_BUMP_SOFTSTART` | `1` | during a bump the target climbs 1 °C per cycle from the previous command, never below water + 3 (`bump-oploop` in the log); `0` = off |
 | `WP_QMAX` | `6.0` | heat cap (kW) for every quarter of the plan, bumps included; lifted per quarter to the steady heat loss in frost, and during a bump never below the heat already delivered. Replaces `WP_BUMP_QMAX` (2026-11-15) |
 | `WP_HW_LOW_ALERT` | `1` | alert `wp_hw_setpoint_low` (WordPress banner + HA push via `battery/alert`) when the Honeywell knob is below `WP_OVERRIDE_THRESHOLD` and the room is at least `WP_HW_LOW_MARGIN` above it for `WP_HW_LOW_HOLD_S`, outside a manual lowering; cleared once the knob is back. `0` = off |
 | `WP_HW_LOW_MARGIN` / `WP_HW_LOW_HOLD_S` | `0.2` / `600` | see above; the P60 stops itself at about knob + 0.5 |

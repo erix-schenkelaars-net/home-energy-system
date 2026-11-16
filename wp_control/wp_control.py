@@ -376,6 +376,41 @@ def defrost_soft_flow(flow, defrost, now, water_now, cfg, below_floor=False, max
                  f"water na ontdooien {water_end} +{gap:g} +{rate:g}/5min ({t:.0f} min) = {ramp:.1f} | water nu {now_txt}")
 
 
+def bump_soft_flow(flow, bump_active, running, last_cmd, water_now, cfg):
+    """PURE: during a bump, let the flow target climb gradually instead of jumping (2026-11-16).
+
+    The planner caps a bump's heat (WP_QMAX, 6 kW) but only sends a flow target: the steady-state
+    flow for that heat, often the 50 C cap. The P60 sets its own power from the GAP between target and
+    water (see soft_start_flow), so 11-16 12:52 (target 38.4 -> 50, water 37) it went to 98 % / 5460
+    rpm and 9.3 kW for 25 min -- the burst the cap was meant to prevent. Ceiling:
+
+        running:      max(last_cmd + rate,  water_now + gap)     (rate C per cycle of 5 min)
+        not running:  water_now + gap                            (start_kick_flow keeps it there)
+
+    Counted from our own previous command, so the target rises rate C per cycle; the water term keeps
+    the target above the water when the water climbs faster, else the P60 would stop itself (an hour of
+    restart lockout). Can only lower the planner's target, never lift it (no ratchet, 11-03). Unlike
+    the soft restart it ignores the comfort floor: during a bump the planner's floor IS the bump
+    target, so the room is always "below" it. Off with WP_BUMP_SOFTSTART=0. Returns (flow, explanation
+    or None)."""
+    if not cfg.get("bump_soft") or flow is None or not bump_active:
+        return flow, None
+    gap, rate = cfg["softstart_gap"], cfg["softstart_rate"]
+    caps, why = [], []
+    if running and last_cmd is not None:
+        caps.append(last_cmd + rate)
+        why.append(f"vorig commando {last_cmd} +{rate:g}")
+    if water_now is not None:
+        caps.append(water_now + gap)
+        why.append(f"water nu {water_now} +{gap:g}")
+    if not caps:
+        return flow, None
+    cap = round(max(cfg["flow_min"], max(caps)), 1)
+    if cap >= flow:
+        return flow, None
+    return cap, f"bump-oploop: {flow} -> {cap}°C | " + " | ".join(why)
+
+
 def start_kick_flow(flow, running, water, gap, cap):
     """PURE: while the planner wants to heat but the compressor is not running, the target is at least
     `gap` above the water the P60 measures now, else it sees no demand and does not start.
@@ -491,6 +526,8 @@ def build_cfg():
         "softstart_rate": float(os.environ.get("WP_SOFTSTART_RATE", "1")),  # C of ramp per 5 min of run time
         # after a defrost the same ramp from the water (defrost_soft_flow); 0 = off
         "defrost_soft":  os.environ.get("WP_DEFROST_SOFTSTART", "1").strip() not in ("0", "", "false", "no"),
+        # during a bump the same ramp, from our previous command (bump_soft_flow); 0 = off
+        "bump_soft":     os.environ.get("WP_BUMP_SOFTSTART", "1").strip() not in ("0", "", "false", "no"),
         # OTThing OpenTherm mode: decides the override flags in command_wp (see there). repeater | master_slave
         "ot_mode":       os.environ.get("WP_OT_MODE", "repeater").strip().lower(),
         # alert "Honeywell knob too low" (honeywell_low_step); 0 = off
@@ -1775,6 +1812,10 @@ def main():
                         # after the drop brake: the ramp sits at water + gap by construction, so a drop of more
                         # than flow_max_drop is safe here, and the brake would otherwise undo it
                         flow, why = defrost_soft_flow(flow, planned.get("defrost"), now, water, cfg, below_floor)
+                        if why:
+                            dbg("PLAN", why)
+                        flow, why = bump_soft_flow(flow, bump_minutes_left(ovr_state, now) > 0,
+                                                   planned["running"], last_cmd, water, cfg)
                         if why:
                             dbg("PLAN", why)
                         flow, why = start_kick_flow(flow, planned["running"],

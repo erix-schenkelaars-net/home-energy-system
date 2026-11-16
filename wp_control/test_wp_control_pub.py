@@ -1328,6 +1328,47 @@ class TestDefrostSoftFlow(unittest.TestCase):
             self.assertFalse(wp.build_cfg()["defrost_soft"])
 
 
+class TestBumpSoftFlow(unittest.TestCase):
+    """During a bump the target climbs 1 C per cycle instead of jumping to the plan's 50 C. Values:
+    2026-11-16 12:52 (previous command 38.4, plan 50.0 at bump-cap 6 kW, water 37.1; the P60 then ran
+    98 % / 9.3 kW for 25 min)."""
+
+    def _cfg(self, **over):
+        return dict(wp.build_cfg(), **over)
+
+    def test_first_cycle_stays_close_to_the_water_instead_of_50(self):
+        flow, why = wp.bump_soft_flow(50.0, True, True, 38.4, 37.1, self._cfg())
+        self.assertEqual(flow, 40.1)                          # water 37.1 + 3 beats 38.4 + 1
+        self.assertIn("bump-oploop", why)
+
+    def test_climbs_one_degree_per_cycle_from_our_own_command(self):
+        flow, _ = wp.bump_soft_flow(50.0, True, True, 40.1, 37.5, self._cfg())
+        self.assertEqual(flow, 41.1)
+
+    def test_follows_the_water_when_it_climbs_faster(self):
+        flow, _ = wp.bump_soft_flow(50.0, True, True, 41.1, 40.0, self._cfg())
+        self.assertEqual(flow, 43.0)                          # else the P60 would stop itself
+
+    def test_before_the_start_only_water_plus_gap(self):
+        flow, _ = wp.bump_soft_flow(50.0, True, False, None, 30.0, self._cfg())
+        self.assertEqual(flow, 33.0)
+
+    def test_only_lowers_never_above_the_plan(self):
+        self.assertEqual(wp.bump_soft_flow(39.0, True, True, 38.4, 37.1, self._cfg()), (39.0, None))
+
+    def test_inactive_without_bump_flag_or_data(self):
+        c = self._cfg()
+        self.assertEqual(wp.bump_soft_flow(50.0, False, True, 38.4, 37.1, c), (50.0, None))
+        self.assertEqual(wp.bump_soft_flow(50.0, True, True, 38.4, 37.1, self._cfg(bump_soft=False)), (50.0, None))
+        self.assertEqual(wp.bump_soft_flow(50.0, True, False, None, None, c), (50.0, None))
+        self.assertEqual(wp.bump_soft_flow(None, True, True, 38.4, 37.1, c), (None, None))
+
+    def test_on_by_default_and_switchable(self):
+        self.assertTrue(wp.build_cfg()["bump_soft"])
+        with patch.dict(os.environ, {"WP_BUMP_SOFTSTART": "0"}):
+            self.assertFalse(wp.build_cfg()["bump_soft"])
+
+
 class TestHoneywellLowAlert(unittest.TestCase):
     """Alert when the Honeywell knob is below 22.5 and the room heads towards knob + 0.5, where the P60
     stops itself. Course of 2026-11-12: knob 21.5 since 12:15 (lowering until 13:12), room 22.0, the P60
