@@ -39,3 +39,7 @@ tools/*.png
 
 # wp_control: runtime-state (bump, aan/uit, I-term) die een herstart overleeft
 wp_control/runtime_state.json
+
+# Vendor documentation (copyrighted PDFs) — kept locally next to the service, not in the public repo
+**/vendor_docs/
+*.pdf

@@ -953,6 +953,41 @@ class TestToSigned(unittest.TestCase):
         self.assertEqual(ctrl.to_signed(0x7FFF, 16), 32767)
 
 
+class TestRegisterFunctionCode(unittest.TestCase):
+    """SPH input registers 1000-1124 sit inside the address range the heuristic reads as holding;
+    input_reg=True must force function code 0x04 for them, and leave the heuristic alone otherwise."""
+
+    def _client(self, value):
+        client = MagicMock()
+        rr = MagicMock(registers=[value])
+        rr.isError.return_value = False
+        client.read_input_registers.return_value = rr
+        client.read_holding_registers.return_value = rr
+        return client
+
+    def test_storage_vbat_reads_input_register(self):
+        client = self._client(516)
+        val = ctrl.read_register(client, ctrl.REG_BY_NAME["REG_Vbat_storage"])
+        client.read_input_registers.assert_called_once_with(1013)
+        client.read_holding_registers.assert_not_called()
+        self.assertEqual(val, 51.6)
+
+    def test_bms_voltage_keeps_centivolt_resolution(self):
+        val = ctrl.read_register(self._client(5111), ctrl.REG_BY_NAME["REG_BMS_BatteryVolt"])
+        self.assertEqual(val, 51.11)
+
+    def test_bms_voltage_reads_input_register(self):
+        client = self._client(516)
+        ctrl.read_register(client, ctrl.REG_BY_NAME["REG_BMS_BatteryVolt"])
+        client.read_input_registers.assert_called_once_with(1087)
+        client.read_holding_registers.assert_not_called()
+
+    def test_heuristic_unchanged_for_holding_range(self):
+        client = self._client(90)
+        ctrl.read_register(client, ctrl.REG_BY_NAME["REG_Charging_cut_off_SOC"])
+        client.read_holding_registers.assert_called_once_with(30404)
+
+
 class TestToUint16(unittest.TestCase):
 
     def test_positive_value(self):
@@ -1102,9 +1137,9 @@ class TestDischargePowerFromPlan(unittest.TestCase):
         return ctrl.slot_to_conf(slot, self.now, self.base).power
 
     def test_full_rate_is_capped_at_max_discharge(self):
-        # 3 kW planned -> clamped to BAT_MAX_DISCHARGE_KW (2.8 kW = 93 %, keeps the pack at ~55 A)
-        self.assertEqual(self._power(bat_kwh=-0.75), -93)
-        self.assertEqual(ctrl.DB_SCHEDULE_DISCHARGE_PCT, 93)
+        # 4 kW planned -> clamped to BAT_MAX_DISCHARGE_KW (3.0 kW = 100 %)
+        self.assertEqual(self._power(bat_kwh=-1.0), -100)
+        self.assertEqual(ctrl.DB_SCHEDULE_DISCHARGE_PCT, 100)
 
     def test_half_rate_is_50pct(self):
         self.assertEqual(self._power(bat_kwh=-0.375), -50)      # 1.5 kW
@@ -1114,13 +1149,13 @@ class TestDischargePowerFromPlan(unittest.TestCase):
 
     def test_missing_bat_kwh_falls_back_to_the_cap(self):
         self.assertEqual(self._power(), -ctrl.DB_SCHEDULE_EXPORT_PCT)
-        self.assertEqual(self._power(), -93)                    # not a blind 100 %
+        self.assertEqual(self._power(), -100)                   # the cap, 3.0 kW
 
     def test_export_action_also_follows_the_plan(self):
         self.assertEqual(self._power(action="EXPORT", bat_kwh=-0.375), -50)
 
     def test_over_cap_is_clamped(self):
-        self.assertEqual(self._power(bat_kwh=-1.0), -93)        # 4 kW clamps to 2.8 kW
+        self.assertEqual(self._power(bat_kwh=-1.6), -100)       # 6.4 kW clamps to 3.0 kW
 
 
 # ─────────────────────────────────────────────────────────────────────────────

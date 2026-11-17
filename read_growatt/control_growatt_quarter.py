@@ -215,7 +215,7 @@ vmin_glob: Optional[int] = None  # latest min cell voltage in mV from seplos DB;
 # --------------------------------------------------
 BAT_RATED_W               = bc.BAT_RATED_W   # 3000 W max battery charge/discharge
 # Full-rate fallback when a slot carries no bat_kwh: the discharge cap, not a blind 100 %.
-DB_SCHEDULE_DISCHARGE_PCT = int(bc.BAT_MAX_DISCHARGE_KW * 1000 / (BAT_RATED_W / 100))  # 2.8 kW -> 93
+DB_SCHEDULE_DISCHARGE_PCT = int(bc.BAT_MAX_DISCHARGE_KW * 1000 / (BAT_RATED_W / 100))  # 3.0 kW -> 100
 DB_SCHEDULE_EXPORT_PCT    = DB_SCHEDULE_DISCHARGE_PCT
 
 # --------------------------------------------------
@@ -260,8 +260,9 @@ def dbg(level, area, msg):
 # REGISTER MODEL
 # ---------------------------------------
 class Register:
-    def __init__(self, name, addr, level, rtype, signed, factor, comment):
+    def __init__(self, name, addr, level, rtype, signed, factor, comment, input_reg=False):
         self.name    = name
+        self.input_reg = input_reg  # force function code 0x04 (the address heuristic says holding)
         self.addr    = addr
         self.level   = level
         self.rtype   = rtype
@@ -278,9 +279,9 @@ class Registry(dict):
 SPH = Registry()
 
 
-def R(name, addr, level, rtype, signed, factor, comment):
+def R(name, addr, level, rtype, signed, factor, comment, input_reg=False):
     name = name.strip()
-    reg  = Register(name, addr, level, rtype, signed, factor, comment)
+    reg  = Register(name, addr, level, rtype, signed, factor, comment, input_reg)
     SPH[name] = reg
     return reg
 
@@ -333,6 +334,12 @@ SPH_REG_LIST = [
     R("REG_Maximum_allowable_charging_power   ", 31210, 1, "UINT32", False, 0.1, "W"),
     R("REG_Maximum_allowable_discharging_power", 31212, 1, "UINT32", False, 0.1, "W"),
     R("REG_Battery_voltage                    ", 31214, 1, "INT16",  True,  0.1, "V"),
+    # Three more battery voltages from Modbus RTU Protocol II V1.39 (SPH input registers 0-124 and
+    # 1000-1124), to find out which one the inverter measures itself. 31214 tracks the BMS sum to
+    # within rounding, so on its own it cannot expose a BMS measurement fault.
+    R("REG_BatVolt_DSP                        ", 97,    1, "UINT16", False, 0.1, "V inverter DSP measurement (input reg)", input_reg=True),
+    R("REG_Vbat_storage                       ", 1013,  1, "UINT16", False, 0.1, "V storage-group battery voltage (input reg)", input_reg=True),
+    R("REG_BMS_BatteryVolt                    ", 1087,  1, "UINT16", False, 0.01, "V battery voltage from BMS (input reg, 0.01 V verified live)", input_reg=True),
     R("REG_Battery_current                    ", 31215, 1, "INT32",  True,  0.1, "A"),
     R("REG_SOC                                ", 31217, 1, "UINT8",  False, 1,   "%"),
     R("REG_SOH                                ", 31218, 3, "UINT8",  False, 1,   "%"),
@@ -510,9 +517,9 @@ def soc_latch_condition(run, soc):
 # MODBUS HELPERS
 # ---------------------------------------
 
-def read_16bit_register(client, address):
+def read_16bit_register(client, address, input_reg=False):
     dbg(4, "SPH", f"Reading 16-bit register {address}")
-    if (address > 100) and (address < 31000):
+    if not input_reg and (address > 100) and (address < 31000):
         rr = client.read_holding_registers(address)
     else:
         rr = client.read_input_registers(address)
@@ -543,10 +550,10 @@ def to_uint16(value):
 
 def read_register(client, reg: Register):
     if reg.rtype in ("UINT8", "INT8"):
-        raw  = read_16bit_register(client, reg.addr) & 0xFF
+        raw  = read_16bit_register(client, reg.addr, reg.input_reg) & 0xFF
         bits = 8
     elif reg.rtype in ("UINT16", "INT16"):
-        raw  = read_16bit_register(client, reg.addr)
+        raw  = read_16bit_register(client, reg.addr, reg.input_reg)
         bits = 16
     elif reg.rtype in ("UINT32", "INT32"):
         raw  = read_32bit_register(client, reg.addr)
@@ -555,7 +562,7 @@ def read_register(client, reg: Register):
         raise ValueError(f"Unknown register type {reg.rtype}")
 
     val = to_signed(raw, bits) if reg.signed else raw
-    val = round((val * reg.factor), 1)
+    val = round((val * reg.factor), 2)
     dbg(3, "SPH", f"{reg.name:45s} @ {reg.addr:6d} = {val:>8}   {reg.comment}")
     return val
 
@@ -563,13 +570,17 @@ def read_register(client, reg: Register):
 SPH_BURST_POLL_S   = 3     # how often to poll the vdelta_taper latch during the sleep
 SPH_BURST_SAMPLE_S = 2     # sampling interval of the SPH pack voltage during a taper
 SPH_BURST_CAP_S    = 180   # safety cap: max burst duration if the latch stays stuck
+# Extra voltages logged in each SPH-BURST sample: if dsp/vbat diverge from the BMS value during a
+# taper, the dip is a BMS measurement fault; if they follow it, the pack voltage really dropped.
+BURST_EXTRA_VOLTS = [("REG_BatVolt_DSP", "dsp"), ("REG_Vbat_storage", "vbat1013"),
+                     ("REG_BMS_BatteryVolt", "bms1087")]
 
 def sleep_with_sph_burst(client, seconds):
     """Sleep `seconds`, but poll the vdelta_taper latch every ~3 s. While it is active, read ONLY
     REG_Battery_voltage every ~2 s and log 'SPH-BURST' -- read only, no inverter writes, no control.
     Records the SPH pack voltage during a Seplos taper, next to the read_seplos BURST (to compare by
-    timestamp in the logs). (NB 2026-11-09: the SPH voltage is the BMS value over CAN, so not truly
-    independent.) Capped against a stuck latch. Best effort: must never break the inverter loop."""
+    timestamp in the logs). (NB 2026-11-09: 31214 tracks the BMS value, so it is not independent; the
+    BURST_EXTRA_VOLTS registers are logged next to it to find one that is.) Capped against a stuck latch. Best effort: must never break the inverter loop."""
     end = time.time() + seconds
     while time.time() < end:
         try:
@@ -583,7 +594,13 @@ def sleep_with_sph_burst(client, seconds):
                     if not alert_active('vdelta_taper'):
                         break
                     v = read_register(client, REG_BY_NAME['REG_Battery_voltage'])
-                    dbg(1, 'SPH', f"\U0001f52c SPH-BURST growatt_pack={v}V (vdelta_taper actief)")
+                    extra = []
+                    for name, tag in BURST_EXTRA_VOLTS:
+                        try:
+                            extra.append(f"{tag}={read_register(client, REG_BY_NAME[name])}V")
+                        except Exception:
+                            extra.append(f"{tag}=ERR")
+                    dbg(1, 'SPH', f"\U0001f52c SPH-BURST growatt_pack={v}V {' '.join(extra)} (vdelta_taper actief)")
                 except Exception as e:
                     dbg(1, 'SPH', f'SPH-BURST read failed: {e}')
                 sleep(SPH_BURST_SAMPLE_S)
