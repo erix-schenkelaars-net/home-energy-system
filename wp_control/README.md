@@ -355,6 +355,19 @@ after the ~60 min restart lockout is left out of the plan: normal comfort floor,
 16:00, made the plan buy 5 kW at EUR 0.50 in the one quarter it could still act on, for a floor it could
 not reach. The knob and the setpoint shown stay as they are; only the plan ignores it.
 
+**Smooth plan** (`WP_DQ_PENALTY`, 2026-11-18, trial). The electricity cost per quarter is a set of
+tangent lines 0.5 kW apart, so the cheapest heat sits on their kinks and hops between them from quarter
+to quarter and from one 5-min re-plan to the next (11-17 05:46-06:41: 4.25 -> 3.75 -> 3.25 -> 3.75 ->
+3.25 -> 2.75 kW). Each hop is ~2.3 °C of flow target; the drop brake caught 110-140 of them a day. The
+penalty charges every kW of change, including the step to and from 0 at a start or stop, so a stop is
+never a cheaper way around it; the first quarter is charged against the heat the previous cycle planned
+(our own plan, never a measurement). It removes the zigzag, not the size of a single step: the drop brake
+still shapes a real step down. Backtest 11-12/14/15/17 at EUR 0.02: zigzag (sum of |dQ|) 72.5 -> 26.3 kW,
+hops of 0.4 kW or more 99 -> 27, same comfort (0 K·h under) and starts (2), cost on the model +1.3 %
+(EUR 26.14 -> 26.49 net of stored heat); an earlier version with starts exempt kept heat in the cheap
+third of the quarters (120 vs 124 kWh).
+What the model cannot see (power spikes of the P60 after each hop, the brake) is what the trial measures.
+
 **House model refit 2026-11-06** (UA 172 -> 262 W/K): fitted on 10-18..11-06, held out 11-06..11-07:
 RMSE 0.48 -> 0.31 K, 24 h ahead 0.40 -> 0.04 K. The old night term (-0.7 kW) was compensating a too-low
 UA. The model still has no water node (the 50 L vessel and the radiators), so after a long stop the
@@ -375,6 +388,7 @@ room keeps falling for a while longer than predicted.
 | `WP_DEFROST_SOFTSTART` | `1` | after a defrost the target ramps up from the water like a soft restart (`ontdooi-oploop` in the log); `0` = off |
 | `WP_BUMP_SOFTSTART` | `1` | during a bump the target climbs 1 °C per cycle from the previous command, never below water + 3 (`bump-oploop` in the log); `0` = off |
 | `WP_QMAX` | `6.0` | heat cap (kW) for every quarter of the plan, bumps included; lifted per quarter to the steady heat loss in frost, and during a bump never below the heat already delivered. Replaces `WP_BUMP_QMAX` (2026-11-15) |
+| `WP_DQ_PENALTY` | `0` | EUR per kW that the planned heat changes from one quarter to the next, starts and stops included (`0` = off). See *Smooth plan* above |
 | `WP_HW_LOW_ALERT` | `1` | alert `wp_hw_setpoint_low` (WordPress banner + HA push via `battery/alert`) when the Honeywell knob is below `WP_OVERRIDE_THRESHOLD` and the room is at least `WP_HW_LOW_MARGIN` above it for `WP_HW_LOW_HOLD_S`, outside a manual lowering; cleared once the knob is back. `0` = off |
 | `WP_HW_LOW_MARGIN` / `WP_HW_LOW_HOLD_S` | `0.2` / `600` | see above; the P60 stops itself at about knob + 0.5 |
 

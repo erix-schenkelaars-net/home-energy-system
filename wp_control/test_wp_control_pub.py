@@ -1113,6 +1113,13 @@ class TestPlannerFallback(unittest.TestCase):
         self.assertEqual((got["room_1h"], got["running"], got["on_min"], got["start_water"]), (21.2, True, None, None))
         self.assertEqual(got["tmin_now"], 21.7)            # the comfort floor now, for the soft start
 
+    def test_previous_planned_heat_goes_to_the_planner(self):
+        # the dQ penalty needs the previous cycle's own plan (never a measurement) as Q_prev
+        import wp_planner
+        with patch.object(wp_planner, "run_live", side_effect=RuntimeError("x")) as rl, patch.object(wp, "write_plan"):
+            wp.plan_cycle(self._cfg("live"), datetime(2026, 11, 3, 13), 21.0, {"last_q": 3.25})
+        self.assertEqual(rl.call_args.kwargs["q_prev"], 3.25)
+
     def test_planner_default_is_off(self):
         self.assertEqual(wp.build_cfg()["planner"], "off")
 

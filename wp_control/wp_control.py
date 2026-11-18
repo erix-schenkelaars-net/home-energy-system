@@ -1624,7 +1624,8 @@ def plan_cycle(cfg, now, room, ovr_state):
         bump = ((ovr_state["ovr_until"], ovr_state["ovr_target"], ovr_state.get("ovr_q"))
                 if active(ovr_state.get("ovr_until")) else None)
         lower = (ovr_state["und_until"], ovr_state["und_target"]) if active(ovr_state.get("und_until")) else None
-        dec, res, diag = wp_planner.run_live(cfg["db"], now, room, bands, bump, lower, cfg["flow_min"], cfg["flow_cap"])
+        dec, res, diag = wp_planner.run_live(cfg["db"], now, room, bands, bump, lower, cfg["flow_min"], cfg["flow_cap"],
+                                             q_prev=ovr_state.get("last_q"))
     except Exception as e:
         dbg("PLAN", f"planner faalde: {type(e).__name__}: {e}")
         write_plan(cfg, 2 if mode == 1 else 0, now=now)
@@ -1689,7 +1690,8 @@ def main():
         ensure_plan_columns(cfg)
         dbg("CONF", f"PLANNER = {cfg['planner'].upper()} "
                     f"({'stuurt de WP, regels = terugval' if cfg['planner'] == 'live' else 'rekent mee + logt, regels sturen'})"
-                    f" | comfort {cfg['comfort'] or '(standaard)'}")
+                    f" | comfort {cfg['comfort'] or '(standaard)'}"
+                    f" | dQ-straf €{float(os.environ.get('WP_DQ_PENALTY', '0')):g}/kW")
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
     # wait briefly for a fresh Honeywell setting: the DB row may still hold the setting from before a turn
     for _ in range(15):

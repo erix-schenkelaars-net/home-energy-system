@@ -335,6 +335,42 @@ class TestPlanner(unittest.TestCase):
         res = wpp.plan(PARAMS, 20.5, 20.5, _inputs(24, tmin=21.0), on0=True, force_off=range(4, 8))
         self.assertEqual(res["on"][4:8], [0, 0, 0, 0])
 
+    @staticmethod
+    def _zigzag(res):
+        return sum(abs(b - a) for a, b in zip(res["Q"], res["Q"][1:]))
+
+    def test_dq_penalty_off_by_default(self):
+        self.assertEqual(wpp.DQ_PENALTY, 0.0)
+
+    def test_dq_penalty_stops_the_zigzag_but_keeps_heating(self):
+        # price alternates every half hour: without the penalty Q hops between the tangent kinks
+        price = lambda k: 0.30 if (k // 2) % 2 == 0 else 0.40
+        free = wpp.plan(PARAMS, 21.2, 21.0, _inputs(32, price=price, tmin=21.0), on0=True, dq_penalty=0.0)
+        calm = wpp.plan(PARAMS, 21.2, 21.0, _inputs(32, price=price, tmin=21.0), on0=True, dq_penalty=0.02)
+        self.assertGreater(self._zigzag(free), 2.0)
+        self.assertLess(self._zigzag(calm), 0.25 * self._zigzag(free))
+        self.assertTrue(all(calm["on"]))                     # it is smoothing, not switching off
+        for k in range(32):
+            self.assertGreaterEqual(calm["room"][k], 21.0 + wpp.MARGIN * min(1.0, (k + 1) / wpp.PENALTY_RAMP_SLOTS) - 0.01)
+
+    def test_dq_penalty_never_makes_a_stop_the_way_out(self):
+        # from 4 kW down to ~1.5: with starts/stops exempt the plan stopped instead (2026-11-18 in development)
+        inp = _inputs(16, price=0.35, tmin=21.0)
+        inp["q_prev"] = 4.0
+        res = wpp.plan(PARAMS, 21.3, 21.0, inp, on0=True, dq_penalty=0.05)
+        self.assertEqual(res["on"][:4], [1, 1, 1, 1])
+
+    def test_dq_penalty_still_starts_when_needed(self):
+        res = wpp.plan(PARAMS, 20.6, 20.6, _inputs(24, price=0.35, tmin=21.0), on0=False, dq_penalty=0.05)
+        self.assertEqual(res["on"][0], 1)
+
+    def test_q_prev_ignored_without_penalty(self):
+        inp = _inputs(16, price=0.35, tmin=21.0)
+        base = wpp.plan(PARAMS, 21.3, 21.0, inp, on0=True, dq_penalty=0.0)
+        inp["q_prev"] = 6.0
+        again = wpp.plan(PARAMS, 21.3, 21.0, inp, on0=True, dq_penalty=0.0)
+        self.assertAlmostEqual(base["cost"], again["cost"], places=6)
+
     def test_shifts_heat_to_cheap_slots(self):
         # no comfort until the end; cheap first half, dear second half -> heat lands in the cheap half
         price = lambda k: 0.20 if k < 24 else 0.60

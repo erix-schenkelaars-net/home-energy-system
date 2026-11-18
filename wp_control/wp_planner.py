@@ -34,6 +34,13 @@ DT = 0.25                    # h per slot
 SUB = 3                      # 5-min sub-steps per slot for the house dynamics
 MARGIN = 0.2                 # K above the comfort minimum: the model's p90 error at 12 h is ~0.24 K
 START_COST = 0.10            # EUR per start
+# EUR per kW that Q changes from one quarter to the next (WP_DQ_PENALTY, 0 = off). The electricity cost is
+# a set of tangent lines, so the cheapest Q sits on their 0.5 kW kinks and hops between them from quarter
+# to quarter and from re-plan to re-plan; each hop is ~2.3 C of flow target, which the P60 answers with a
+# power spike or the drop brake has to catch. A small price per kW of change keeps Q steady unless the
+# saving is real. A start or stop counts as a change too (on top of START_COST), so stopping is never a
+# way around the penalty.
+DQ_PENALTY = float(os.environ.get("WP_DQ_PENALTY", "0"))
 COMFORT_PENALTY = 50.0       # EUR per K below the bound per hour: high, the bands are a hard floor (soft only so a plan exists)
 OVERHEAT_MAX = 23.5          # soft upper bound
 PENALTY_RAMP_SLOTS = 8       # first 2 h: comfort penalty AND margin ramp up from ~0, so a small deficit
@@ -238,17 +245,21 @@ def lockout_slots(min_off_min, on0, off_minutes):
     return max(0, math.ceil((min_off_min - off_minutes) / 15)) if not on0 else 0
 
 
-def plan(params, tr0, tm0, inputs, on0=False, off_minutes=999.0, comfort=None, force_off=()):
+def plan(params, tr0, tm0, inputs, on0=False, off_minutes=999.0, comfort=None, force_off=(), dq_penalty=None):
     """inputs: dict of lists per slot -> price, t_out, pv_kw, hour, tmin (None = no bound), and
     optionally qmax (a lower heat cap than q_max for that slot, None = q_max).
     force_off: slot indices that must stay off (what-if analysis, or a manual "not now").
+    dq_penalty: EUR per kW of change in Q from quarter to quarter (None = DQ_PENALTY). With
+    inputs["q_prev"] (the heat the previous cycle planned) the first quarter is charged against that too.
     Returns per-slot on, Q, electricity, room, mass, plus cost and solver status."""
     p, w = params["house"], params["heat_pump"]
     N = len(inputs["price"])
     A, bq, br, bo = discrete_house(p)
     # variable layout per slot k: Q, on, start, elec, slack_lo, slack_hi ; plus states Tr,Tm for k=1..N
-    nv = 6
-    iQ, iON, iST, iEL, iSL, iSH = range(6)
+    nv = 7
+    iQ, iON, iST, iEL, iSL, iSH, iDQ = range(7)
+    dqp = DQ_PENALTY if dq_penalty is None else dq_penalty
+    q_prev = inputs.get("q_prev")
     off_x = N * nv
     nx = off_x + 2 * N
     idx = lambda k, j: k * nv + j
@@ -292,6 +303,19 @@ def plan(params, tr0, tm0, inputs, on0=False, off_minutes=999.0, comfort=None, f
             con([(idx(k, iST), 1), (idx(k, iON), -1)], -(1.0 if on0 else 0.0), np.inf)
         else:
             con([(idx(k, iST), 1), (idx(k, iON), -1), (idx(k - 1, iON), 1)], 0, np.inf)
+        # smoothness: dq_k >= |Q_k - Q_{k-1}|, starts and stops included (Q = 0 when off). Exempting them made a
+        # stop the cheap way out of a big step down: from 4 kW the plan stopped (and sat out the hour lockout)
+        # rather than pay for ramping to 1.5 kW. Now a stop always costs more than the ramp it replaces.
+        if dqp > 0:
+            c[idx(k, iDQ)] = dqp
+            for sg in (1, -1):
+                if k == 0:
+                    if q_prev is not None:
+                        con([(idx(k, iDQ), 1), (idx(k, iQ), -sg)], -sg * q_prev, np.inf)
+                else:
+                    con([(idx(k, iDQ), 1), (idx(k, iQ), -sg), (idx(k - 1, iQ), sg)], 0, np.inf)
+        else:
+            ub[idx(k, iDQ)] = 0
         # minimum off-time: a stop at k (on_{k-1}=1, on_k=0) keeps it off for L-1 more slots
         for j in range(1, L):
             if k + j < N:
@@ -424,6 +448,7 @@ def backtest(day, horizon_h=36, quiet=False, realistic=False, out_json=None):
         inp.update({
                "hour": [r["t"].hour + r["t"].minute / 60 for r in seg],
                "tmin": comfort_floors(bands, [r["t"] for r in seg])})
+        inp["q_prev"] = log[-1]["Q"] if log else hist[i0 - 1]["q"]
         res = plan(params, tr, tm, inp, on0=on, off_minutes=off_min)
         if "on" not in res:
             print("solver failed at", seg[0]["t"], res.get("message")); return
@@ -645,9 +670,11 @@ def live_decision(params, res, room, outlet, running, flow_min, flow_cap):
             "room_sp": room_sp}
 
 
-def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flow_cap=50.0, params=None):
+def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flow_cap=50.0, params=None, q_prev=None):
     """Plan from live data and return (decision, plan, diagnostics). Raises on any problem, so the
-    caller can fall back to the rule-based control."""
+    caller can fall back to the rule-based control. q_prev: the heat the previous cycle planned (kW, 0/None
+    when off or unknown), so the smoothness penalty also holds across re-plans. It is our own plan, never a
+    measurement, so it cannot ratchet."""
     params = params or hm.load_params()
     p = params["house"]
     q0 = quarter(now)
@@ -673,6 +700,7 @@ def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flo
     except Exception:            # without it the floor is simply not relaxed: the behaviour before 11-14
         defrost = None
     inp = build_live_inputs(fut, now, bands, recent, bump_used, lower, defrost and defrost["end"], house=p)
+    inp["q_prev"] = q_prev
     res = plan(params, room_now, tm, inp, on0=running, off_minutes=off_min)
     if "on" not in res:
         raise RuntimeError(f"solver: {res.get('message')}")
