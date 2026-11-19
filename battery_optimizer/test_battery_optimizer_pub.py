@@ -2173,6 +2173,44 @@ class TestWpPlanInLoad(unittest.TestCase):
         self.assertEqual(mod.load_wp_plan(conn, datetime(2026, 11, 3, 13)), {})
 
 
+class TestRollingSnapshotSeesWpPlan(unittest.TestCase):
+    """The dashboard's predicted line is the rolling replay's slot loads. Until 2026-11-19 the
+    snapshot was built without the heat pump plan, so it kept the 14-day historical WP share:
+    36 kWh of load against 26 with the plan, ~3 euro too high. The replay has to carry the plan
+    into every solve, and the stored load has to move with it."""
+
+    N = 8
+
+    def _replay(self, wp_plan):
+        okw = dict(prices=prices_make(), radiation=_build_radiation(cloud_flat(8)),
+                   load_profile=LOAD_NORM, today=TODAY, mode="DYNAMIC_PRICE",
+                   ref_temp_by_hour=REF_TEMP, wp_plan=wp_plan)
+        return mod.rolling_replay(start_qtr=0, end_qtr=self.N, initial_soc_pct=50.0, optimise_kwargs=okw)
+
+    def _slots(self):
+        start = datetime.combine(TODAY, datetime.min.time())
+        return [start + timedelta(minutes=15 * k) for k in range(self.N)]
+
+    def test_every_solve_gets_the_plan(self):
+        seen, real = [], mod.optimise
+
+        def spy(**kw):
+            seen.append(kw.get("wp_plan"))
+            return real(**kw)
+
+        plan = {t: 0.2 for t in self._slots()}
+        with patch.object(mod, "optimise", side_effect=spy):
+            self._replay(plan)
+        self.assertEqual(len(seen), self.N)
+        self.assertTrue(all(s == plan for s in seen))
+
+    def test_stored_load_follows_the_plan(self):
+        low  = self._replay({t: 0.0 for t in self._slots()})
+        high = self._replay({t: 0.5 for t in self._slots()})
+        for (dt, _a, _pv, load_lo, _g, _c), (_d, _b, _p, load_hi, _h, _e) in zip(low, high):
+            self.assertAlmostEqual(load_hi - load_lo, 0.5, places=6, msg=str(dt))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PV shade mask: fit (pv_shade_fit) and its use in the optimizer
 # ══════════════════════════════════════════════════════════════════════════════

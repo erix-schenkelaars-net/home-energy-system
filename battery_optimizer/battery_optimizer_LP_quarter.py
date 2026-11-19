@@ -4058,7 +4058,11 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
     okw_base = dict(prices=prices, radiation=radiation, load_profile=load_prof, today=today,
                     mode=mode, ev_soc=ev_soc, ref_temp_by_hour=ref_temp_by_hour,
                     inday_load_factor=inday_factor, cooling_factors=cooling_facs,
-                    nowcast_pv=nowcast_pv, hp_profile=hp_prof)
+                    nowcast_pv=nowcast_pv, hp_profile=hp_prof,
+                    # The predicted line (rolling snapshot) must see the planned heat pump too: without
+                    # it the snapshot kept the 14-day historical WP share, 36 kWh of load on 2026-11-19
+                    # against 26 with the plan, ~3 euro too high on the dashboard.
+                    wp_plan=wp_plan)
 
     if rolling_range is not None:
         end_q = round((rolling_range[1] - datetime.combine(today, datetime.min.time())).total_seconds() / 900)
