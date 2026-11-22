@@ -26,6 +26,7 @@ Key algorithm features:
   - Runs every 15 minutes; writes schedule to battery_schedule table in MariaDB
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -1494,16 +1495,14 @@ def load_nowcast_overlay(conn, now: datetime) -> dict:
     if not PV_NOWCAST_OVERLAY:
         return {}
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT MAX(run_dt) FROM pv_knmi_nowcast")
-        run = cur.fetchone()[0]
-        if run is None or (now - run).total_seconds() > PV_NOWCAST_MAX_AGE_MIN * 60:
-            log.info("PV nowcast-overlay: geen verse run (laatste=%s) — AROME only", run)
-            cur.close()
-            return {}
-        cur.execute("SELECT slot_dt, pv_kwh FROM pv_knmi_nowcast WHERE run_dt=%s", (run,))
-        overlay = {r[0]: float(r[1]) for r in cur.fetchall()}
-        cur.close()
+        with contextlib.closing(conn.cursor()) as cur:
+            cur.execute("SELECT MAX(run_dt) FROM pv_knmi_nowcast")
+            run = cur.fetchone()[0]
+            if run is None or (now - run).total_seconds() > PV_NOWCAST_MAX_AGE_MIN * 60:
+                log.info("PV nowcast-overlay: geen verse run (laatste=%s) — AROME only", run)
+                return {}
+            cur.execute("SELECT slot_dt, pv_kwh FROM pv_knmi_nowcast WHERE run_dt=%s", (run,))
+            overlay = {r[0]: float(r[1]) for r in cur.fetchall()}
         log.info("PV nowcast-overlay: run %s, %d slots (0-%.0fu)",
                  run, len(overlay), PV_NOWCAST_HORIZON_H)
         return overlay
@@ -1525,17 +1524,15 @@ def load_wp_plan(conn, now: datetime) -> dict:
     if not WP_PLAN_IN_LOAD:
         return {}
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT MAX(created_at) FROM wp_plan")
-        made = cur.fetchone()[0]
-        if made is None or (now - made).total_seconds() > WP_PLAN_MAX_AGE_MIN * 60:
-            log.info("WP plan: geen vers plan (laatste=%s) — eigen WP-schatting", made)
-            cur.close()
-            return {}
-        cur.execute("SELECT slot_dt, elec_kwh FROM wp_plan WHERE slot_dt >= %s AND elec_kwh IS NOT NULL",
-                    (now - timedelta(minutes=15),))
-        plan = {r[0]: float(r[1]) for r in cur.fetchall()}
-        cur.close()
+        with contextlib.closing(conn.cursor()) as cur:
+            cur.execute("SELECT MAX(created_at) FROM wp_plan")
+            made = cur.fetchone()[0]
+            if made is None or (now - made).total_seconds() > WP_PLAN_MAX_AGE_MIN * 60:
+                log.info("WP plan: geen vers plan (laatste=%s) — eigen WP-schatting", made)
+                return {}
+            cur.execute("SELECT slot_dt, elec_kwh FROM wp_plan WHERE slot_dt >= %s AND elec_kwh IS NOT NULL",
+                        (now - timedelta(minutes=15),))
+            plan = {r[0]: float(r[1]) for r in cur.fetchall()}
         log.info("WP plan: %s, %d kwartieren, %.1f kWh gepland", made, len(plan), sum(plan.values()))
         return plan
     except Exception as exc:
@@ -1858,15 +1855,16 @@ def ensure_schedule_table(conn):
         ("pv_clearsky_kwh",   "FLOAT"),
         ("pv_clearsky_east_kwh", "FLOAT"),
         ("pv_clearsky_west_kwh", "FLOAT"),
+        ("ev_plug_control",  "TINYINT DEFAULT 0"),   # plug ownership, see set_ev_plug_control_flag
     ]:
+        # IF NOT EXISTS: a no-op once the column is there. This used to be a bare ADD COLUMN
+        # in try/except: pass, which failed on "duplicate column" for every column on every run
+        # and would just as quietly have swallowed a real error.
         try:
-            cur.execute(f"ALTER TABLE battery_schedule ADD COLUMN {col} {typedef}")
-        except Exception:
-            pass
-    try:
-        cur.execute("ALTER TABLE battery_schedule MODIFY COLUMN action VARCHAR(30) NOT NULL")
-    except Exception:
-        pass
+            cur.execute(f"ALTER TABLE battery_schedule ADD COLUMN IF NOT EXISTS {col} {typedef}")
+        except Exception as exc:
+            # Logged, not raised: a missing display column must not stop the schedule write.
+            log.warning("battery_schedule: adding column %s failed: %s", col, exc)
     conn.commit()
     cur.close()
 
@@ -3530,46 +3528,44 @@ def set_ev_plug_control_flag(set_control: bool) -> bool:
     looks back 30 h, so a clear limited to +-3 h left older marks behind and the optimizer kept
     "owning" the plug for a day -- switching off a plug the user had turned on by hand (2026-11-01).
     """
+    # Own short-lived connection on purpose: the 60 s poll loop between main() runs has no open conn.
+    # closing() releases it even when execute() raises.
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        if set_control:
-            now = datetime.now()
-            cursor.execute(
-                "UPDATE battery_schedule SET ev_plug_control = 1 "
-                "WHERE slot_dt >= %s AND slot_dt <= %s",
-                (now - timedelta(hours=3), now + timedelta(hours=3))
-            )
-        else:
-            cursor.execute("UPDATE battery_schedule SET ev_plug_control = 0 "
-                           "WHERE ev_plug_control = 1")
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with contextlib.closing(get_db()) as conn, contextlib.closing(conn.cursor()) as cursor:
+            _set_plug_flag(cursor, set_control)
+            conn.commit()
         return True
     except Exception as e:
         log.warning("EV plug control flag update failed: %s", e)
         return False
 
 
+def _set_plug_flag(cursor, set_control: bool) -> None:
+    if set_control:
+        now = datetime.now()
+        cursor.execute(
+            "UPDATE battery_schedule SET ev_plug_control = 1 "
+            "WHERE slot_dt >= %s AND slot_dt <= %s",
+            (now - timedelta(hours=3), now + timedelta(hours=3))
+        )
+    else:
+        cursor.execute("UPDATE battery_schedule SET ev_plug_control = 0 "
+                       "WHERE ev_plug_control = 1")
+
+
 def ev_plug_is_optimizer_controlled() -> bool:
     """Check if optimizer has control (persistent flag in battery_schedule DB)."""
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        now = datetime.now()
-        time_window = now - timedelta(hours=30)
-        cursor.execute(
-            "SELECT COUNT(*) FROM battery_schedule "
-            "WHERE slot_dt >= %s AND slot_dt <= %s AND ev_plug_control = 1 "
-            "LIMIT 1",
-            (time_window, now + timedelta(hours=3))
-        )
-        result = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        has_control = result and result[0] > 0
-        return has_control
+        with contextlib.closing(get_db()) as conn, contextlib.closing(conn.cursor()) as cursor:
+            now = datetime.now()
+            cursor.execute(
+                "SELECT COUNT(*) FROM battery_schedule "
+                "WHERE slot_dt >= %s AND slot_dt <= %s AND ev_plug_control = 1 "
+                "LIMIT 1",
+                (now - timedelta(hours=30), now + timedelta(hours=3))
+            )
+            result = cursor.fetchone()
+        return bool(result and result[0] > 0)
     except Exception as e:
         log.warning("EV plug control flag check failed: %s", e)
         return False

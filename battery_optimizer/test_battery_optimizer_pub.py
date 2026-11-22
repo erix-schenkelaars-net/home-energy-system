@@ -1382,6 +1382,32 @@ class TestEvProbeCharging(unittest.TestCase):
         self.flag.assert_called_once_with(True)
 
 
+class TestEnsureScheduleTable(unittest.TestCase):
+    """Column migrations are idempotent (IF NOT EXISTS) and include the plug-ownership column."""
+
+    def test_add_column_if_not_exists_incl_plug_control(self):
+        conn = MagicMock()
+        mod.ensure_schedule_table(conn)
+        sqls = [c.args[0] for c in conn.cursor.return_value.execute.call_args_list]
+        alters = [q for q in sqls if q.startswith("ALTER TABLE")]
+        self.assertTrue(alters)
+        self.assertTrue(all("ADD COLUMN IF NOT EXISTS" in q for q in alters))
+        self.assertTrue(any("ev_plug_control" in q for q in alters))
+        self.assertFalse(any("MODIFY COLUMN" in q for q in sqls))
+
+
+class TestLoaderCursorClosed(unittest.TestCase):
+    """A failing query in the per-run loaders still closes the cursor and degrades to {}."""
+
+    def test_cursor_closed_on_failure(self):
+        for fn in (mod.load_nowcast_overlay, mod.load_wp_plan):
+            conn = MagicMock()
+            conn.cursor.return_value.execute.side_effect = RuntimeError("db gone")
+            with patch.object(mod, "PV_NOWCAST_OVERLAY", True), patch.object(mod, "WP_PLAN_IN_LOAD", True):
+                self.assertEqual(fn(conn, datetime(2026, 11, 22, 12, 0)), {})
+            conn.cursor.return_value.close.assert_called_once()
+
+
 class TestEvPlugControlFlag(unittest.TestCase):
     """The ownership check looks back 30 h, so clearing must clear every mark, not +-3 h."""
 
@@ -1389,6 +1415,14 @@ class TestEvPlugControlFlag(unittest.TestCase):
         with patch.object(mod.mysql.connector, "connect") as connect:
             self.assertTrue(mod.set_ev_plug_control_flag(set_control))
             return connect.return_value.cursor.return_value.execute.call_args.args
+
+    def test_connection_closed_when_query_fails(self):
+        for fn, args in ((mod.set_ev_plug_control_flag, (True,)),
+                         (mod.ev_plug_is_optimizer_controlled, ())):
+            with patch.object(mod.mysql.connector, "connect") as connect:
+                connect.return_value.cursor.return_value.execute.side_effect = RuntimeError("db gone")
+                self.assertFalse(fn(*args))
+                connect.return_value.close.assert_called_once()
 
     def test_clear_removes_every_mark(self):
         args = self._sql(False)

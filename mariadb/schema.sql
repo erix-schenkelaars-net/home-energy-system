@@ -316,6 +316,12 @@ CREATE TABLE IF NOT EXISTS `battery_schedule` (
   `pv_clearsky_kwh`     float        DEFAULT NULL COMMENT 'Clear-sky PV for this slot kWh (whole array, reference only)',
   `pv_clearsky_east_kwh` float       DEFAULT NULL COMMENT 'Clear-sky PV east roof half kWh (display only)',
   `pv_clearsky_west_kwh` float       DEFAULT NULL COMMENT 'Clear-sky PV west roof half kWh (display only)',
+  -- Ownership of the EV smart plug: 1 on the slots around the moment the optimiser switched it on.
+  -- Lets the optimiser switch OFF only a plug it switched on itself, never one turned on by hand or
+  -- by HA. Lives here rather than in its own table for history only; long added by hand, until
+  -- 2026-11-22 not created by ensure_schedule_table() nor documented, so a rebuilt table silently
+  -- disabled plug control (both helpers just log a warning and report "not ours").
+  `ev_plug_control`     tinyint(4)   DEFAULT 0   COMMENT '1 = optimiser owns the EV plug around this slot (see set_ev_plug_control_flag)',
 
   PRIMARY KEY (`id`),
   KEY `slot_dt` (`slot_dt`),
