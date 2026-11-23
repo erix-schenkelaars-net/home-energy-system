@@ -86,6 +86,20 @@ def flow_for_heat(w, room, q):
     return room + q / w["k_emitter"] + w["spread"] / 2
 
 
+def flow_cap_auto(params, floor, t_out, headroom, lo, hi):
+    """PURE: the flow cap (°C) the weather needs: the supply that holds `floor` at `t_out` in steady
+    state (heat loss ua * (floor - t_out) minus the mean internal gains, through the emitters) plus
+    `headroom`, clamped to [lo, hi]. On mild days the cap stays at lo (the peak guard of 2026-11-17:
+    9 kW at 50 °C after a bump); in frost it is never what keeps the room under the floor (2026-11-23:
+    42 °C holds 21.8 only down to about +3 °C, at -1 °C the room would settle near 19.7). floor or
+    t_out None -> lo, the fixed cap as before."""
+    if floor is None or t_out is None:
+        return lo
+    p, w = params["house"], params["heat_pump"]
+    need = max(0.0, ua(p) * (floor - t_out) - p["q0"])
+    return round(min(hi, max(lo, flow_for_heat(w, floor, need) + headroom)), 1)
+
+
 def q_min_at(w, t_out):
     """Lowest heat (kW) the P60 can sustain while running, at an outside temperature.
 

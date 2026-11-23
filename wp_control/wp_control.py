@@ -239,6 +239,20 @@ def room_comp_pi(room, setpoint, state, cfg, headroom=None, running=True, now=No
     return round(boost, 1) + 0.0, state["i"]
 
 
+def rules_flow_cap(cfg, setpoint, outside, params=None):
+    """The flow cap for the rule-based control: with WP_FLOW_CAP_AUTO the one the weather needs for the
+    setpoint the rules steer on (house_model.flow_cap_auto), else WP_FLOW_CAP. Any problem (no house
+    model file, no outside temperature) -> WP_FLOW_CAP, the fixed cap as before."""
+    if not cfg.get("flow_cap_auto"):
+        return cfg["flow_cap"]
+    try:
+        import house_model as hm
+        params = params or hm.load_params()
+        return hm.flow_cap_auto(params, setpoint, outside, cfg["flow_cap_headroom"], cfg["flow_cap"], cfg["flow_cap_max"])
+    except Exception:
+        return cfg["flow_cap"]
+
+
 def regulated_flow(base, boost, cfg):
     """PURE: curve + room comp -> flow target (C), bounded to [flow_min, flow_cap]. With a negative
     boost (room above setpoint) the floor keeps the heat pump at a low but sensible flow instead of
@@ -514,6 +528,12 @@ def build_cfg():
         "comfort":   os.environ.get("WP_COMFORT_MIN", ""),
         "flow_min": float(os.environ.get("WP_FLOW_MIN", "28")),
         "flow_cap": float(os.environ.get("WP_FLOW_CAP", "50")),
+        # 2026-11-23: the cap follows the weather (house_model.flow_cap_auto): the supply that holds the
+        # floor at the outside temperature + headroom, between WP_FLOW_CAP (mild: peak guard) and
+        # WP_FLOW_CAP_MAX. 0 = WP_FLOW_CAP as a fixed cap.
+        "flow_cap_auto":     os.environ.get("WP_FLOW_CAP_AUTO", "0").strip() == "1",
+        "flow_cap_headroom": float(os.environ.get("WP_FLOW_CAP_HEADROOM", "3")),
+        "flow_cap_max":      float(os.environ.get("WP_FLOW_CAP_MAX", "55")),
         "flow_max_drop": float(os.environ.get("WP_FLOW_MAX_DROP", "1.0")),  # C per cycle down
         "flow_land_below": float(os.environ.get("WP_FLOW_LAND_BELOW", "37")),  # soft landing from this target
         "flow_land_step":  float(os.environ.get("WP_FLOW_LAND_STEP", "0.5")),  # C per cycle down during the landing
@@ -1625,7 +1645,9 @@ def plan_cycle(cfg, now, room, ovr_state):
                 if active(ovr_state.get("ovr_until")) else None)
         lower = (ovr_state["und_until"], ovr_state["und_target"]) if active(ovr_state.get("und_until")) else None
         dec, res, diag = wp_planner.run_live(cfg["db"], now, room, bands, bump, lower, cfg["flow_min"], cfg["flow_cap"],
-                                             q_prev=ovr_state.get("last_q"))
+                                             q_prev=ovr_state.get("last_q"),
+                                             flow_cap_auto=((cfg["flow_cap_headroom"], cfg["flow_cap_max"])
+                                                            if cfg.get("flow_cap_auto") else None))
     except Exception as e:
         dbg("PLAN", f"planner faalde: {type(e).__name__}: {e}")
         write_plan(cfg, 2 if mode == 1 else 0, now=now)
@@ -1640,6 +1662,9 @@ def plan_cycle(cfg, now, room, ovr_state):
     cap_now = ((diag.get("inputs") or {}).get("qmax") or [None])[0]
     if cap_now is not None and (bump or cap_now > wp_planner.QMAX):     # only when it is not the plain WP_QMAX
         relax_txt += f" | {'bump-cap' if bump else 'vorst-cap'} {cap_now:.2f}kW"
+    if diag.get("flow_cap_floor") is not None:
+        out_txt = "?" if diag.get("flow_cap_out") is None else f"{diag['flow_cap_out']:.1f}"
+        relax_txt += f" | aanvoer-cap {diag['flow_cap']:.1f}°C (vloer {diag['flow_cap_floor']:.2f} bij {out_txt}°C)"
     dbg("PLAN", f"[{'LIVE' if mode else 'SCHADUW'}] kamer={room} massa={diag['tm']:.2f} {run_txt} "
                 f"KNMI-bias={bias}K -> {act}{' | bump genegeerd (herstartblokkade)' if diag.get('bump_skipped') else ''}"
                 f"{relax_txt}"
@@ -1647,7 +1672,8 @@ def plan_cycle(cfg, now, room, ovr_state):
     write_plan(cfg, mode, dec, res, diag, now)
     dec = dict(dec, mass=diag["tm"], heatplan=heatplan_payload(res, diag, now),
                room_1h=res["room"][3], running=diag["running"], on_min=diag.get("on_min"),
-               start_water=diag.get("start_water"), defrost=defrost, tmin_now=(diag.get("inputs") or {}).get("tmin", [None])[0])
+               start_water=diag.get("start_water"), defrost=defrost, tmin_now=(diag.get("inputs") or {}).get("tmin", [None])[0],
+               flow_cap=diag.get("flow_cap", cfg["flow_cap"]))
     return dec
 
 
@@ -1695,7 +1721,9 @@ def main():
                     f" | dQ-straf €{float(os.environ.get('WP_DQ_PENALTY', '0')):g}/kW"
                     f" | buiten-correctie {wp_planner.COMFORT_SLOPE:g} K/K rond {wp_planner.COMFORT_TREF:g}°C"
                     f" (+{wp_planner.COMFORT_ADJ_UP:g}/-{wp_planner.COMFORT_ADJ_DOWN:g} K,"
-                    f" gem. {wp_planner.COMFORT_OUT_AVG_H:g}u)")
+                    f" gem. {wp_planner.COMFORT_OUT_AVG_H:g}u)"
+                    + (f" | aanvoer-cap AUTO {cfg['flow_cap']:g}..{cfg['flow_cap_max']:g}°C (+{cfg['flow_cap_headroom']:g} K)"
+                       if cfg["flow_cap_auto"] else f" | aanvoer-cap vast {cfg['flow_cap']:g}°C"))
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
     # wait briefly for a fresh Honeywell setting: the DB row may still hold the setting from before a turn
     for _ in range(15):
@@ -1781,14 +1809,15 @@ def main():
         # NOT on the raw Honeywell setting `sp_now`. Otherwise an expired bump (the dial left at 23)
         # keeps heating the house towards 23 while `gewenst` is already back at 21 (schedule).
         base = curve_flow(ot, cfg["curve"])
-        headroom = None if base is None else (cfg["flow_cap"] - base)   # room up to the cap = anti-windup
+        rules_cap = rules_flow_cap(cfg, sp, ot)
+        headroom = None if base is None else (rules_cap - base)   # room up to the cap = anti-windup
         running = flame != 0                         # None (unknown) -> behaviour as before
         now = datetime.now()
         boost, i_term = room_comp_pi(room, sp, i_state, cfg, headroom, running, now)
         nominal = price_overlay(now, *decide_setpoint(now, cfg), price_win, cfg)[0]   # without bump
         off_above = heat_off_above(now, sp, price_win, cfg, nominal)
         heat = decide_heat(room, sp, heat_state, cfg["heat_on_below"], off_above)
-        flow_raw = regulated_flow(base, boost, cfg)
+        flow_raw = regulated_flow(base, boost, dict(cfg, flow_cap=rules_cap))
         last_cmd = heat_state.get("flow")    # the previous cycle's command, before the rules overwrite it
         if heat:
             flow = limit_flow_drop(flow_raw, heat_state, cfg["flow_max_drop"])
@@ -1826,7 +1855,7 @@ def main():
                             dbg("PLAN", why)
                         flow, why = start_kick_flow(flow, planned["running"],
                                                     water if water is not None else planned["start_water"],
-                                                    cfg["softstart_gap"], cfg["flow_cap"])
+                                                    cfg["softstart_gap"], planned.get("flow_cap", cfg["flow_cap"]))
                         if why:
                             dbg("PLAN", why)
                     heat_state["heat"] = heat            # the rules resume from the real state on fallback

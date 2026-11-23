@@ -7,7 +7,7 @@ synthetic inputs; the real fitted parameters come from house_model_params.json.
 import math
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -490,6 +490,62 @@ class TestComfortOutsideAdj(unittest.TestCase):
 
     def test_slope_zero_is_off(self):
         self.assertEqual(wpp.comfort_outside_adj([-10.0] * 3, slope=0), [0.0, 0.0, 0.0])
+
+
+class TestFlowCapAuto(unittest.TestCase):
+    """2026-11-23: 42 C holds 21.8 only down to about +3 C; the cap follows the weather instead."""
+    LO, HEAD, HI = 42.0, 3.0, 55.0
+
+    def _need(self, floor, t_out):
+        p, w = PARAMS["house"], PARAMS["heat_pump"]
+        return hm.flow_for_heat(w, floor, hm.ua(p) * (floor - t_out) - p["q0"])
+
+    def test_frost_lifts_the_cap_to_need_plus_headroom(self):
+        cap = hm.flow_cap_auto(PARAMS, 21.8, -1.0, self.HEAD, self.LO, self.HI)
+        self.assertAlmostEqual(cap, round(self._need(21.8, -1.0) + self.HEAD, 1))
+        self.assertGreater(cap, 48.0)                 # ~46.6 needed at -1 C, so 42 would starve the room
+
+    def test_mild_keeps_the_peak_guard(self):
+        self.assertEqual(hm.flow_cap_auto(PARAMS, 21.3, 10.0, self.HEAD, self.LO, self.HI), self.LO)
+
+    def test_hard_frost_stops_at_the_max(self):
+        self.assertEqual(hm.flow_cap_auto(PARAMS, 22.2, -15.0, self.HEAD, self.LO, self.HI), self.HI)
+
+    def test_unknown_input_falls_back_to_the_fixed_cap(self):
+        self.assertEqual(hm.flow_cap_auto(PARAMS, None, -5.0, self.HEAD, self.LO, self.HI), self.LO)
+        self.assertEqual(hm.flow_cap_auto(PARAMS, 21.0, None, self.HEAD, self.LO, self.HI), self.LO)
+
+    def test_planner_cap_uses_the_band_floor_ahead_not_a_bump(self):
+        from unittest.mock import patch
+        t0 = datetime(2026, 11, 23, 8, 30)
+        times = [t0 + timedelta(minutes=15 * k) for k in range(8)]
+        bands = wpp.parse_comfort("07:00-09:00=20.8,09:00-13:00=21.3")
+        with patch.object(wpp, "COMFORT_SLOPE", 0.0), patch.object(wpp, "COMFORT_STEP_K", 0.0):
+            cap, floor, out = wpp.auto_flow_cap(PARAMS, bands, times, [-1.0] * 8, [-1.0] * 24,
+                                                self.LO, self.HEAD, self.HI)
+        self.assertEqual(floor, 21.3)                 # 09:00 is within the next hour: its floor counts
+        self.assertEqual(out, -1.0)
+        self.assertEqual(cap, hm.flow_cap_auto(PARAMS, 21.3, -1.0, self.HEAD, self.LO, self.HI))
+
+    def test_planner_cap_takes_the_colder_of_now_and_the_mean(self):
+        from unittest.mock import patch
+        t0 = datetime(2026, 11, 23, 10, 0)
+        times = [t0 + timedelta(minutes=15 * k) for k in range(4)]
+        bands = wpp.parse_comfort("00:00-23:59=21.3")
+        with patch.object(wpp, "COMFORT_SLOPE", 0.0):
+            _, _, cooling = wpp.auto_flow_cap(PARAMS, bands, times, [-3.0] * 4, [5.0] * 24, self.LO, self.HEAD, self.HI)
+            _, _, warming = wpp.auto_flow_cap(PARAMS, bands, times, [8.0] * 4, [0.0] * 24, self.LO, self.HEAD, self.HI)
+        self.assertEqual(cooling, -3.0)               # the cold sets in: now counts
+        self.assertAlmostEqual(warming, (0.0 * 23 + 8.0) / 24)   # thawing: the walls are still cold
+
+    def test_planner_cap_includes_the_outside_shift(self):
+        from unittest.mock import patch
+        times = [datetime(2026, 11, 23, 10, 0)]
+        bands = wpp.parse_comfort("00:00-23:59=21.3")
+        with patch.object(wpp, "COMFORT_SLOPE", 0.08), patch.object(wpp, "COMFORT_TREF", 5.0), \
+             patch.object(wpp, "COMFORT_ADJ_UP", 0.5):
+            _, floor, _ = wpp.auto_flow_cap(PARAMS, bands, times, [0.0], [0.0] * 24, self.LO, self.HEAD, self.HI)
+        self.assertEqual(floor, 21.7)
 
 
 class TestComfortRampSavesTheMorningPeak(unittest.TestCase):

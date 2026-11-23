@@ -155,7 +155,10 @@ them).
 |---|---|---|
 | `WP_FLOW_CURVE` | `20:28,10:38,0:42,-10:48,-25:50,-30:50` | weather curve `outside:flow`, linearly interpolated. The 10 °C point went 35 → 38 on 2026-11-02: on the first day without the I ratchet the room stayed 0.4–0.6 °C under the setpoint around 10 °C outside (the old high I had been hiding that gap) |
 | `WP_FLOW_MIN` | `28` | flow floor (also with negative compensation) |
-| `WP_FLOW_CAP` | `50` | flow ceiling |
+| `WP_FLOW_CAP` | `50` | flow ceiling; with `WP_FLOW_CAP_AUTO=1` the lowest value of the weather-following cap |
+| `WP_FLOW_CAP_AUTO` | `0` | `1` = the flow cap follows the weather (2026-11-23): the supply that holds the comfort floor at the outside temperature in steady state (house model: heat loss minus mean internal gains, through the emitters) plus `WP_FLOW_CAP_HEADROOM`, between `WP_FLOW_CAP` and `WP_FLOW_CAP_MAX`. Planner: floor = the highest band floor (outside shift included) in the next hour, not a bump; outside = the colder of now and the 6-h mean. Rules fallback: the setpoint and the current outside temperature. A fixed 42 holds 21.8 only down to about +3 °C (at -1 °C the room settles near 19.7); 50 down to about -4 °C. Logged as `aanvoer-cap X°C (vloer .. bij ..°C)` in `[PLAN]` |
+| `WP_FLOW_CAP_HEADROOM` | `3` | K above the steady-state need, so a defrost or a cold spell can be caught up |
+| `WP_FLOW_CAP_MAX` | `55` | the cap never goes above this |
 | `WP_FLOW_LAND_BELOW` | `37` | soft landing: from this target down, the planner's target falls by `WP_FLOW_LAND_STEP` per cycle |
 | `WP_FLOW_LAND_STEP` | `0.5` | °C per cycle during the soft landing |
 | `WP_FLOW_LAND_FLOOR` | `32` | lowest planner target while the heat pump runs (a target already below it is not raised) |

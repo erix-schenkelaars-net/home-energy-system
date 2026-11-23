@@ -601,6 +601,33 @@ class TestRegulatedFlow(unittest.TestCase):
     def test_no_base_is_none(self):
         self.assertIsNone(wp.regulated_flow(None, 2.0, self.CFG))
 
+
+class TestRulesFlowCap(unittest.TestCase):
+    """The fallback rules use the same weather-following cap as the planner (2026-11-23)."""
+
+    CFG = {"flow_cap": 42.0, "flow_cap_auto": True, "flow_cap_headroom": 3.0, "flow_cap_max": 55.0}
+
+    def test_off_is_the_fixed_cap(self):
+        self.assertEqual(wp.rules_flow_cap(dict(self.CFG, flow_cap_auto=False), 21.5, -5.0), 42.0)
+
+    def test_frost_lifts_it_mild_keeps_it(self):
+        import house_model as hm
+        params = hm.load_params()
+        self.assertEqual(wp.rules_flow_cap(self.CFG, 21.8, -1.0, params),
+                         hm.flow_cap_auto(params, 21.8, -1.0, 3.0, 42.0, 55.0))
+        self.assertGreater(wp.rules_flow_cap(self.CFG, 21.8, -1.0, params), 48.0)
+        self.assertEqual(wp.rules_flow_cap(self.CFG, 21.3, 10.0, params), 42.0)
+
+    def test_any_problem_is_the_fixed_cap(self):
+        with patch("house_model.load_params", side_effect=OSError("no file")):
+            self.assertEqual(wp.rules_flow_cap(self.CFG, 21.5, -5.0), 42.0)
+        self.assertEqual(wp.rules_flow_cap(self.CFG, 21.5, None, {"house": {}, "heat_pump": {}}), 42.0)
+
+    def test_auto_is_off_by_default(self):
+        cfg = wp.build_cfg()
+        self.assertFalse(cfg["flow_cap_auto"])
+        self.assertEqual((cfg["flow_cap_headroom"], cfg["flow_cap_max"]), (3.0, 55.0))
+
     def test_build_cfg_defaults(self):
         cfg = wp.build_cfg()
         self.assertEqual((cfg["flow_min"], cfg["rc_neg_max"], cfg["heat_off_above"]), (28.0, 8.0, 0.8))

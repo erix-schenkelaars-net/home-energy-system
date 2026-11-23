@@ -87,6 +87,7 @@ COMFORT_SLOPE = float(os.environ.get("WP_COMFORT_SLOPE", "0"))
 COMFORT_ADJ_UP = float(os.environ.get("WP_COMFORT_ADJ_UP", "0.5"))
 COMFORT_ADJ_DOWN = float(os.environ.get("WP_COMFORT_ADJ_DOWN", "0.3"))
 COMFORT_OUT_AVG_H = float(os.environ.get("WP_COMFORT_OUT_AVG_H", "6"))
+FLOW_CAP_AHEAD = 4           # auto flow cap: look this many quarters ahead for the floor (auto_flow_cap)
 DEFROST_GAP_K = 2.0          # flow this much below return with the compressor on = defrost (see defrost_from_rows)
 DEFROST_MIN_ROWS = 2         # in at least this many consecutive 5-min rows
 
@@ -170,20 +171,39 @@ def comfort_outside_adj(t_out, history=(), slope=None, tref=None, up=None, down=
     tref = COMFORT_TREF if tref is None else tref
     up = COMFORT_ADJ_UP if up is None else up
     down = COMFORT_ADJ_DOWN if down is None else down
-    n = max(1, int(round((COMFORT_OUT_AVG_H if avg_h is None else avg_h) / DT)))
     if slope == 0 or not t_out:
         return [0.0] * len(t_out)
-    series = [x for x in history if x is not None] + [x for x in t_out]
+    return [0.0 if m is None else round(max(-down, min(up, slope * (tref - m))), 2)
+            for m in outside_means(t_out, history, avg_h)]
+
+
+def outside_means(t_out, history=(), avg_h=None):
+    """PURE: per quarter of `t_out`, the mean outside temperature over the last avg_h hours (the
+    measured `history` first, oldest first, then the plan's own values; None skipped, None if empty)."""
+    n = max(1, int(round((COMFORT_OUT_AVG_H if avg_h is None else avg_h) / DT)))
+    series = [x for x in history if x is not None] + list(t_out)
     off = len(series) - len(t_out)
     out = []
     for k in range(len(t_out)):
         win = [x for x in series[max(0, off + k + 1 - n): off + k + 1] if x is not None]
-        if not win:
-            out.append(0.0)
-            continue
-        adj = slope * (tref - sum(win) / len(win))
-        out.append(round(max(-down, min(up, adj)), 2))
+        out.append(sum(win) / len(win) if win else None)
     return out
+
+
+def auto_flow_cap(params, bands, times, t_out, history, lo, headroom, hi, ahead=FLOW_CAP_AHEAD):
+    """PURE: the flow cap for this cycle (house_model.flow_cap_auto) and the (floor, outside) it was
+    made from. Floor = the highest comfort band floor (outside shift included) in the next `ahead`
+    quarters, so a morning staircase is not capped below its next steps; NOT a bump or lowering: the
+    peak guard is for exactly those. Outside = the colder of now and the window mean: the cap must not
+    hold the room back while the cold sets in. No band in reach -> 20.5."""
+    k = max(1, min(ahead, len(times)))
+    adj = comfort_outside_adj(t_out, history)
+    floors = [f + a for f, a in zip(comfort_floors(bands, list(times[:k])), adj[:k]) if f is not None]
+    floor = round(max(floors), 2) if floors else 20.5
+    means = outside_means(t_out[:1], history)
+    cands = [x for x in (t_out[0] if t_out else None, means[0] if means else None) if x is not None]
+    out = min(cands) if cands else None
+    return hm.flow_cap_auto(params, floor, out, headroom, lo, hi), floor, out
 
 
 def defrost_relax(t, defrost_end, k=None, hold_h=None, rate=None):
@@ -709,11 +729,13 @@ def live_decision(params, res, room, outlet, running, flow_min, flow_cap):
             "room_sp": room_sp}
 
 
-def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flow_cap=50.0, params=None, q_prev=None):
+def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flow_cap=50.0, params=None, q_prev=None,
+             flow_cap_auto=None):
     """Plan from live data and return (decision, plan, diagnostics). Raises on any problem, so the
     caller can fall back to the rule-based control. q_prev: the heat the previous cycle planned (kW, 0/None
     when off or unknown), so the smoothness penalty also holds across re-plans. It is our own plan, never a
-    measurement, so it cannot ratchet."""
+    measurement, so it cannot ratchet. flow_cap_auto = (headroom, max) -> the cap follows the weather
+    (auto_flow_cap) with flow_cap as its lowest value; None -> flow_cap as a fixed cap."""
     params = params or hm.load_params()
     p = params["house"]
     q0 = quarter(now)
@@ -743,8 +765,12 @@ def run_live(db, now, room_now, bands, bump=None, lower=None, flow_min=28.0, flo
     res = plan(params, room_now, tm, inp, on0=running, off_minutes=off_min)
     if "on" not in res:
         raise RuntimeError(f"solver: {res.get('message')}")
+    cap_floor = cap_out = None
+    if flow_cap_auto:
+        flow_cap, cap_floor, cap_out = auto_flow_cap(params, bands, [r["t"] for r in fut], inp["t_out"],
+                                                     [m for m, _ in recent], flow_cap, *flow_cap_auto)
     dec = live_decision(params, res, room_now, outlet, running, flow_min, flow_cap)
-    diag = {"tm": tm, "running": running, "off_min": off_min, "on_min": on_min, "start_water": start_water, "outlet": outlet, "slots": n,
+    diag = {"flow_cap": flow_cap, "flow_cap_floor": cap_floor, "flow_cap_out": cap_out,"tm": tm, "running": running, "off_min": off_min, "on_min": on_min, "start_water": start_water, "outlet": outlet, "slots": n,
             "bias": inp["t_out"][0] - fut[0]["t_out_fc"] if fut[0]["t_out_fc"] is not None else None,
             "cost": res["cost"], "times": [r["t"] for r in fut], "inputs": inp, "bump_skipped": bool(bump and not bump_used),
             "defrost": defrost, "relax": defrost_relax(fut[0]["t"], defrost and defrost["end"])}
