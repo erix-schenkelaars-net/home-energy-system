@@ -76,6 +76,17 @@ COMFORT_RAMP_MAX_MIN = float(os.environ.get("WP_COMFORT_RAMP_MAX_MIN", "120"))
 # the window, the floor is never more than DEFROST_RELAX_K lower. 0 = off.
 DEFROST_RELAX_K = float(os.environ.get("WP_DEFROST_RELAX_K", "0.2"))
 DEFROST_RELAX_H = float(os.environ.get("WP_DEFROST_RELAX_H", "4"))
+# The comfort bands move with the outside temperature: floor + SLOPE * (TREF - outside), clamped to
+# [-ADJ_DOWN, +ADJ_UP]. At the same air temperature a frosty day feels colder (cold windows and outside
+# walls radiate less back, cold air falls off the glass), a mild day warmer. 2026-11-23: 21.4 felt cold at
+# ~0 C outside, fine the days before. "Outside" is the mean of the last COMFORT_OUT_AVG_H hours (sensor
+# history, then the corrected forecast), because walls follow the weather slowly and a single cold hour
+# should not move the floor. SLOPE 0 = off (the bands as they are).
+COMFORT_TREF = float(os.environ.get("WP_COMFORT_TREF", "5.0"))
+COMFORT_SLOPE = float(os.environ.get("WP_COMFORT_SLOPE", "0"))
+COMFORT_ADJ_UP = float(os.environ.get("WP_COMFORT_ADJ_UP", "0.5"))
+COMFORT_ADJ_DOWN = float(os.environ.get("WP_COMFORT_ADJ_DOWN", "0.3"))
+COMFORT_OUT_AVG_H = float(os.environ.get("WP_COMFORT_OUT_AVG_H", "6"))
 DEFROST_GAP_K = 2.0          # flow this much below return with the compressor on = defrost (see defrost_from_rows)
 DEFROST_MIN_ROWS = 2         # in at least this many consecutive 5-min rows
 
@@ -148,6 +159,31 @@ def comfort_floors(bands, times, step=None, step_max=None, max_q=None):
             elif out[j] is not None:                 # after it: hold back (a band that ended stays ended)
                 out[j] = min(out[j], v)
     return [None if f is None else round(f, 2) for f in out]
+
+
+def comfort_outside_adj(t_out, history=(), slope=None, tref=None, up=None, down=None, avg_h=None):
+    """PURE: the comfort-floor shift (K) per quarter of `t_out` (the plan's outside temperatures):
+    slope * (tref - mean outside over the last avg_h hours), clamped to [-down, +up]. `history` = the
+    measured outside temperatures before the first quarter, oldest first (None allowed); the window
+    takes them first, so the first quarters are not judged on one forecast value."""
+    slope = COMFORT_SLOPE if slope is None else slope
+    tref = COMFORT_TREF if tref is None else tref
+    up = COMFORT_ADJ_UP if up is None else up
+    down = COMFORT_ADJ_DOWN if down is None else down
+    n = max(1, int(round((COMFORT_OUT_AVG_H if avg_h is None else avg_h) / DT)))
+    if slope == 0 or not t_out:
+        return [0.0] * len(t_out)
+    series = [x for x in history if x is not None] + [x for x in t_out]
+    off = len(series) - len(t_out)
+    out = []
+    for k in range(len(t_out)):
+        win = [x for x in series[max(0, off + k + 1 - n): off + k + 1] if x is not None]
+        if not win:
+            out.append(0.0)
+            continue
+        adj = slope * (tref - sum(win) / len(win))
+        out.append(round(max(-down, min(up, adj)), 2))
+    return out
 
 
 def defrost_relax(t, defrost_end, k=None, hold_h=None, rate=None):
@@ -447,7 +483,9 @@ def backtest(day, horizon_h=36, quiet=False, realistic=False, out_json=None):
             inp = {"price": [r["price"] for r in seg], "t_out": [r["t_out"] for r in seg], "pv_kw": [r["pv"] for r in seg]}
         inp.update({
                "hour": [r["t"].hour + r["t"].minute / 60 for r in seg],
-               "tmin": comfort_floors(bands, [r["t"] for r in seg])})
+               "tmin": [None if f is None else round(f + a, 2) for f, a in zip(
+                   comfort_floors(bands, [r["t"] for r in seg]),
+                   comfort_outside_adj(inp["t_out"], [r["t_out"] for r in hist[max(0, i0 + k - BIAS_HOURS * 4): i0 + k]]))]})
         inp["q_prev"] = log[-1]["Q"] if log else hist[i0 - 1]["q"]
         res = plan(params, tr, tm, inp, on0=on, off_minutes=off_min)
         if "on" not in res:
@@ -606,9 +644,10 @@ def build_live_inputs(rows, now, bands, recent, bump=None, lower=None, defrost_e
     t_out = corrected_outside(fc_filled, [m for m, _ in recent], [f for _, f in recent])
     tmin, qmax = [], []
     floors = comfort_floors(bands, [r["t"] for r in rows])
-    for r, tm, to in zip(rows, floors, t_out):
+    adjs = comfort_outside_adj(t_out, [m for m, _ in recent])
+    for r, tm, to, adj in zip(rows, floors, t_out, adjs):
         if tm is not None:
-            tm = round(tm - defrost_relax(r["t"], defrost_end), 2)
+            tm = round(tm + adj - defrost_relax(r["t"], defrost_end), 2)
         if lower and r["t"] < lower[0]:
             tm = None if tm is None else min(tm, lower[1])
         in_bump = bool(bump and r["t"] < bump[0])

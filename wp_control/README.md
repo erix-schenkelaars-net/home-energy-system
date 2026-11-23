@@ -383,6 +383,10 @@ room keeps falling for a while longer than predicted.
 | `WP_COMFORT_STEP_K` | `0.1` | an upward step becomes stairs of this height per quarter, centred on the step: at the moment of the step half of it is made (rounded up), the rest after. Downward steps apply at once. 0 = hard steps |
 | `WP_COMFORT_STEP_MAX_K` | `0.2` | stair height when `WP_COMFORT_STEP_K` would take longer than `WP_COMFORT_RAMP_MAX_MIN` |
 | `WP_COMFORT_RAMP_MAX_MIN` | `120` | longest staircase; if even `WP_COMFORT_STEP_MAX_K` takes longer, the staircase starts higher (18.0 → 20.8 would start at 19.2) |
+| `WP_COMFORT_SLOPE` | `0` | the comfort floor follows the outside temperature: + this many K per K that the outside is below `WP_COMFORT_TREF` (minus when above), clamped by the next two. At the same air temperature a frosty day feels colder: cold windows and outside walls radiate less back, cold air falls off the glass (2026-11-23: 21.4 felt cold at ~0 °C outside, fine the days before). `0` = off. Live: `0.08` |
+| `WP_COMFORT_TREF` | `5.0` | outside temperature (°C) at which the bands apply as written |
+| `WP_COMFORT_ADJ_UP` / `WP_COMFORT_ADJ_DOWN` | `0.5` / `0.3` | most the floor is raised in frost / lowered on mild days (K) |
+| `WP_COMFORT_OUT_AVG_H` | `6` | "outside" = the mean of the last this many hours (sensor history, then the corrected forecast): walls follow the weather slowly, one cold hour does not move the floor. The defrost relax and a manual lowering still apply on top; a bump does not get the shift |
 | `WP_DEFROST_RELAX_K` | `0.2` | after a defrost the floor is this much lower, so the missed heat is made up in cheap hours (0 = off) |
 | `WP_DEFROST_RELAX_H` | `4` | ... for this many hours after the defrost ended, then back by `WP_COMFORT_STEP_K` per quarter; a new defrost extends it, it never adds up |
 | `WP_DEFROST_SOFTSTART` | `1` | after a defrost the target ramps up from the water like a soft restart (`ontdooi-oploop` in the log); `0` = off |

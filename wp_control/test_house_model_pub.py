@@ -447,6 +447,50 @@ class TestLiveInputs(unittest.TestCase):
         self.assertEqual(relaxed["tmin"][15], 20.8)   # 3 h 45 later: still inside the 4 h hold
         self.assertAlmostEqual(bump["tmin"][0], 22.5 - wpp.MARGIN)
 
+    def test_frost_raises_the_floor_and_mild_lowers_it(self):
+        # 2026-11-23: 21.4 felt cold at ~0 C outside. Same band, +0.08 K per K below 5 C, clamped.
+        from unittest.mock import patch
+        bands = wpp.parse_comfort("00:00-23:59=21.3")
+        with patch.object(wpp, "COMFORT_SLOPE", 0.08), patch.object(wpp, "COMFORT_TREF", 5.0), \
+             patch.object(wpp, "COMFORT_ADJ_UP", 0.5), patch.object(wpp, "COMFORT_ADJ_DOWN", 0.3), \
+             patch.object(wpp, "COMFORT_STEP_K", 0.1), patch.object(wpp, "DEFROST_RELAX_K", 0.2):
+            frost = wpp.build_live_inputs(self._rows(8, fc=0.0), self.T0, bands, [(0.0, 0.0)] * 24)
+            hard = wpp.build_live_inputs(self._rows(8, fc=-8.0), self.T0, bands, [(-8.0, -8.0)] * 24)
+            mild = wpp.build_live_inputs(self._rows(8, fc=12.0), self.T0, bands, [(12.0, 12.0)] * 24)
+            ref = wpp.build_live_inputs(self._rows(8, fc=5.0), self.T0, bands, [(5.0, 5.0)] * 24)
+            relaxed = wpp.build_live_inputs(self._rows(8, fc=0.0), self.T0, bands, [(0.0, 0.0)] * 24,
+                                            defrost_end=self.T0)
+        self.assertEqual(frost["tmin"][0], 21.7)      # 21.3 + 0.08 * 5
+        self.assertEqual(hard["tmin"][0], 21.8)       # capped at +0.5
+        self.assertEqual(mild["tmin"][0], 21.0)       # capped at -0.3
+        self.assertEqual(ref["tmin"][0], 21.3)        # at TREF: the band as written
+        self.assertEqual(relaxed["tmin"][0], 21.5)    # the defrost relax still applies on top
+
+    def test_outside_shift_off_by_default_leaves_the_bands(self):
+        from unittest.mock import patch
+        bands = wpp.parse_comfort("00:00-23:59=21.3")
+        with patch.object(wpp, "COMFORT_SLOPE", 0.0), patch.object(wpp, "COMFORT_STEP_K", 0.1):
+            inp = wpp.build_live_inputs(self._rows(8, fc=-5.0), self.T0, bands, [(-5.0, -5.0)] * 24)
+        self.assertEqual(inp["tmin"][0], 21.3)
+
+
+class TestComfortOutsideAdj(unittest.TestCase):
+    KW = dict(slope=0.1, tref=5.0, up=0.5, down=0.3, avg_h=6)
+
+    def test_uses_the_mean_of_the_window_not_one_cold_hour(self):
+        # 6 h at 5 C, then the forecast drops to -5: the shift grows over the window, it does not jump
+        adj = wpp.comfort_outside_adj([-5.0] * 30, history=[5.0] * 24, **self.KW)
+        self.assertAlmostEqual(adj[0], round(0.1 * (5 - (5 * 23 - 5) / 24), 2))
+        self.assertLess(adj[0], adj[12])
+        self.assertEqual(adj[23], 0.5)                # whole window at -5: +1.0, capped at +0.5
+
+    def test_no_history_uses_the_forecast_and_skips_gaps(self):
+        adj = wpp.comfort_outside_adj([1.0, None, 1.0], history=[None, None], **self.KW)
+        self.assertEqual(adj, [0.4, 0.4, 0.4])
+
+    def test_slope_zero_is_off(self):
+        self.assertEqual(wpp.comfort_outside_adj([-10.0] * 3, slope=0), [0.0, 0.0, 0.0])
+
 
 class TestComfortRampSavesTheMorningPeak(unittest.TestCase):
     """The behaviour the ramp is for, on the real planner: a cheap quarter just before a +0.5 K step

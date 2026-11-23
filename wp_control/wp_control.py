@@ -1688,10 +1688,14 @@ def main():
     ensure_shadow_columns(cfg)           # shadow comparison with the OTThing (DRY)
     if cfg["planner"] in ("shadow", "live"):
         ensure_plan_columns(cfg)
+        import wp_planner
         dbg("CONF", f"PLANNER = {cfg['planner'].upper()} "
                     f"({'stuurt de WP, regels = terugval' if cfg['planner'] == 'live' else 'rekent mee + logt, regels sturen'})"
                     f" | comfort {cfg['comfort'] or '(standaard)'}"
-                    f" | dQ-straf €{float(os.environ.get('WP_DQ_PENALTY', '0')):g}/kW")
+                    f" | dQ-straf €{float(os.environ.get('WP_DQ_PENALTY', '0')):g}/kW"
+                    f" | buiten-correctie {wp_planner.COMFORT_SLOPE:g} K/K rond {wp_planner.COMFORT_TREF:g}°C"
+                    f" (+{wp_planner.COMFORT_ADJ_UP:g}/-{wp_planner.COMFORT_ADJ_DOWN:g} K,"
+                    f" gem. {wp_planner.COMFORT_OUT_AVG_H:g}u)")
     start_thermo_listener(cfg)           # snelle Honeywell-bump-detectie (fase-2, Optie B)
     # wait briefly for a fresh Honeywell setting: the DB row may still hold the setting from before a turn
     for _ in range(15):
