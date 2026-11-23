@@ -1,0 +1,15 @@
+services:
+  mosquitto:
+    # Same broker version as the HA add-on it replaces (2.1.2). The official image tags 2.1.x only as -alpine.
+    image: eclipse-mosquitto:2.1.2-alpine
+    container_name: mosquitto
+    restart: unless-stopped
+    stop_grace_period: 10s          # the wrapper forwards SIGTERM; mosquitto saves its retained messages
+    network_mode: host              # LAN clients (OTThing, HA VM) connect to <pi5new>:1883
+    entrypoint: ["/bin/sh", "/app/entrypoint.sh"]
+    volumes:
+      - ./entrypoint.sh:/app/entrypoint.sh:ro
+      - ./config:/mosquitto/config:ro
+      - ./data:/mosquitto/data      # persistence (retained messages); git-ignored
+      - ./logs:/logs
+      - /etc/localtime:/etc/localtime:ro   # local time in the log (musl reads /etc/localtime; no TZ, no tzdata)

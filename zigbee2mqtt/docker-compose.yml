@@ -1,0 +1,29 @@
+services:
+  zigbee2mqtt:
+    # Same version the HA add-on ran (2.14.3), so the database and state carry over unchanged.
+    image: koenkk/zigbee2mqtt:2.14.3
+    container_name: zigbee2mqtt
+    restart: unless-stopped
+    stop_grace_period: 20s          # the wrapper forwards SIGTERM; z2m saves database.db + state.json
+    network_mode: host              # broker on 127.0.0.1:1883, frontend on <pi5new>:8099
+    entrypoint: ["/bin/sh", "/wrap/entrypoint.sh"]
+    env_file:
+      - ../.env                     # MQTT_USERNAME / MQTT_PASSWORD, handed to z2m by entrypoint.sh
+    environment:
+      - TZ=Europe/Amsterdam
+    # Sonoff Zigbee 3.0 USB Dongle Plus V2 (EFR32, adapter `ember`) on the powered hub, opened as
+    # /dev/tty_zigbee: a udev rule on its serial number (/etc/udev/rules.d/99-tty-zigbee.rules), the
+    # same way as tty_seplos / sphgen / sphmeter, so the ttyUSBn number does not matter.
+    # privileged like those services, NOT a `devices:` entry: with `devices:` Docker looks the device up
+    # itself on every (re)start, and when the stick has just dropped off the bus that lookup fails
+    # ("error gathering device information") and Docker stops restarting the container for good.
+    # Privileged + /dev:/dev (a live view, so the udev symlink and a re-plugged stick show up without a
+    # recreate), the container always starts; z2m exits while the stick is absent and the restart
+    # policy keeps trying until it is back (tested 2026-11-23 with a software re-plug).
+    privileged: true
+    volumes:
+      - /dev:/dev
+      - ./entrypoint.sh:/wrap/entrypoint.sh:ro
+      - ./data:/app/data            # configuration.yaml, network key, device database; git-ignored
+      - ./logs:/logs
+      - /run/udev:/run/udev:ro
