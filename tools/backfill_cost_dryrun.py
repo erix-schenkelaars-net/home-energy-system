@@ -29,7 +29,7 @@ TARGET_DATE = date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else date(202
 DB = dict(
     host=os.getenv("DB_HOST", "127.0.0.1"),
     user=os.getenv("DB_USER", "erix"),
-    passwd=os.getenv("DB_PASSWORD", "UK2204uk."),
+    passwd=os.environ["DB_PASSWORD"],  # no default: never put a real password in code
     db=os.getenv("DB_NAME", "erix_db"),
 )
 
