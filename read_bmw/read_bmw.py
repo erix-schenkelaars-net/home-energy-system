@@ -932,15 +932,32 @@ def _check_vehicle_mapping():
 
 # ── Token refresh loop ─────────────────────────────────────────────────────────
 
+TOKEN_RETRY_MINS = 5    # after a failed reconnect: try again this soon, the id_token lasts 60 min
+
+
 def _token_loop(local: mqtt.Client, stop: threading.Event):
-    """Refresh every TOKEN_REFRESH_MINS minutes and reconnect BMW MQTT."""
-    while not stop.wait(TOKEN_REFRESH_MINS * 60):
+    """Refresh every TOKEN_REFRESH_MINS minutes and reconnect BMW MQTT.
+
+    A reconnect that raises (network blip, DNS, TLS) used to kill this thread silently: no more
+    refreshes, the token expired and the bridge stopped delivering -- no EV SoC, no car alarm --
+    while the container still showed "Up" (2026-11-22 review). Now it is logged and retried after
+    TOKEN_RETRY_MINS. A refresh the server REJECTS still stops the process (restart -> re-auth)."""
+    wait_min = TOKEN_REFRESH_MINS
+    while not stop.wait(wait_min * 60):
         log.info("Periodic token refresh…")
-        if _refresh():
-            _connect_bmw_mqtt(local)
-        else:
+        try:
+            ok = _refresh()
+            if ok:
+                _connect_bmw_mqtt(local)
+        except Exception as e:
+            log.error(f"Token refresh/reconnect raised: {e} — retry in {TOKEN_RETRY_MINS} min")
+            wait_min = TOKEN_RETRY_MINS
+            continue
+        if not ok:
             log.error("Token refresh failed — re-authentication needed.")
             stop.set()
+            return
+        wait_min = TOKEN_REFRESH_MINS
 
 
 def _rest_poll_loop(local: mqtt.Client, stop: threading.Event):

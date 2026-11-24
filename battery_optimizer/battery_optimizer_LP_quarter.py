@@ -9,7 +9,7 @@ Hardware:
   - Seplos 16 kWh LiFePO4 battery (20–89.5% SoC operating range)
   - 6.24 kWp solar PV (east + west strings)
   - Heat pump (Weheat)
-  - BMW i3 EV (7.7 kWh, 2.3 kW AC charge) on Antela smart plug
+  - BMW i3 EV (7.7 kWh, 2.3 kW AC charge) on a Zigbee smart plug (switched via HA)
 
 Key algorithm features:
   - 96 quarter-slots per day (SLOT_H = 0.25 h); horizon = today + tomorrow (192 slots)
@@ -311,8 +311,11 @@ MQTT_BROKER_PASS = os.environ.get("MQTT_PASSWORD", "")
 
 HA_URL            = os.environ.get("HA_URL", "http://YOUR_HA_IP:8123")
 HA_TOKEN          = os.environ.get("HA_TOKEN", "")
-HA_EV_PLUG_ENTITY       = "switch.antela_smart_plug_socket_1"
-HA_EV_PLUG_POWER_ENTITY = "sensor.antela_smart_plug_power"
+# EV charge plug: Third Reality Zigbee plug "230 V smart switch 8 EV-charging" (zigbee2mqtt on pi5new),
+# switched and read through its Home Assistant entities. Replaced the Tuya-cloud Antela WiFi plug on
+# 2026-11-23; switching it over MQTT directly (HA out of the control path) is a later step.
+HA_EV_PLUG_ENTITY       = "switch.230_v_smart_switch_8_ev_charging"
+HA_EV_PLUG_POWER_ENTITY = "sensor.230_v_smart_switch_8_ev_charging_power"
 
 # ---------------------------------------------------------------------------
 # HEAT PUMP MODEL
@@ -2410,9 +2413,15 @@ def ev_charge_window(start_qtr_idx: int, prices: dict[int, float],
 def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
                               prices: dict[int, float],
                               ev_soc: Optional[float],
-                              current_hour: int) -> list[float]:
+                              current_hour: int,
+                              charging_now: bool = False) -> list[float]:
     """Return per-quarter-slot EV charging energy (kWh/slot = kW × SLOT_H) before the
     BMW_READY_BY_HOUR deadline, placed on the same slots as ev_charge_window().
+
+    charging_now: the car is drawing power right now (a committed session, also one started by
+    hand). The plug then holds until the car is full, so the load is one unbroken run from the
+    current slot -- not the cheapest window, which booked an 18:00 hand-started charge at 02:30
+    and left the evening plan blind to 2.3 kW the house battery was really feeding (2026-11-22).
     """
     if ev_soc is None or ev_soc >= BMW_TARGET_SOC_PCT:
         return [0.0] * n_slots
@@ -2422,14 +2431,17 @@ def compute_ev_load_schedule(start_qtr_idx: int, n_slots: int,
         return [0.0] * n_slots
 
     qtrs_needed = math.ceil(energy_needed / (BMW_CHARGE_POWER_KW * SLOT_H))
-    chosen_abs  = ev_charge_window(start_qtr_idx, prices, ev_soc, current_hour, n_slots)
+    if charging_now:
+        chosen_abs = list(range(start_qtr_idx, start_qtr_idx + min(qtrs_needed, n_slots)))
+    else:
+        chosen_abs = ev_charge_window(start_qtr_idx, prices, ev_soc, current_hour, n_slots)
     chosen      = {a - start_qtr_idx for a in chosen_abs}
 
     ev_kwh   = BMW_CHARGE_POWER_KW * SLOT_H  # kWh per active quarter slot
     schedule = [ev_kwh if i in chosen else 0.0 for i in range(n_slots)]
     log.info("EV schedule: need=%.2f kWh  qtrs=%d  shape=%s  slots=%s",
              energy_needed, qtrs_needed,
-             "contiguous" if EV_CHARGE_CONTIGUOUS else "cheapest",
+             "charging-now" if charging_now else ("contiguous" if EV_CHARGE_CONTIGUOUS else "cheapest"),
              chosen_abs)
     return schedule
 
@@ -2542,6 +2554,7 @@ def optimise(  # noqa: C901
     nowcast_pv: Optional[dict] = None,
     hp_profile: Optional[dict] = None,
     wp_plan: Optional[dict] = None,
+    ev_charging_now: bool = False,
 ) -> tuple[list[HourSlot], str]:
     if ref_temp_by_hour is None:
         ref_temp_by_hour = {}
@@ -2718,7 +2731,8 @@ def optimise(  # noqa: C901
     log.info("LP: building problem  n=%d quarter slots  mode=%s  pv_curtail=%s", n, mode,
              "enabled" if PV_CURTAIL_ENABLED else "disabled")
 
-    ev_load = compute_ev_load_schedule(start_qtr_idx, n, prices, ev_soc, current_hour)
+    ev_load = compute_ev_load_schedule(start_qtr_idx, n, prices, ev_soc, current_hour,
+                                       charging_now=ev_charging_now)
     # pv_surplus[t] in kW: max PV available for charging in slot t
     pv_surplus = [max(0.0, (slot.pv_kwh - slot.load_kwh - ev_load[t]) / SLOT_H)
                   for t, slot in enumerate(slots)]
@@ -3962,6 +3976,55 @@ def apply_adaptive_floor(conn):
     return floor
 
 
+def _eur_or_na(v: Optional[float]) -> str:
+    """'€+1.2345', or 'n/a' when there is no value (e.g. no fixed reference for the period)."""
+    return "n/a" if v is None else f"€{v:.4f}"
+
+
+# Stale SoC (2026-11-22): read_current_state() takes the newest SoC however old it is. On 2026-10-06
+# read_seplos was silent for 6.7 h and every run planned from the 15:25 value. Planning goes on (there
+# is no better SoC: the SPH's is a whole-percent guess), but it is logged and raised as an alert.
+SOC_MAX_AGE_MIN = float(os.getenv("SOC_MAX_AGE_MIN", "30"))
+SOC_STALE_KEY   = "soc_stale"
+_soc_stale_latched: Optional[bool] = None     # None = not yet read from alert_latch
+
+
+def soc_stale_step(ts: Optional[datetime], now: datetime, latched: bool,
+                   max_age_min: float = SOC_MAX_AGE_MIN) -> tuple[Optional[float], Optional[str]]:
+    """PURE: (age in minutes or None, action) for the SoC timestamp. action 'trigger' when the
+    SoC turned stale, 'clear' when it is fresh again after an alert, else None. A missing
+    timestamp counts as stale (no SoC at all)."""
+    age = None if ts is None else (now - ts).total_seconds() / 60
+    stale = age is None or age > max_age_min
+    if stale and not latched:
+        return age, "trigger"
+    if not stale and latched:
+        return age, "clear"
+    return age, None
+
+
+def check_soc_freshness(ts: Optional[datetime], now: datetime) -> None:
+    """Warn when the SoC the plan starts from is old, and raise/clear the alert on the transition."""
+    global _soc_stale_latched
+    try:
+        from common.battery_alert import alert_trigger, alert_clear, alert_active
+        if _soc_stale_latched is None:
+            _soc_stale_latched = alert_active(SOC_STALE_KEY)
+        age, action = soc_stale_step(ts, now, _soc_stale_latched)
+        if age is None or age > SOC_MAX_AGE_MIN:
+            log.warning("SoC is %s old (limit %.0f min) — planning from a stale SoC; is read_seplos running?",
+                        "unknown" if age is None else f"{age:.0f} min", SOC_MAX_AGE_MIN)
+        if action == "trigger":
+            alert_trigger(SOC_STALE_KEY, "Accu-SoC is al " + ("onbekend" if age is None else f"{age:.0f} min")
+                          + " niet bijgewerkt — optimizer plant op een oude waarde (draait read_seplos?)")
+            _soc_stale_latched = True
+        elif action == "clear":
+            alert_clear(SOC_STALE_KEY, f"Accu-SoC weer actueel ({age:.0f} min oud)")
+            _soc_stale_latched = False
+    except Exception as exc:
+        log.warning("SoC freshness check failed: %s", exc)
+
+
 def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_range: Optional[tuple] = None, snapshot_date: Optional[date] = None):
     global BAT_MIN_SOC_PCT, BAT_MIN_KWH, _SHADE_MASK
     log.info("=== Battery Optimizer LP %s start%s ===", WIP, "  [DRY-RUN]" if dry_run else "")
@@ -3995,6 +4058,8 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         log.info("SoC-vloer actief: %.1f%% (basis %.1f%%, cap %.1f%%)", BAT_MIN_SOC_PCT, SOC_FLOOR_BASE_PCT, SOC_FLOOR_CAP_PCT)
 
     state   = read_current_state(conn)
+    if replay_at is None and snapshot_date is None:
+        check_soc_freshness(state.get("ts"), now)
     soc_pct = state.get("seplos_soc_pct")
     if not soc_pct or soc_pct < 5.0:
         log.warning("Invalid SOC reading (%.1f) — using fallback 50%%", soc_pct or 0)
@@ -4058,7 +4123,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
                     # The predicted line (rolling snapshot) must see the planned heat pump too: without
                     # it the snapshot kept the 14-day historical WP share, 36 kWh of load on 2026-11-19
                     # against 26 with the plan, ~3 euro too high on the dashboard.
-                    wp_plan=wp_plan)
+                    wp_plan=wp_plan, ev_charging_now=ev_is_charging)
 
     if rolling_range is not None:
         end_q = round((rolling_range[1] - datetime.combine(today, datetime.min.time())).total_seconds() / 900)
@@ -4087,6 +4152,7 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
         nowcast_pv        = nowcast_pv,
         hp_profile        = hp_prof,
         wp_plan           = wp_plan,
+        ev_charging_now   = ev_is_charging,
     )
 
     if not schedule:
@@ -4159,10 +4225,10 @@ def main(dry_run: bool = False, replay_at: Optional[datetime] = None, rolling_ra
 
     conn.close()
     log.info("=== Battery Optimizer LP %s done%s  cost=€%.4f  saving_vs_baseline=€%.4f  "
-             "saving_vs_fixed=€%.4f  pv_curtailed=%.2f kWh ===",
+             "saving_vs_fixed=%s  pv_curtailed=%.2f kWh ===",
              WIP, "  [DRY-RUN]" if dry_run else "",
              sim_results["a_cost"], sim_results["saving_vs_baseline"],
-             sim_results["saving_dynamic_vs_fixed"], sim_results["pv_curtailed"])
+             _eur_or_na(sim_results["saving_dynamic_vs_fixed"]), sim_results["pv_curtailed"])
 
 
 def _print_full_schedule(schedule: list[HourSlot]) -> None:

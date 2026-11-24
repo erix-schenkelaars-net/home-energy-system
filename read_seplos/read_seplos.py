@@ -515,7 +515,12 @@ def read_today_energy_from_db():
 # ---------------- MODBUS ----------------
 def write_to_seplos_reg(ser, addr, value, label):
     """
-    Modbus RTU Write Multiple Registers (0x10)
+    Modbus RTU Write Multiple Registers (0x10). Returns True only on a CRC-valid reply.
+
+    The caller must only record a value as written when this returns True. Until 2026-11-22 the
+    loop recorded it either way; restrictive limits were re-sent by the watchdog, but a failed
+    release back to the full limit (end of STANDBY or of a taper) was never retried and left the
+    BMS at 0 A until the next change.
     """
 
     if not isinstance(value, list):
@@ -550,13 +555,29 @@ def write_to_seplos_reg(ser, addr, value, label):
 
     if len(response) < 8:
         dbg(1, DEBUG_SEPLOS, "SEPL", f"⛔ No response writing {label}")
-        return
+        return False
 
     if crc16(response[:-2]) != (response[-2] | (response[-1] << 8)):
         dbg(1, DEBUG_SEPLOS, "SEPL", f"⛔ CRC error writing {label}")
-        return
+        return False
 
     dbg(2, DEBUG_SEPLOS, "SEPL", f"✔ Wrote {value} to {label} @0x{addr:04X}")
+    return True
+
+
+def read_frames(ser):
+    """(pia, pib) from the pack (0x1000, 18 regs) and cell (0x1100, 26 regs) blocks, or None when
+    either read fails. A failed read must skip the cycle: safe_modbus_read's zero fill gave SoC 0,
+    cells 0 mV and -273 C, and with both blocks zero the cell-sum check (0 == 0) let it through."""
+    pia = modbus_read(ser, 0x1000, 18)
+    if pia is None or len(pia) < 18:
+        dbg(1, DEBUG_SEPLOS, "SEPL", "⛔ pack read (0x1000) failed -> cycle skipped")
+        return None
+    pib = modbus_read(ser, 0x1100, 26)
+    if pib is None or len(pib) < 26:
+        dbg(1, DEBUG_SEPLOS, "SEPL", "⛔ cell read (0x1100) failed -> cycle skipped")
+        return None
+    return pia, pib
 
 
 def safe_modbus_read(ser, start, count=1, default=0):
@@ -878,8 +899,11 @@ def main():
         prev_current_a = 0.0
         cell_rejects   = 0      # consecutive rejected frames
         while True:
-            pia = safe_modbus_read(ser, 0x1000, 18)
-            pib = safe_modbus_read(ser, 0x1100, 26)
+            frames = read_frames(ser)
+            if frames is None:
+                time.sleep(2)
+                continue
+            pia, pib = frames
 
             pic = read_pic(ser)
             if not pic or len(pic) < 21:   # highest index you use is pic[20]
@@ -1027,17 +1051,21 @@ def main():
 
             if charge_limit != last_charge_limit or \
                (charge_limit != MAX_CHARGE_LIMIT and now - last_charge_write_ts > WATCHDOG_INTERVAL):
-                write_to_seplos_reg(ser, REG_PCS_CHG_LIMIT, charge_limit, "PCS Charge Limit")
-                dbg(1, DEBUG_MAIN, "MAIN", f"⛔ Charge limit changed to {charge_limit}")
-                last_charge_limit = charge_limit
-                last_charge_write_ts = now
+                if write_to_seplos_reg(ser, REG_PCS_CHG_LIMIT, charge_limit, "PCS Charge Limit"):
+                    dbg(1, DEBUG_MAIN, "MAIN", f"⛔ Charge limit changed to {charge_limit}")
+                    last_charge_limit = charge_limit
+                    last_charge_write_ts = now
+                else:   # not confirmed -> try again next poll (~2 s)
+                    dbg(1, DEBUG_MAIN, "MAIN", f"⛔ Charge limit {charge_limit} NOT confirmed — retry next poll")
 
             if discharge_limit != last_discharge_limit or \
                (discharge_limit != MAX_DISCHARGE_LIMIT and now - last_discharge_write_ts > WATCHDOG_INTERVAL):
-                write_to_seplos_reg(ser, REG_PCS_DIS_LIMIT, -discharge_limit, "PCS Discharge Limit")
-                dbg(1, DEBUG_MAIN, "MAIN", f"⛔ Discharge limit changed to {-discharge_limit}")
-                last_discharge_limit = discharge_limit
-                last_discharge_write_ts = now
+                if write_to_seplos_reg(ser, REG_PCS_DIS_LIMIT, -discharge_limit, "PCS Discharge Limit"):
+                    dbg(1, DEBUG_MAIN, "MAIN", f"⛔ Discharge limit changed to {-discharge_limit}")
+                    last_discharge_limit = discharge_limit
+                    last_discharge_write_ts = now
+                else:   # not confirmed -> try again next poll (~2 s)
+                    dbg(1, DEBUG_MAIN, "MAIN", f"⛔ Discharge limit {-discharge_limit} NOT confirmed — retry next poll")
 
             direction = "charge" if pack_current > 0 else "discharge" if pack_current < 0 else "idle"
 

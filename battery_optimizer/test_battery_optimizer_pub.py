@@ -1382,6 +1382,66 @@ class TestEvProbeCharging(unittest.TestCase):
         self.flag.assert_called_once_with(True)
 
 
+class TestEvChargingNowAnchored(unittest.TestCase):
+    """A charge that is running now is booked from the current slot, not in the cheapest window."""
+
+    def _prices(self):
+        # 03:00-04:00 is the cheapest hour of the night, 18:00 is dear
+        return {q: (0.05 if (q % 96) // 4 == 3 else 0.20) for q in range(192)}
+
+    def test_hand_started_charge_books_from_now(self):
+        sched = mod.compute_ev_load_schedule(72, 120, self._prices(), 60.0, 18, charging_now=True)
+        on = [i for i, v in enumerate(sched) if v > 0]
+        need = mod.math.ceil(0.40 * mod.BMW_BATTERY_KWH / (mod.BMW_CHARGE_POWER_KW * mod.SLOT_H))
+        self.assertEqual(on, list(range(need)))            # 18:00 onwards, one unbroken run
+
+    def test_planned_charge_still_takes_cheapest_window(self):
+        sched = mod.compute_ev_load_schedule(72, 120, self._prices(), 60.0, 18)
+        first = 72 + next(i for i, v in enumerate(sched) if v > 0)
+        self.assertGreaterEqual(first, 96 + 3 * 4 - 4)     # in the cheap night hours, not at 18:00
+        self.assertEqual(sched[0], 0.0)
+
+
+class TestSocStale(unittest.TestCase):
+    """2026-10-06: read_seplos silent 6.7 h; the optimizer must warn and alert once, then clear."""
+
+    now = datetime(2026, 11, 22, 12, 0)
+
+    def test_fresh_is_quiet(self):
+        self.assertEqual(mod.soc_stale_step(self.now - timedelta(minutes=5), self.now, False), (5.0, None))
+
+    def test_turns_stale_triggers_once(self):
+        ts = self.now - timedelta(minutes=45)
+        self.assertEqual(mod.soc_stale_step(ts, self.now, False)[1], "trigger")
+        self.assertIsNone(mod.soc_stale_step(ts, self.now, True)[1])
+
+    def test_missing_ts_is_stale(self):
+        self.assertEqual(mod.soc_stale_step(None, self.now, False), (None, "trigger"))
+
+    def test_fresh_again_clears(self):
+        self.assertEqual(mod.soc_stale_step(self.now - timedelta(minutes=2), self.now, True)[1], "clear")
+
+    def test_check_raises_alert_on_transition_only(self):
+        import common.battery_alert as ba
+        with patch.object(ba, "alert_active", return_value=False), \
+             patch.object(ba, "alert_trigger") as trig, patch.object(ba, "alert_clear") as clr, \
+             patch.object(mod, "_soc_stale_latched", None):
+            old = self.now - timedelta(hours=2)
+            mod.check_soc_freshness(old, self.now)
+            mod.check_soc_freshness(old, self.now)
+            self.assertEqual(trig.call_count, 1)
+            mod.check_soc_freshness(self.now - timedelta(minutes=1), self.now)
+            self.assertEqual(clr.call_count, 1)
+
+
+class TestEurOrNa(unittest.TestCase):
+    """The closing log line must not raise a logging error when there is no fixed reference."""
+
+    def test_formats(self):
+        self.assertEqual(mod._eur_or_na(None), "n/a")
+        self.assertEqual(mod._eur_or_na(-5.4248), "€-5.4248")
+
+
 class TestEnsureScheduleTable(unittest.TestCase):
     """Column migrations are idempotent (IF NOT EXISTS) and include the plug-ownership column."""
 

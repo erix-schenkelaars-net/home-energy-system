@@ -67,6 +67,13 @@ print(f"=== {os.path.basename(__file__)} ===")
 SPH_PORT = "/dev/sphmeter"
 DSMR_URL = os.environ.get("DSMR_URL", "http://YOUR_DSMR_IP/api/v2/sm/actual")
 P1_POLL_INTERVAL = 1.0   # seconds
+# Power counts as fresh only while the meter's own telegram timestamp keeps moving (2026-11-22).
+# The dongle sometimes hangs, and the last values were then written as measurements: 5 episodes of
+# >= 30 min in 45 days, the longest an hour of a constant 2371.7 W at the evening peak (2026-10-13).
+# That frozen power fed the optimizer's load history. Stale -> the power columns get NULL.
+P1_STALE_S = 60
+P1_FRESH_AT = None        # time.time() of the last poll with a NEW telegram timestamp
+_P1_LAST_TELEGRAM = None
 
 # ---------------------------
 # DB SMOOTHING CONFIG
@@ -82,6 +89,22 @@ P1_LOCK = threading.Lock()
 YESTERDAY_LOCK = threading.Lock()
 FIRST_P1_COMMIT = threading.Event()
 stop_event = threading.Event()
+
+
+def mark_telegram(telegram_ts, now, last_telegram, fresh_at):
+    """PURE: (last_telegram, fresh_at) after a successful poll. Fresh = the meter's telegram
+    timestamp changed; a reply without one (other firmware) counts as fresh. A repeated timestamp
+    leaves fresh_at where it was, so a dongle serving the same telegram goes stale."""
+    if telegram_ts is None or telegram_ts != last_telegram:
+        return telegram_ts, now
+    return last_telegram, fresh_at
+
+
+def power_if_fresh(p_del, p_ret, fresh_at, now, stale_s=P1_STALE_S):
+    """PURE: (p_del, p_ret) when the meter data is fresh, else (None, None) -> NULL in the DB."""
+    if fresh_at is None or now - fresh_at > stale_s:
+        return None, None
+    return p_del, p_ret
 
 
 def val(j, key, default=None):
@@ -579,6 +602,7 @@ def sph5000_thread_debug(port):
 # P1 REST READER THREAD
 # ---------------------------
 def p1_rest_thread():
+    global P1_FRESH_AT, _P1_LAST_TELEGRAM
     dbg(1, DEBUG_P1, "P1",
         f"Starting DSMR REST reader  "
         f"(poll={P1_POLL_INTERVAL}s  db_smooth={P1_DB_SMOOTH_WINDOW}s)")
@@ -588,6 +612,8 @@ def p1_rest_thread():
             r = requests.get(DSMR_URL, timeout=2)
             r.raise_for_status()
             j = r.json()
+            _P1_LAST_TELEGRAM, P1_FRESH_AT = mark_telegram(
+                val(j, "timestamp"), time.time(), _P1_LAST_TELEGRAM, P1_FRESH_AT)
 
             p_del = round(float(val(j, "power_delivered", 0.0)) * 1000.0, 3)
             p_ret = round(float(val(j, "power_returned",  0.0)) * 1000.0, 3)
@@ -694,9 +720,14 @@ if __name__ == "__main__":
                         e_ret_today = max(0.0, e_ret_today)
                         gas_today   = max(0.0, gas_today)
 
-                    # Use smoothed power values for DB write
-                    p_del_db = P1_LAST_DATA['p1_p_del_avg']
-                    p_ret_db = P1_LAST_DATA['p1_p_ret_avg']
+                    # Use smoothed power values for DB write -- only while the meter data is fresh
+                    p_del_db, p_ret_db = power_if_fresh(P1_LAST_DATA['p1_p_del_avg'],
+                                                        P1_LAST_DATA['p1_p_ret_avg'],
+                                                        P1_FRESH_AT, time.time())
+                    if p_del_db is None:
+                        age = "?" if P1_FRESH_AT is None else f"{time.time() - P1_FRESH_AT:.0f}s"
+                        dbg(1, DEBUG_DB_UPDATE, "DB",
+                            f"⚠ P1 meter data stale ({age}, limit {P1_STALE_S}s) -> power NULL")
 
                 bat_chg_today, bat_dis_today = read_battery_today_kwh()
 
@@ -708,7 +739,7 @@ if __name__ == "__main__":
                     f"net_grid={e_net_today:.3f}  "
                     f"bat_chg={bat_chg_today:.3f}  bat_dis={bat_dis_today:.3f}  "
                     f"→ electricity_today={electricity_today:.3f} kWh  "
-                    f"p_del_avg={p_del_db:.1f} W  p_ret_avg={p_ret_db:.1f} W")
+                    f"p_del_avg={p_del_db} W  p_ret_avg={p_ret_db} W")
 
                 # Realized cost over this interval (meter delta x actual price)
                 cum_imp = P1_LAST_DATA['p1_e_t1_i'] + P1_LAST_DATA['p1_e_t2_i']

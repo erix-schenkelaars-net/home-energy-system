@@ -233,20 +233,62 @@ class TestOtEventLog(unittest.TestCase):
 
 
 class TestReadLatest(unittest.TestCase):
+    """The query returns ts as 5th column; a row older than WP_ROOM_MAX_AGE_S counts as no data."""
+
     def _set_fetchone(self, value):
         wp.mysql.connector.connect.return_value.cursor.return_value.fetchone.return_value = value
 
+    def _fresh(self):
+        return datetime.now() - timedelta(minutes=3)
+
     def test_returns_room_outside_setpoint_and_flame(self):
-        self._set_fetchone((21.3, 13.8, 21.0, 0))
+        self._set_fetchone((21.3, 13.8, 21.0, 0, self._fresh()))
         self.assertEqual(wp.read_latest(wp.build_cfg()), (21.3, 13.8, 21.0, 0))
 
     def test_missing_flame_stays_none(self):
-        self._set_fetchone((21.3, 13.8, 21.0, None))
+        self._set_fetchone((21.3, 13.8, 21.0, None, self._fresh()))
         self.assertIsNone(wp.read_latest(wp.build_cfg())[3])
 
     def test_no_row_is_all_none(self):
         self._set_fetchone(None)
         self.assertEqual(wp.read_latest(wp.build_cfg()), (None, None, None, None))
+
+    def test_stale_row_is_all_none(self):
+        # 2026-10-23: OTThing silent 7.7 h, the control kept steering on (and logging) 20.7 C
+        self._set_fetchone((20.7, 8.0, 21.0, 1, datetime.now() - timedelta(minutes=16)))
+        self.assertEqual(wp.read_latest(wp.build_cfg()), (None, None, None, None))
+
+    def test_age_limit_boundary(self):
+        now = datetime(2026, 11, 22, 12, 0)
+        row = (21.0, 9.0, 21.0, 1, now - timedelta(seconds=900))
+        self.assertEqual(wp.latest_from_row(row, now, 900), (21.0, 9.0, 21.0, 1))
+        self.assertEqual(wp.latest_from_row(row, now, 899), (None, None, None, None))
+
+
+class TestLiveRoom(unittest.TestCase):
+    """The listener caches roomunit.room_t; it is only used while fresh."""
+
+    def setUp(self):
+        wp._thermo_cache.update(room=None, room_ts=None)
+
+    def test_parse_room_plain_and_wrapped(self):
+        self.assertEqual(wp.parse_roomunit_room(json.dumps({"roomunit": {"room_t": 20.9}})), 20.9)
+        self.assertEqual(wp.parse_roomunit_room(json.dumps({"roomunit": {"room_t": {"result": True, "data": 21.1}}})), 21.1)
+        self.assertIsNone(wp.parse_roomunit_room(json.dumps({"roomunit": {"room_t": {"result": False, "data": 21.1}}})))
+        self.assertIsNone(wp.parse_roomunit_room(json.dumps({"roomunit": {"room_t": 99}})))   # implausible
+        self.assertIsNone(wp.parse_roomunit_room(b"not json"))
+
+    def test_fresh_room_used_stale_ignored(self):
+        now = datetime(2026, 11, 22, 12, 0)
+        wp._thermo_cache.update(room=21.2, room_ts=now - timedelta(seconds=30))
+        self.assertEqual(wp.live_room(now), 21.2)
+        self.assertIsNone(wp.live_room(now + timedelta(seconds=120)))
+
+    def test_listener_caches_room(self):
+        msg = MagicMock(payload=json.dumps({"roomunit": {"room_t": 20.6, "room_set_t": 21.0}}).encode())
+        with patch.object(wp, "dbg"):
+            wp._on_thermo_msg(None, {"thr": 21.5}, msg)
+        self.assertEqual(wp.live_room(), 20.6)
 
 
 class TestHaOutside(unittest.TestCase):
@@ -1225,14 +1267,23 @@ class TestSoftStart(unittest.TestCase):
         self.assertEqual(wp.soft_start_flow(41.6, 39.0, 21.5, 21.6, True, 20.0, c, 15.1)[0], 28.5)
         self.assertEqual(wp.soft_start_flow(41.6, 39.0, 21.5, 21.6, True, 0.0, c, 15.1)[0], 28.0)
 
-    def test_no_ramp_below_the_comfort_floor(self):
-        # 11-06 10:39: room 21.2 under the 21.3 floor, water 25.5 -> ramp gave 28.5; below the floor only
-        # the curve cap applies: 39.9 + 4 * (21.45 - 21.2) = 40.9
+    def test_no_limit_below_the_comfort_floor(self):
+        # 11-06 10:39: room 21.2 under the 21.3 floor, water 25.5 -> the ramp gave 28.5. Below the floor
+        # neither ceiling applies: the planner's target (44.6) goes out untouched.
         c = self._cfg()
         with_ramp = wp.soft_start_flow(44.6, 39.9, 21.2, 21.45, False, None, c, 25.5)[0]
-        no_ramp = wp.soft_start_flow(44.6, 39.9, 21.2, 21.45, False, None, c, 25.5, below_floor=True)[0]
         self.assertEqual(with_ramp, 28.5)
-        self.assertEqual(no_ramp, 40.9)
+        self.assertEqual(wp.soft_start_flow(44.6, 39.9, 21.2, 21.45, False, None, c, 25.5, below_floor=True),
+                         (44.6, None))
+
+    def test_curve_cap_does_not_hold_back_a_shortfall(self):
+        # 2026-11-24 07:28: room 20.7 under the 21.3 floor, plan 48.9, curve 42.5, want 20.95. The curve
+        # cap (42.5 + 4 * 0.25 = 43.5) held the target for half an hour; below the floor it must not.
+        c = self._cfg()
+        # start_water None isolates the curve cap (the ramp would otherwise be the lower one)
+        self.assertEqual(wp.soft_start_flow(48.9, 42.5, 20.7, 20.95, True, 28.0, c, None)[0], 43.5)
+        self.assertEqual(wp.soft_start_flow(48.9, 42.5, 20.7, 20.95, True, 28.0, c, None, below_floor=True),
+                         (48.9, None))
 
     def test_never_above_the_plan(self):
         c = self._cfg()

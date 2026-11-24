@@ -301,7 +301,7 @@ SPH_REG_LIST = [
     R("REG_E_TOTAL_PV1_H                      ", 61,    3, "UINT32", False, 0.1, "Energy Total PV1 kWh"),
     R("REG_E_TOTAL_PV2_H                      ", 65,    3, "UINT32", False, 0.1, "Energy Total PV2 kWh"),
     R("REG_INV_TEMP                           ", 93,    2, "INT16",  True,  0.1, "Inverter Temperature degC"),
-    R("REG_EPS offline enable                 ", 30155, 3, "UINT16", False, 1,   "[0,1] 0 default disabled, 1 enabled"),
+    R("REG_EPS offline enable                 ", 30155, 3, "UINT16", False, 1,   "VPP flag, NOT the EPS state: reads 0 while EPS is on (set in SPH GUI)"),
     R("REG_EPS offline frequency              ", 30156, 3, "UINT16", False, 1,   "[0,1] 0 default 50 Hz, 1 60 Hz"),
     R("REG_EPS offline Voltage                ", 30157, 3, "UINT16", False, 1,   "[0..3] 0 default 230V, 1: 208V, 2: 240V 3: 220V"),
     R("Export Limitation Enable               ", 30200, 3, "UINT16", False, 1,   "1=enable 0=disable"),
@@ -864,7 +864,9 @@ def kw_to_pct(kw: float) -> int:
 
 
 def read_vmin_from_db() -> Optional[int]:
-    """Return latest min cell voltage in mV from seplos_cell_voltage_min_v, or None."""
+    """Latest min cell voltage in mV from seplos_cell_voltage_min_v, or None when unavailable or
+    older than SOC_DB_STALE_S -- the same limit as the SoC. Without it the vmin guards kept working
+    from the last value when read_seplos stalled (2026-11-22 review)."""
     try:
         db = mysql.connector.connect(
             host=DB_HOST, user=DB_USER, passwd=DB_PASSWD,
@@ -872,19 +874,49 @@ def read_vmin_from_db() -> Optional[int]:
         )
         cur = db.cursor()
         cur.execute(
-            f"SELECT seplos_cell_voltage_min_v FROM {DB_TABLE} "
+            f"SELECT seplos_cell_voltage_min_v, ts FROM {DB_TABLE} "
             f"WHERE seplos_cell_voltage_min_v IS NOT NULL ORDER BY id DESC LIMIT 1"
         )
         row = cur.fetchone()
         cur.close()
         db.close()
-        return round(float(row[0]) * 1000) if row else None
+        return vmin_if_fresh(row, datetime.now())
     except Exception as e:
         dbg(1, "DB", f"Failed to read vmin: {e}")
         return None
 
 
 SOC_DB_STALE_S = 600   # Seplos SoC older than this (read_seplos stalled) -> fall back to SPH REG_SOC
+
+
+def vmin_if_fresh(row, now, max_age_s=None) -> Optional[int]:
+    """PURE: (vmin_v, ts) row -> vmin in mV, or None without a row or when older than max_age_s."""
+    max_age_s = SOC_DB_STALE_S if max_age_s is None else max_age_s
+    if not row or row[0] is None:
+        return None
+    if row[1] is not None and (now - row[1]).total_seconds() > max_age_s:
+        dbg(1, "DB", f"Seplos vmin stale ({(now - row[1]).total_seconds():.0f}s old) — vmin guards paused")
+        return None
+    return round(float(row[0]) * 1000)
+
+
+# The controller follows whatever battery_schedule holds for the current quarter. If the optimizer
+# stops, that is its last run's plan -- up to 48 h of it, tomorrow on placeholder prices -- and
+# nobody was told (2026-11-22 review). Control behaviour stays the same; this only raises the alert.
+PLAN_MAX_AGE_MIN = 60
+PLAN_STALE_KEY   = "optimizer_stale"
+
+
+def plan_stale_step(created_at, now, latched, max_age_min=PLAN_MAX_AGE_MIN):
+    """PURE: (age in minutes or None, action) for the current slot's plan. 'trigger' when it turned
+    stale (or there is no plan row at all), 'clear' when fresh again after an alert, else None."""
+    age = None if created_at is None else (now - created_at).total_seconds() / 60
+    stale = age is None or age > max_age_min
+    if stale and not latched:
+        return age, "trigger"
+    if not stale and latched:
+        return age, "clear"
+    return age, None
 
 
 def read_seplos_soc_from_db() -> Optional[float]:
@@ -1698,6 +1730,7 @@ def main_loop():
     _pv_soc_curtail    = False   # SoC-based curtailment latch (True = panels OFF due to SoC)
     _pv_fault_since    = None    # datetime: when one PV string was first seen dead
     _pv_fault_latched  = False   # True once the >1 h fault alarm has been raised (one trigger per fault)
+    _plan_stale_latched = alert_active(PLAN_STALE_KEY)   # no duplicate alert after a restart
 
     # --------------------------------------------------
     # Build ActiveRun
@@ -1851,9 +1884,7 @@ def main_loop():
 
         regs = run_data_collection(client)
 
-        vmin_db = read_vmin_from_db()
-        if vmin_db is not None:
-            vmin_glob = vmin_db
+        vmin_glob = read_vmin_from_db()   # None when stale: the vmin guards pause, the SoC guards stay
 
         seplos_soc = read_seplos_soc_from_db()
         if seplos_soc is not None:
@@ -1880,6 +1911,19 @@ def main_loop():
         else:
             # DB mode (default): optimizer takes priority, file is fallback
             db_slot = read_battery_schedule_slot(now)
+
+            _plan_age, _plan_act = plan_stale_step(db_slot.get("created_at") if db_slot else None,
+                                                   now, _plan_stale_latched)
+            if _plan_act == "trigger":
+                _plan_stale_latched = True
+                _age_txt = "geen plan" if _plan_age is None else f"plan {_plan_age:.0f} min oud"
+                dbg(1, "CONF", f"⚠ optimizer plan stale ({_age_txt}) — is battery_optimizer running?")
+                alert_trigger(PLAN_STALE_KEY, f"Optimizer-plan verouderd ({_age_txt}) — "
+                                              f"omvormer volgt een oud plan; draait battery_optimizer?")
+            elif _plan_act == "clear":
+                _plan_stale_latched = False
+                dbg(1, "CONF", f"✓ optimizer plan fresh again ({_plan_age:.0f} min)")
+                alert_clear(PLAN_STALE_KEY, f"Optimizer-plan weer actueel ({_plan_age:.0f} min oud)")
 
             if db_slot:
                 slot_created = db_slot.get('created_at')

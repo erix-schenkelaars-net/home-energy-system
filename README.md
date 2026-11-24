@@ -131,7 +131,7 @@ utility grid — allowing immediate verification of the optimisation strategy.
 
 ## Software components
 
-Ten services plus MariaDB, each an independent Docker container.
+Ten services plus MariaDB and the MQTT broker, each an independent Docker container.
 
 | Service | Description |
 |---------|-------------|
@@ -146,6 +146,7 @@ Ten services plus MariaDB, each an independent Docker container.
 | `transfer_p60` | Weheat P60 heat pump integration |
 | `wp_control` | Heat pump controller — on/off and flow temperature via OpenTherm |
 | `MariaDB` | Central time-series database |
+| `mosquitto` | MQTT broker (moved here from the Home Assistant VM, 2026-11) |
 
 ---
 

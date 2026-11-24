@@ -469,5 +469,25 @@ class TestNext5MinBoundaryEdgeCases(unittest.TestCase):
         self.assertEqual(result.minute, 5)
 
 
+
+class TestP1Freshness(unittest.TestCase):
+    """2026-10-13: an hour of frozen 2371.7 W written as measurements. Power only while fresh."""
+
+    def test_new_telegram_is_fresh(self):
+        self.assertEqual(mod.mark_telegram("261122172612W", 100.0, "261122172611W", 10.0),
+                         ("261122172612W", 100.0))
+
+    def test_repeated_telegram_keeps_old_fresh_at(self):
+        self.assertEqual(mod.mark_telegram("261122172612W", 100.0, "261122172612W", 10.0),
+                         ("261122172612W", 10.0))
+
+    def test_missing_timestamp_counts_as_fresh(self):
+        self.assertEqual(mod.mark_telegram(None, 100.0, None, 10.0), (None, 100.0))
+
+    def test_power_fresh_and_stale(self):
+        self.assertEqual(mod.power_if_fresh(1500.0, 0.0, 100.0, 130.0), (1500.0, 0.0))
+        self.assertEqual(mod.power_if_fresh(1500.0, 0.0, 100.0, 161.0), (None, None))
+        self.assertEqual(mod.power_if_fresh(1500.0, 0.0, None, 161.0), (None, None))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

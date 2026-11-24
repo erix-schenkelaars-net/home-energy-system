@@ -465,5 +465,45 @@ class TestCheckCellFrame(unittest.TestCase):
         self.assertEqual(why, "budget exhausted")
 
 
+
+class TestWriteConfirmed(unittest.TestCase):
+    """A BMS limit only counts as written on a CRC-valid reply (so a failed release is retried)."""
+
+    def _reply(self, addr=0x1366, count=1):
+        frame = bytearray([mod.SLAVE, 0x10, addr >> 8, addr & 0xFF, 0, count])
+        crc = mod.crc16(frame)
+        return bytes(frame + bytes([crc & 0xFF, crc >> 8]))
+
+    def test_valid_reply_is_true(self):
+        ser = MagicMock(); ser.read.return_value = self._reply()
+        with patch.object(mod.time, "sleep"):
+            self.assertTrue(mod.write_to_seplos_reg(ser, 0x1366, 60, "chg"))
+
+    def test_no_reply_is_false(self):
+        ser = MagicMock(); ser.read.return_value = b""
+        with patch.object(mod.time, "sleep"):
+            self.assertFalse(mod.write_to_seplos_reg(ser, 0x1366, 60, "chg"))
+
+    def test_bad_crc_is_false(self):
+        ser = MagicMock(); ser.read.return_value = self._reply()[:-1] + b"\x00"
+        with patch.object(mod.time, "sleep"):
+            self.assertFalse(mod.write_to_seplos_reg(ser, 0x1366, 60, "chg"))
+
+
+class TestReadFrames(unittest.TestCase):
+    """A failed pack or cell read skips the cycle instead of feeding zeros into limits and DB."""
+
+    def test_both_ok(self):
+        with patch.object(mod, "modbus_read", side_effect=[[1] * 18, [2] * 26]):
+            self.assertEqual(mod.read_frames(MagicMock()), ([1] * 18, [2] * 26))
+
+    def test_pack_fails(self):
+        with patch.object(mod, "modbus_read", side_effect=[None, [2] * 26]):
+            self.assertIsNone(mod.read_frames(MagicMock()))
+
+    def test_cell_fails(self):
+        with patch.object(mod, "modbus_read", side_effect=[[1] * 18, None]):
+            self.assertIsNone(mod.read_frames(MagicMock()))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

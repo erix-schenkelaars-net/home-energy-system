@@ -291,14 +291,17 @@ def soft_start_flow(flow, base, room, want, running, on_min, cfg, start_water=No
     does not start (11-03 20:10: target 29.5 with water 34 -> no start for an hour). Never below
     flow_min, never above the planner's target (this can only lower). Returns (flow, explanation or None).
 
-    below_floor: the room is BELOW the comfort floor -> no ramp (only ceiling 2). The ramp is against
-    overshoot on a restart without hurry; with a shortfall it worked against comfort (11-06 10:39:
-    water 25 -> target 28.5 and 1 C/5 min, the room dropped to 20.9 at a floor of 21.3)."""
-    if flow is None or room is None or cfg["softstart_min"] <= 0:
+    below_floor: the room is BELOW the comfort floor -> no limit at all, the planner's target applies.
+    Both ceilings are against overshoot on a restart without hurry; with a shortfall they work against
+    comfort. The ramp: 11-06 10:39, water 25 -> target 28.5 and 1 C/5 min, the room dropped to 20.9 at
+    a floor of 21.3. Ceiling 2 (2026-11-24 07:28-08:00, -1 C outside): `want` is the planner's own
+    room in an hour (20.95), not the floor (21.3), so it held the target at 43.5 instead of 48.9 for
+    half an hour while the room sat 0.6 K under the floor. Overshoot stays bounded by the flow cap."""
+    if flow is None or room is None or cfg["softstart_min"] <= 0 or below_floor:
         return flow, None
     t = 0.0 if not running else (on_min if on_min is not None else 1e9)
     caps, why = [], []
-    if start_water is not None and not below_floor:
+    if start_water is not None:
         # after a long standstill the OTThing measures the cooled-down water in the outdoor unit
         # (13-15 C, nights of 10-24/11-02/11-03), not the radiator water inside, which does not drop
         # below the room
@@ -480,6 +483,9 @@ def build_cfg():
         # night and in stable weather. No report = unchanged; with 2 h it fell back to KNMI needlessly in
         # the middle of the morning warm-up (07:49-10:44).
         "ha_max_age": int(os.environ.get("WP_OUTSIDE_MAX_AGE_S", "21600")),
+        # the OTThing DB row (room/setpoint/flame) counts only when younger than this; read_otthing
+        # writes every 5 min, so 15 min = two missed rows
+        "room_max_age_s": int(os.environ.get("WP_ROOM_MAX_AGE_S", "900")),
         # 6-point weather curve (user 2026-10-22) "outside:flow,..." -- the same curve as in the
         # OTThing; the difference with the OTThing target = damping + preheat/price/PV.
         # 2026-11-02: point 10 C 35 -> 38. First day without the I ratchet (Ki 0.15 + build-up gate):
@@ -918,18 +924,34 @@ def read_latest(cfg):
         cur = c.cursor()
         cur.execute(
             f"SELECT otthing_roomunit_room_t_c, honeywell_ot_boiler_outside_t_c, "
-            f"otthing_roomunit_set_t_c, honeywell_ot_boiler_flame "
+            f"otthing_roomunit_set_t_c, honeywell_ot_boiler_flame, ts "
             f"FROM {cfg['db_table']} WHERE otthing_roomunit_set_t_c IS NOT NULL "
             f"ORDER BY ts DESC LIMIT 1")
         row = cur.fetchone()
         cur.close(); c.close()
-        if not row:
-            return None, None, None, None
-        f = lambda x: None if x is None else float(x)
-        return f(row[0]), f(row[1]), f(row[2]), None if row[3] is None else int(row[3])
+        return latest_from_row(row, datetime.now(), cfg["room_max_age_s"])
     except Exception as e:
         dbg("DB", f"read_latest faalde: {e}")
         return None, None, None, None
+
+
+def latest_from_row(row, now, max_age_s):
+    """PURE: (room, outside, setpoint, flame) from the newest OTThing row (..., ts), or all None when
+    there is none or it is older than max_age_s.
+
+    Without the age check an OTThing outage left the control steering on its last reading: on
+    2026-10-23 the feed stopped for 7.7 h and wp_control kept using -- and writing back into
+    wp_shadow_room_t_c, which the planner reads as room history -- 20.7 C for 91 rows. None makes the
+    planner fall back to the rules, and the rules hold their previous on/off state."""
+    if not row:
+        return None, None, None, None
+    age = (now - row[4]).total_seconds() if row[4] is not None else None
+    if age is None or age > max_age_s:
+        dbg("DB", f"OTThing-rij te oud ({'?' if age is None else f'{age / 60:.0f} min'}, grens "
+                  f"{max_age_s / 60:.0f} min) -> kamer/buiten/setpoint onbekend")
+        return None, None, None, None
+    f = lambda x: None if x is None else float(x)
+    return f(row[0]), f(row[1]), f(row[2]), None if row[3] is None else int(row[3])
 
 
 def read_forecast_outside(cfg):
@@ -1133,7 +1155,7 @@ def request_valve(cfg):
 # the wall thermostat up). Hence a SEPARATE background MQTT client on <base>/state (updates every
 # 1-2 s): it keeps the Honeywell setpoint seconds-fresh and wakes the main loop on a turn upwards, so
 # the heat pump reacts within seconds instead of after ~5-10 min.
-_thermo_cache = {"setpoint": None, "ts": None, "bump_from": None}
+_thermo_cache = {"setpoint": None, "ts": None, "bump_from": None, "room": None, "room_ts": None}
 _thermo_lock  = threading.Lock()
 _bump_event   = threading.Event()
 
@@ -1153,6 +1175,24 @@ def parse_roomunit_setpoint(payload):
         return None if v is None else float(v)
     except (TypeError, ValueError):
         return None
+
+
+def parse_roomunit_room(payload):
+    """roomunit.room_t (the room the Honeywell measures) from an OTThing /state payload -> float or
+    None, plausibility-clipped to 5..35 C. Does not crash on odd/partial payloads."""
+    try:
+        d = json.loads(payload.decode() if isinstance(payload, (bytes, bytearray)) else payload)
+    except Exception:
+        return None
+    ru = (d.get("roomunit") if isinstance(d, dict) else None) or {}
+    v = ru.get("room_t")
+    if isinstance(v, dict):
+        v = v.get("data") if v.get("result", True) else None
+    try:
+        v = None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v is not None and 5.0 <= v <= 35.0 else None
 
 
 def is_bump(setp, prev, thr):
@@ -1273,6 +1313,10 @@ def _on_thermo_msg(client, userdata, msg):
         log_ot_events(msg.payload)
     except Exception as e:               # the event log must never break the bump detection
         dbg("OTEV", f"faalde: {e}")
+    room = parse_roomunit_room(msg.payload)
+    if room is not None:
+        with _thermo_lock:
+            _thermo_cache["room"], _thermo_cache["room_ts"] = room, datetime.now()
     setp = parse_roomunit_setpoint(msg.payload)
     if setp is None:
         return
@@ -1323,6 +1367,17 @@ def live_setpoint(cfg, now=None, max_age_s=90):
     if setp is None or ts is None or (now - ts).total_seconds() > max_age_s:
         return None
     return setp
+
+
+def live_room(now=None, max_age_s=90):
+    """The seconds-fresh Honeywell room temperature from the MQTT listener, or None when there is
+    nothing yet or the listener is silent (> max_age_s) -> the loop then uses the DB row."""
+    now = now or datetime.now()
+    with _thermo_lock:
+        room, ts = _thermo_cache["room"], _thermo_cache["room_ts"]
+    if room is None or ts is None or (now - ts).total_seconds() > max_age_s:
+        return None
+    return room
 
 
 def write_valve(cfg, now=None):
@@ -1749,6 +1804,9 @@ def main():
         if cfg["valve_log"]:
             write_valve(cfg)              # write the fresh cached state (from reports + the previous /get)
         room, outside, sp_db, flame = read_latest(cfg)
+        room_live = live_room()                      # ~5 s fresh; first choice, the DB row lags up to 5 min
+        if room_live is not None:
+            room = room_live
         sp_live = live_setpoint(cfg)                 # seconden-verse Honeywell-setpoint (MQTT)
         sp_now = sp_live if sp_live is not None else sp_db
         src = "MQTT-live" if sp_live is not None else "DB-5min"

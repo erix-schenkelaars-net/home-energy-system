@@ -388,6 +388,28 @@ class TestSaveToEnergy(unittest.TestCase):
             self.assertNotIn(foreign, sql)
 
 
+
+class TestTokenLoopSurvives(unittest.TestCase):
+    """A reconnect that raises must not kill the refresh thread; it retries after TOKEN_RETRY_MINS."""
+
+    def test_exception_then_success_keeps_running(self):
+        stop = MagicMock()
+        stop.wait.side_effect = [False, False, True]          # two iterations, then stop
+        with patch.object(mod, "_refresh", return_value=True), \
+             patch.object(mod, "_connect_bmw_mqtt", side_effect=[OSError("dns"), None]) as conn:
+            mod._token_loop(MagicMock(), stop)
+        self.assertEqual(conn.call_count, 2)
+        waits = [c.args[0] for c in stop.wait.call_args_list]
+        self.assertEqual(waits[1], mod.TOKEN_RETRY_MINS * 60)  # retried soon after the failure
+        self.assertEqual(waits[2], mod.TOKEN_REFRESH_MINS * 60)
+        stop.set.assert_not_called()
+
+    def test_rejected_refresh_stops(self):
+        stop = MagicMock(); stop.wait.side_effect = [False, True]
+        with patch.object(mod, "_refresh", return_value=False):
+            mod._token_loop(MagicMock(), stop)
+        stop.set.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

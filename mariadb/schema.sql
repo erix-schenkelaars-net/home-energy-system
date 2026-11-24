@@ -281,7 +281,7 @@ CREATE TABLE IF NOT EXISTS `battery_schedule` (
   `slot_dt`             datetime     NOT NULL COMMENT 'Quarter-hour slot start (local time)',
   `action`              varchar(30)  NOT NULL COMMENT 'Canonical action: LOAD_FIRST | BATTERY_FIRST+CHARGE | BATTERY_FIRST+PV_CHARGE | BATTERY_FIRST+DISCHARGE | STANDBY',
   `charge_kw`           float        DEFAULT NULL COMMENT 'Scheduled charge power kW (0 if not charging)',
-  `price_eur_kwh`       float        DEFAULT NULL COMMENT 'EPEX spot price incl. VAT for this slot',
+  `price_eur_kwh`       float        DEFAULT NULL COMMENT 'All-in IMPORT price EUR/kWh for this slot (EPEX + purchase fee + energy tax, incl. VAT; HourSlot.import_price). Not the bare spot price: that is electricity_prices.markttarief_kwh. wp_control and wp_planner read this column as the cost of their electricity',
   `pv_kwh`              float        DEFAULT NULL COMMENT 'Forecast PV generation kWh',
   `load_kwh`            float        DEFAULT NULL COMMENT 'Forecast household load kWh',
   `soc_start_pct`       float        DEFAULT NULL COMMENT 'Predicted SoC at slot start %',

@@ -64,6 +64,7 @@ like the change silently not working:
 | Service | Code arrives via | Applies with |
 |---|---|---|
 | **all** pi5new services + surebet on pi5 | bind-mount `.:/app` | `docker compose restart` |
+| `mosquitto` (stock image, no build) | bind-mount `./config` + `./entrypoint.sh` | `docker compose restart`; a new password: `./mkpasswd.sh` first |
 
 Since 2026-09-03 **every** service is bind-mount: the compose mounts `.:/app` (host code shadows the
 image), and the Dockerfile copies only `requirements.txt` + `entrypoint.sh` — no app `.py`. So a code

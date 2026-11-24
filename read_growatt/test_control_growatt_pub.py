@@ -1239,5 +1239,38 @@ class TestPvFaultStep(unittest.TestCase):
         self.assertIsNone(action2)                     # so no trigger yet
 
 
+
+class TestVminIfFresh(unittest.TestCase):
+    """vmin gets the same age limit as the Seplos SoC: a stale value pauses the vmin guards."""
+    now = datetime(2026, 11, 22, 12, 0)
+
+    def test_fresh(self):
+        self.assertEqual(ctrl.vmin_if_fresh((3.215, self.now - timedelta(seconds=30)), self.now), 3215)
+
+    def test_stale(self):
+        self.assertIsNone(ctrl.vmin_if_fresh((3.215, self.now - timedelta(seconds=601)), self.now))
+
+    def test_no_row(self):
+        self.assertIsNone(ctrl.vmin_if_fresh(None, self.now))
+
+
+class TestPlanStale(unittest.TestCase):
+    """Alert once when the optimizer's plan is old or missing; clear when it is fresh again."""
+    now = datetime(2026, 11, 22, 12, 0)
+
+    def test_fresh_quiet(self):
+        self.assertEqual(ctrl.plan_stale_step(self.now - timedelta(minutes=10), self.now, False), (10.0, None))
+
+    def test_old_triggers_once(self):
+        old = self.now - timedelta(minutes=90)
+        self.assertEqual(ctrl.plan_stale_step(old, self.now, False)[1], "trigger")
+        self.assertIsNone(ctrl.plan_stale_step(old, self.now, True)[1])
+
+    def test_missing_plan_triggers(self):
+        self.assertEqual(ctrl.plan_stale_step(None, self.now, False), (None, "trigger"))
+
+    def test_fresh_again_clears(self):
+        self.assertEqual(ctrl.plan_stale_step(self.now - timedelta(minutes=5), self.now, True)[1], "clear")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
