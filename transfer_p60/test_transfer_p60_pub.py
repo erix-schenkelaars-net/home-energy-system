@@ -197,5 +197,125 @@ class TestMqttCallbackApi(unittest.TestCase):
         self.assertIs(kwargs["callback_api_version"], m.CallbackAPIVersion.VERSION2)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# D.  feed-freeze detection — Weheat feed byte-identical while the OTThing moves
+# ══════════════════════════════════════════════════════════════════════════════
+from datetime import datetime, timedelta
+
+
+class TestFreezePure(unittest.TestCase):
+
+    def test_fingerprint_ignores_the_live_counter(self):
+        # 11-03 17:20-18:00: all measurements frozen, but electricity_used went 5235.8 -> 5236.4
+        a = {k: "44.1" for k in mod.FP_KEYS}
+        b = dict(a, sparrow_electricity_kwh="5236.4")
+        a["sparrow_electricity_kwh"] = "5235.8"
+        self.assertEqual(mod.fingerprint(a), mod.fingerprint(b))
+
+    def test_track_unchanged(self):
+        st = {"fp": None, "since": None}
+        t0 = datetime(2026, 11, 3, 17, 20)
+        self.assertEqual(mod.track_unchanged(st, ("44.1",), t0), 0.0)
+        self.assertEqual(mod.track_unchanged(st, ("44.1",), t0 + timedelta(minutes=40)), 40.0)
+        self.assertEqual(mod.track_unchanged(st, ("40.8",), t0 + timedelta(minutes=45)), 0.0)  # change
+        self.assertEqual(mod.track_unchanged(st, (None, None), t0 + timedelta(minutes=50)), 0.0)  # empty
+
+    def test_decision_of_11_03(self):
+        # 40 min identical, OTThing flow 43.4..47.2 -> frozen (NULL), no alert yet
+        self.assertEqual(mod.freeze_decision(40, 3.8, 15, 60, 0.5), (True, False))
+
+    def test_decision_of_11_16_alerts(self):
+        self.assertEqual(mod.freeze_decision(245, 8.2, 15, 60, 0.5), (True, True))
+
+    def test_flat_otthing_is_not_a_freeze(self):
+        # idle heat pump, OTThing flat too (10-26 03:00: 60 min, range 0.2) -> real standstill
+        self.assertEqual(mod.freeze_decision(60, 0.2, 15, 60, 0.5), (False, False))
+        self.assertEqual(mod.freeze_decision(60, None, 15, 60, 0.5), (False, False))   # no OTThing data
+
+    def test_too_short(self):
+        self.assertEqual(mod.freeze_decision(10, 5.0, 15, 60, 0.5), (False, False))
+
+
+class TestFreezeCycle(unittest.TestCase):
+    """execute_cycle end to end with a mocked broker/DB: what would be written."""
+
+    PAYLOAD = {
+        "sensor.sparrow_p60_heat_pump": "heating",
+        "sensor.sparrow_p60_heat_pump_water_outlet_temperature": 44.1,
+        "sensor.sparrow_p60_heat_pump_water_inlet_temperature": 36.7,
+        "sensor.sparrow_p60_heat_pump_input_power": 2394,
+        "sensor.sparrow_p60_heat_pump_compressor_speed": 5459,
+        "sensor.sparrow_p60_heat_pump_electricity_used": 5236.4,
+    }
+
+    def setUp(self):
+        mod._freeze.update(fp=None, since=None, frozen=False, alerted=None)
+        self.cur = MagicMock()
+        self.cur.rowcount = 3
+        db = MagicMock()
+        db.cursor.return_value = self.cur
+        self.p = [patch.object(mod, "mqtt"), patch.object(mod, "connect_to_erix_db", return_value=db),
+                  patch.object(mod.time, "sleep", side_effect=self._deliver),
+                  patch.object(mod, "alert_active", return_value=False),
+                  patch.object(mod, "alert_trigger"), patch.object(mod, "alert_clear")]
+        for x in self.p:
+            x.start()
+
+    def tearDown(self):
+        for x in self.p:
+            x.stop()
+        mod._freeze.update(fp=None, since=None, frozen=False, alerted=None)
+
+    def _deliver(self, _s):
+        mod.last_p60_data = dict(self.PAYLOAD)
+
+    def _written(self):
+        """{column: value} of the upsert (column order = data dict order)."""
+        for c in self.cur.execute.call_args_list:
+            if c.args[0].lstrip().upper().startswith("INSERT"):
+                import re
+                cols = re.findall(r"`?(sparrow_[a-z0-9_]+)`?", c.args[0].split("VALUES")[0])
+                return dict(zip(cols, c.args[1][1:]))
+        self.fail("no upsert")
+
+    def _age(self, minutes, ot_range):
+        mod.execute_cycle()                                   # seeds the fingerprint
+        mod._freeze["since"] = datetime.now() - timedelta(minutes=minutes)
+        self.cur.reset_mock()
+        self.cur.fetchone.return_value = (ot_range, 6)
+        mod.execute_cycle()
+
+    def test_fresh_feed_is_written_unchanged(self):
+        mod.execute_cycle()
+        w = self._written()
+        self.assertEqual(w["sparrow_compressor_speed_rpm"], mod.format_number_string(5459))
+
+    def test_frozen_writes_null_but_keeps_the_counter_and_nulls_earlier_copies(self):
+        self._age(20, 3.8)
+        w = self._written()
+        self.assertIsNone(w["sparrow_water_outlet_temp_c"])
+        self.assertIsNone(w["sparrow_compressor_speed_rpm"])
+        self.assertIsNone(w["sparrow_status"])
+        self.assertEqual(w["sparrow_electricity_kwh"], mod.format_number_string(5236.4))
+        updates = [c for c in self.cur.execute.call_args_list if c.args[0].lstrip().upper().startswith("UPDATE")]
+        self.assertEqual(len(updates), 1)
+        self.assertNotIn("sparrow_electricity_kwh", updates[0].args[0])
+        mod.alert_trigger.assert_not_called()                 # 20 min: NULL, no alert yet
+
+    def test_flat_otthing_writes_normally(self):
+        self._age(30, 0.1)
+        self.assertEqual(self._written()["sparrow_compressor_speed_rpm"], mod.format_number_string(5459))
+
+    def test_alert_after_an_hour_once_then_cleared(self):
+        self._age(70, 3.8)
+        mod.alert_trigger.assert_called_once()
+        self.assertEqual(mod.alert_trigger.call_args.args[0], "p60_feed_frozen")
+        mod.execute_cycle()                                   # still frozen: no second alert
+        mod.alert_trigger.assert_called_once()
+        self.PAYLOAD = dict(self.PAYLOAD, **{"sensor.sparrow_p60_heat_pump_water_outlet_temperature": 40.8})
+        mod.execute_cycle()                                   # feed moves again
+        mod.alert_clear.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -30,6 +30,7 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.d
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from common import energy_row as er   # gedeelde 5-minuten-bucket + upsert
+from common.battery_alert import alert_trigger, alert_clear, alert_active   # alert_latch + HA-push
 
 
 # ---------------------------
@@ -83,6 +84,96 @@ DB_NAME = os.environ["DB_NAME"]
 # Globals
 # ---------------------------
 last_p60_data = None
+
+
+# ---------------------------
+# FEED-FREEZE DETECTION
+# ---------------------------
+# The Weheat cloud feed (HA integration -> MQTT -> here) sometimes freezes: every P60 value stays
+# byte-identical while the heat pump keeps working. Usually ~30-45 min and it recovers by itself;
+# sometimes it stays frozen until the HA integration is reloaded (10-14; 11-16 four hours). The
+# copies are not measurements: they told the planner the heat pump ran after it had stopped (11-03),
+# and they put 9 kW of "heat" into the model fits. So:
+#   - unchanged for >= P60_FREEZE_NULL_MIN while the OTThing flow temperature (a separate path,
+#     read_otthing) moved >= P60_FREEZE_OT_RANGE C -> frozen: write NULL, and NULL the copies already
+#     written since the last change;
+#   - frozen for >= P60_FREEZE_ALERT_MIN -> alert in alert_latch (fix: reload the integration in HA).
+# Backtest 2026-10-01..11-24 (54 days): 30 freezes >= 15 min, 1 >= 60 min (11-16, 245 min).
+# The cumulative electricity counter is a separate entity that keeps updating during a freeze, so it
+# is not part of the fingerprint and is never NULLed.
+FREEZE_NULL_MIN  = float(os.environ.get("P60_FREEZE_NULL_MIN", "15"))
+FREEZE_ALERT_MIN = float(os.environ.get("P60_FREEZE_ALERT_MIN", "60"))
+FREEZE_OT_RANGE  = float(os.environ.get("P60_FREEZE_OT_RANGE", "0.5"))
+FREEZE_KEY       = "p60_feed_frozen"
+
+FP_KEYS = ("sparrow_water_outlet_temp_c", "sparrow_water_inlet_temp_c", "sparrow_inlet_temp_c",
+           "sparrow_outside_temp_c", "sparrow_input_power_w", "sparrow_output_power_w",
+           "sparrow_compressor_speed_rpm", "sparrow_compressor_usage", "sparrow_cop")
+LIVE_KEYS = ("sparrow_electricity_kwh",)          # keeps updating during a freeze: never NULLed
+
+_freeze = {"fp": None, "since": None, "frozen": False, "alerted": None}
+
+
+def fingerprint(data):
+    """PURE: the measured values that all stop together when the feed freezes."""
+    return tuple(data.get(k) for k in FP_KEYS)
+
+
+def track_unchanged(state, fp, now):
+    """Minutes the fingerprint has been unchanged (0 on a change or the first cycle). Updates state.
+    A fingerprint with no values at all (empty payload) never counts as unchanged."""
+    if all(v is None for v in fp):
+        state["fp"], state["since"] = None, None
+        return 0.0
+    if fp != state["fp"]:
+        state["fp"], state["since"] = fp, now
+        return 0.0
+    return (now - state["since"]).total_seconds() / 60
+
+
+def freeze_decision(unchanged_min, ot_range, null_min=None, alert_min=None, ot_min=None):
+    """PURE: (frozen, alert). Frozen only when the OTThing shows the water really changed meanwhile;
+    a P60 that is simply idle with a flat OTThing as well is not a freeze. ot_range None = no OTThing
+    data -> cannot tell -> not frozen."""
+    null_min = FREEZE_NULL_MIN if null_min is None else null_min
+    alert_min = FREEZE_ALERT_MIN if alert_min is None else alert_min
+    ot_min = FREEZE_OT_RANGE if ot_min is None else ot_min
+    frozen = unchanged_min >= null_min and ot_range is not None and ot_range >= ot_min
+    return frozen, frozen and unchanged_min >= alert_min
+
+
+def ot_flow_range(cursor, since):
+    """Range (max-min) of the OTThing flow temperature since `since`, or None with < 2 values."""
+    cursor.execute("SELECT MAX(honeywell_ot_boiler_flow_t_c) - MIN(honeywell_ot_boiler_flow_t_c), "
+                   "COUNT(honeywell_ot_boiler_flow_t_c) FROM energy WHERE ts >= %s", (since,))
+    row = cursor.fetchone()
+    if not row or row[1] is None or row[1] < 2 or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def null_frozen_rows(cursor, since, cols):
+    """NULL the copies already written after the last real change (rows strictly after `since`'s
+    bucket). Only our own columns, addressed by timestamp."""
+    sets = ", ".join(f"`{c}` = NULL" for c in cols)
+    cursor.execute(f"UPDATE energy SET {sets} WHERE ts > %s", (er.bucket(since),))
+    return cursor.rowcount
+
+
+def handle_freeze_alert(alert):
+    """Trigger/clear the alert_latch row on a state change only (synced with the latch at start)."""
+    if _freeze["alerted"] is None:
+        _freeze["alerted"] = alert_active(FREEZE_KEY)
+    if alert and not _freeze["alerted"]:
+        mins = (datetime.now() - _freeze["since"]).total_seconds() / 60
+        alert_trigger(FREEZE_KEY, f"P60-data (Weheat) staat al {mins:.0f} min stil terwijl de OTThing wel "
+                                  "verandert. HA: Instellingen > Apparaten & diensten > Weheat > ⋮ > Herladen")
+        _freeze["alerted"] = True
+        dbg(1, "MAIN", f"MELDING {FREEZE_KEY} gezet ({mins:.0f} min bevroren)")
+    elif not alert and _freeze["alerted"] and not _freeze["frozen"]:
+        alert_clear(FREEZE_KEY, "P60-data (Weheat) loopt weer")
+        _freeze["alerted"] = False
+        dbg(1, "MAIN", f"MELDING {FREEZE_KEY} opgeheven")
 
 
 # ---------------------------
@@ -197,6 +288,26 @@ def execute_cycle():
             "sparrow_compressor_speed_rpm": format_number_string(last_p60_data.get("sensor.sparrow_p60_heat_pump_compressor_speed"))
         }
 
+        # feed-freeze check (see FEED-FREEZE DETECTION above)
+        now = datetime.now()
+        unchanged = track_unchanged(_freeze, fingerprint(data), now)
+        frozen, alert = False, False
+        if unchanged >= FREEZE_NULL_MIN:
+            frozen, alert = freeze_decision(unchanged, ot_flow_range(cursor, _freeze["since"]))
+        null_cols = [k for k in data if k not in LIVE_KEYS]
+        if frozen:
+            if not _freeze["frozen"]:
+                n = null_frozen_rows(cursor, _freeze["since"], null_cols)
+                dbg(1, "MAIN", f"P60-feed BEVROREN sinds {_freeze['since']:%H:%M} ({unchanged:.0f} min, "
+                               f"OTThing beweegt) -> sparrow_* NULL, {n} eerdere rij(en) genuld")
+            else:
+                dbg(1, "MAIN", f"P60-feed nog bevroren ({unchanged:.0f} min) -> sparrow_* NULL")
+            for k in null_cols:
+                data[k] = None
+        elif _freeze["frozen"]:
+            dbg(1, "MAIN", "P60-feed loopt weer")
+        _freeze["frozen"] = frozen
+
         # Write our own 5-minute bucket, not "the newest row": that row may belong to an
         # earlier interval if the service that creates rows missed a cycle. See common/energy_row.py.
         query = er.upsert_sql(list(data.keys()))
@@ -210,6 +321,11 @@ def execute_cycle():
         db.close()
 
         dbg(1, "DB", "Database updated successfully")
+
+        try:
+            handle_freeze_alert(alert)
+        except Exception as e:
+            dbg(1, "MAIN", f"freeze-alert faalde: {e}")
 
     except Exception as e:
         dbg(1, "MAIN", f"Cycle error: {e}")
