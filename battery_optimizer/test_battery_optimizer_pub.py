@@ -1273,20 +1273,20 @@ class TestEvProbeCharging(unittest.TestCase):
             st.enter_context(patch.object(mod, "ev_at_home", return_value=at_home))
             st.enter_context(patch.object(mod, "read_bmw_state_mqtt",
                                           return_value=(soc, status, None)))
-            st.enter_context(patch.object(mod, "get_ha_switch_state", return_value=plug))
-            st.enter_context(patch.object(mod, "get_ha_sensor_float", return_value=power))
+            st.enter_context(patch.object(mod, "get_ev_plug_state", return_value=plug))
+            st.enter_context(patch.object(mod, "get_ev_plug_power", return_value=power))
             st.enter_context(patch.object(mod, "ev_plug_is_optimizer_controlled",
                                           return_value=optimizer_owns))
-            self.set_sw = st.enter_context(patch.object(mod, "set_ha_switch",
+            self.set_sw = st.enter_context(patch.object(mod, "set_ev_plug",
                                                        return_value=switch_ok))
             self.flag = st.enter_context(patch.object(mod, "set_ev_plug_control_flag"))
             return mod.run_ev_charging(hour, start_qtr, prices)
 
     def _turned_off(self):
-        return any(c.args == (mod.HA_EV_PLUG_ENTITY, False) for c in self.set_sw.call_args_list)
+        return any(c.args == (False,) for c in self.set_sw.call_args_list)
 
     def _turned_on(self):
-        return any(c.args == (mod.HA_EV_PLUG_ENTITY, True) for c in self.set_sw.call_args_list)
+        return any(c.args == (True,) for c in self.set_sw.call_args_list)
 
     # -- plug already on --
     def test_idle_plug_plans_no_load(self):
@@ -1518,17 +1518,17 @@ class TestEvManualHome(unittest.TestCase):
             self.at_home = st.enter_context(patch.object(mod, "ev_at_home", return_value=False))
             self.bmw = st.enter_context(patch.object(mod, "read_bmw_state_mqtt",
                                                      return_value=(99.0, "CHARGINGENDED", None)))
-            st.enter_context(patch.object(mod, "get_ha_switch_state", return_value=plug))
-            st.enter_context(patch.object(mod, "get_ha_sensor_float", return_value=power))
+            st.enter_context(patch.object(mod, "get_ev_plug_state", return_value=plug))
+            st.enter_context(patch.object(mod, "get_ev_plug_power", return_value=power))
             st.enter_context(patch.object(mod, "ev_plug_is_optimizer_controlled",
                                           return_value=optimizer_owns))
-            self.set_sw = st.enter_context(patch.object(mod, "set_ha_switch"))
+            self.set_sw = st.enter_context(patch.object(mod, "set_ev_plug"))
             st.enter_context(patch.object(mod, "set_ev_plug_control_flag"))
             self.clear = st.enter_context(patch.object(mod, "clear_ev_manual_home"))
             return mod.run_ev_charging(hour, start_qtr, prices)
 
     def _switched(self, on):
-        return any(c.args == (mod.HA_EV_PLUG_ENTITY, on) for c in self.set_sw.call_args_list)
+        return any(c.args == (on,) for c in self.set_sw.call_args_list)
 
     # -- the signal --
     def test_parse_iso_timestamp_from_ha(self):
@@ -2486,6 +2486,21 @@ class TestEnergyZeroFetch(unittest.TestCase):
         self.assertEqual(sorted(got), list(range(96)))
         self.assertAlmostEqual(got[0], 0.20)        # local 00:00, not tomorrow's midnight
         self.assertAlmostEqual(got[95], 0.43)
+
+
+class TestZ2mSwitchParse(unittest.TestCase):
+    """EV plug read straight from zigbee2mqtt (2026-11-24): payload -> ('on'/'off'/None, W)."""
+
+    def test_on_with_power(self):
+        self.assertEqual(mod.parse_z2m_switch(b'{"state":"ON","power":2300.5}'), ("on", 2300.5))
+
+    def test_off(self):
+        self.assertEqual(mod.parse_z2m_switch(b'{"state":"OFF","power":0}'), ("off", 0.0))
+
+    def test_missing_or_bad(self):
+        self.assertEqual(mod.parse_z2m_switch(b'{"power":"x"}'), (None, None))
+        self.assertEqual(mod.parse_z2m_switch(b'not json'), (None, None))
+        self.assertEqual(mod.parse_z2m_switch(b'{"state":"TOGGLE"}'), (None, None))
 
 
 if __name__ == "__main__":

@@ -309,13 +309,10 @@ MQTT_BROKER_PORT = int(os.environ.get("MQTT_PORT", 1883))
 MQTT_BROKER_USER = os.environ.get("MQTT_USERNAME", "")
 MQTT_BROKER_PASS = os.environ.get("MQTT_PASSWORD", "")
 
-HA_URL            = os.environ.get("HA_URL", "http://YOUR_HA_IP:8123")
-HA_TOKEN          = os.environ.get("HA_TOKEN", "")
-# EV charge plug: Third Reality Zigbee plug "230 V smart switch 8 EV-charging" (zigbee2mqtt on pi5new),
-# switched and read through its Home Assistant entities. Replaced the Tuya-cloud Antela WiFi plug on
-# 2026-11-23; switching it over MQTT directly (HA out of the control path) is a later step.
-HA_EV_PLUG_ENTITY       = "switch.230_v_smart_switch_8_ev_charging"
-HA_EV_PLUG_POWER_ENTITY = "sensor.230_v_smart_switch_8_ev_charging_power"
+# EV charge plug: Zigbee plug, switched and read straight through zigbee2mqtt on our own broker
+# (2026-11-24; until then via the Home Assistant REST API, which put pi5 in the control path). z2m does
+# not retain switch states, so a read asks for a fresh one with <topic>/get.
+EV_PLUG_TOPIC = os.environ.get("EV_PLUG_TOPIC", "zigbee2mqtt/230 V smart switch 8 EV-charging")
 
 # ---------------------------------------------------------------------------
 # HEAT PUMP MODEL
@@ -3336,14 +3333,18 @@ def simulate_and_report(schedule: list[HourSlot]) -> dict:
 # 7.  BMW EV SMART CHARGING
 # ---------------------------------------------------------------------------
 
-def _read_mqtt_topic(topic: str, parser, timeout_s: float = 5.0) -> dict:
-    """Connect to broker, wait for one message on topic, parse it, return result."""
+def _read_mqtt_topic(topic: str, parser, timeout_s: float = 5.0, on_connect_extra=None) -> dict:
+    """Connect to broker, wait for one message on topic, parse it, return result.
+    on_connect_extra(c, ud, flags, rc, props) replaces the plain subscribe (e.g. subscribe + /get)."""
     result: dict = {}
     done: list   = []
 
     def on_connect(c, _ud, _flags, rc, _props=None):
         if rc == 0:
-            c.subscribe(topic)
+            if on_connect_extra:
+                on_connect_extra(c, _ud, _flags, rc, _props)
+            else:
+                c.subscribe(topic)
         else:
             done.append(True)
 
@@ -3498,40 +3499,72 @@ def ev_manual_soc_equiv(charged_s: float) -> float:
     return BMW_TARGET_SOC_PCT - kwh / BMW_BATTERY_KWH * 100.0
 
 
-def _ha_headers() -> dict:
-    return {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
-
-
-def get_ha_switch_state(entity_id: str) -> Optional[str]:
+def parse_z2m_switch(payload) -> tuple:
+    """PURE: a zigbee2mqtt switch payload -> (state 'on'/'off'/None, power W or None).
+    Lower-case state, so the callers keep comparing with 'on' as they did with HA."""
     try:
-        r = requests.get(f"{HA_URL}/api/states/{entity_id}",
-                         headers=_ha_headers(), timeout=10)
-        if r.status_code == 200:
-            return r.json().get("state")
-    except Exception as e:
-        log.warning("HA get state failed: %s", e)
-    return None
-
-
-def get_ha_sensor_float(entity_id: str) -> Optional[float]:
-    val = get_ha_switch_state(entity_id)
+        d = json.loads(payload)
+    except Exception:
+        return None, None
+    if not isinstance(d, dict):
+        return None, None
+    st = d.get("state")
+    state = st.lower() if isinstance(st, str) and st.upper() in ("ON", "OFF") else None
     try:
-        return float(val)
+        power = float(d.get("power"))
     except (TypeError, ValueError):
-        log.warning("HA sensor %s: unexpected value '%s'", entity_id, val)
-        return None
+        power = None
+    return state, power
 
 
-def set_ha_switch(entity_id: str, turn_on: bool) -> bool:
-    service = "turn_on" if turn_on else "turn_off"
+def _z2m_get(topic: str, timeout_s: float = 5.0) -> tuple:
+    """Ask a z2m device for a fresh state (<topic>/get) and return parse_z2m_switch of the reply,
+    (None, None) when none arrives in time."""
+    def ask(c, _ud, _flags, rc, _props=None):
+        if rc == 0:
+            c.subscribe(topic)
+            c.publish(f"{topic}/get", json.dumps({"state": "", "power": ""}))
+
+    def parse(msg, result):
+        result["v"] = parse_z2m_switch(msg.payload)
+
+    res = _read_mqtt_topic(topic, parse, timeout_s, on_connect_extra=ask)
+    return res.get("v", (None, None))
+
+
+def get_ev_plug_state() -> Optional[str]:
+    state, _ = _z2m_get(EV_PLUG_TOPIC)
+    if state is None:
+        log.warning("EV plug: no state from %s", EV_PLUG_TOPIC)
+    return state
+
+
+def get_ev_plug_power() -> Optional[float]:
+    _, power = _z2m_get(EV_PLUG_TOPIC)
+    if power is None:
+        log.warning("EV plug: no power from %s", EV_PLUG_TOPIC)
+    return power
+
+
+def set_ev_plug(turn_on: bool) -> bool:
+    """Switch the plug: publish {"state": "ON"/"OFF"} to <topic>/set. True once the broker has it."""
     try:
-        r = requests.post(f"{HA_URL}/api/services/switch/{service}",
-                          headers=_ha_headers(),
-                          json={"entity_id": entity_id},
-                          timeout=10)
-        return r.status_code in (200, 201)
+        try:
+            c = paho_mqtt.Client(callback_api_version=paho_mqtt.CallbackAPIVersion.VERSION2)
+        except AttributeError:
+            c = paho_mqtt.Client()
+        if MQTT_BROKER_USER:
+            c.username_pw_set(MQTT_BROKER_USER, MQTT_BROKER_PASS)
+        c.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, keepalive=10)
+        c.loop_start()
+        info = c.publish(f"{EV_PLUG_TOPIC}/set", json.dumps({"state": "ON" if turn_on else "OFF"}), qos=1)
+        info.wait_for_publish(5)
+        ok = info.is_published()
+        c.loop_stop()
+        c.disconnect()
+        return ok
     except Exception as e:
-        log.warning("HA set switch failed: %s", e)
+        log.warning("EV plug: switching failed: %s", e)
     return False
 
 
@@ -3588,7 +3621,7 @@ def ev_plug_is_optimizer_controlled() -> bool:
 def ev_plug_on() -> bool:
     """Switch the plug on and claim ownership -- only if HA accepted the command, so a failed
     switch never leaves an ownership mark behind."""
-    if not set_ha_switch(HA_EV_PLUG_ENTITY, True):
+    if not set_ev_plug(True):
         log.warning("EV: plug ON failed — not claiming control")
         return False
     set_ev_plug_control_flag(True)
@@ -3633,7 +3666,7 @@ def _ev_probe_tick(charging_status: Optional[str], power_only: bool = False) -> 
     Returns the measured plug power (W) for logging, or None if unavailable.
     """
     global _ev_session_started, _ev_probe_on_since, _ev_probe_retry_after, _ev_charge_since
-    power_w  = get_ha_sensor_float(HA_EV_PLUG_POWER_ENTITY)
+    power_w  = get_ev_plug_power()
     charging = (power_w is not None and power_w > EV_PROBE_POWER_W) \
                or charging_status in ("INITIALIZATION", "CHARGINGACTIVE")
 
@@ -3660,7 +3693,7 @@ def _ev_probe_tick(charging_status: Optional[str], power_only: bool = False) -> 
         if ev_plug_is_optimizer_controlled():
             log.info("EV: probe idle %.0fs (%.0fW, NOCHARGING) — nothing plugged in, "
                      "plug OFF, retry in %ds", waited, power_w or 0, EV_PROBE_RETRY_S)
-            set_ha_switch(HA_EV_PLUG_ENTITY, False)
+            set_ev_plug(False)
             set_ev_plug_control_flag(False)
         _ev_probe_on_since    = None
         _ev_probe_retry_after = time.time() + EV_PROBE_RETRY_S
@@ -3684,7 +3717,7 @@ def _ev_finish_manual(power_w: Optional[float]) -> None:
     if ev_plug_is_optimizer_controlled():
         log.info("EV manual: load low (%.0fW for %ds) — charging done, plug OFF",
                  power_w or 0, EV_DONE_HOLD_S)
-        set_ha_switch(HA_EV_PLUG_ENTITY, False)
+        set_ev_plug(False)
         set_ev_plug_control_flag(False)
     else:
         log.info("EV manual: load low — done, but plug controlled by HA/remote — skipping OFF")
@@ -3710,7 +3743,7 @@ def _run_ev_manual(current_hour: int, start_qtr_idx: int, prices: dict[int, floa
     charged_s = time.time() - _ev_charge_since if _ev_charge_since else 0.0
     real_soc  = manual_soc_if_reliable(*read_bmw_soc_stamp(), since)
     soc_eq    = real_soc if real_soc is not None else ev_manual_soc_equiv(charged_s)
-    plug      = get_ha_switch_state(HA_EV_PLUG_ENTITY)
+    plug      = get_ev_plug_state()
     log.info("EV manual: car marked home at %s  plug=%s  %s", since.strftime("%d %H:%M"), plug,
              f"SoC {real_soc:.0f}% (fresh)" if real_soc is not None else
              "SoC unknown — assumed remaining %.1f h"
@@ -3763,10 +3796,10 @@ def run_ev_charging(current_hour: int, start_qtr_idx: int,
 
     at_home = ev_at_home()
     if at_home is False:
-        plug_state = get_ha_switch_state(HA_EV_PLUG_ENTITY)
+        plug_state = get_ev_plug_state()
         if plug_state == "on" and ev_plug_is_optimizer_controlled():
             log.info("EV: car not at home — turning plug OFF")
-            set_ha_switch(HA_EV_PLUG_ENTITY, False)
+            set_ev_plug(False)
             set_ev_plug_control_flag(False)
         elif plug_state == "on":
             log.info("EV: car not at home, but plug controlled by HA/remote — skipping OFF")
@@ -3781,10 +3814,10 @@ def run_ev_charging(current_hour: int, start_qtr_idx: int,
 
     if soc is None and charging_status is None:
         log.warning("EV: MQTT read failed — plug unchanged")
-        plug_state = get_ha_switch_state(HA_EV_PLUG_ENTITY)
+        plug_state = get_ev_plug_state()
         return plug_state == "on", None
 
-    plug_state = get_ha_switch_state(HA_EV_PLUG_ENTITY)
+    plug_state = get_ev_plug_state()
     log.info("EV: SoC=%s%%  charging_status=%s  plug=%s",
              f"{soc:.0f}" if soc is not None else "?", charging_status, plug_state)
 
@@ -3792,7 +3825,7 @@ def run_ev_charging(current_hour: int, start_qtr_idx: int,
     if charging_status == "CHARGINGENDED":
         if plug_state == "on" and ev_plug_is_optimizer_controlled():
             log.info("EV: CHARGINGENDED — turning plug OFF")
-            set_ha_switch(HA_EV_PLUG_ENTITY, False)
+            set_ev_plug(False)
             set_ev_plug_control_flag(False)
         elif plug_state == "on":
             log.info("EV: CHARGINGENDED, but plug controlled by HA/remote — skipping OFF")
@@ -4262,7 +4295,7 @@ def _sleep_until_next_quarter():
         remaining = deadline - time.time()
         time.sleep(min(EV_POLL_INTERVAL_S, max(1, remaining)))
 
-        plug_state = get_ha_switch_state(HA_EV_PLUG_ENTITY)
+        plug_state = get_ev_plug_state()
         if plug_state != "on":
             continue
 
@@ -4277,7 +4310,7 @@ def _sleep_until_next_quarter():
         if charging_status == "CHARGINGENDED":
             if ev_plug_is_optimizer_controlled():
                 log.info("EV poll: CHARGINGENDED — turning plug OFF")
-                set_ha_switch(HA_EV_PLUG_ENTITY, False)
+                set_ev_plug(False)
                 set_ev_plug_control_flag(False)
             else:
                 log.info("EV poll: CHARGINGENDED, but plug controlled by HA/remote — skipping OFF")
