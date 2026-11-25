@@ -291,48 +291,68 @@ class TestLiveRoom(unittest.TestCase):
         self.assertEqual(wp.live_room(), 20.6)
 
 
-class TestHaOutside(unittest.TestCase):
-    """The HA outdoor sensor = first choice for outsideTemp (KNMI = fallback). parse_ha_state = the pure core."""
+class TestMqttOutside(unittest.TestCase):
+    """The outdoor sensor via its zigbee2mqtt topic = first choice for outsideTemp (KNMI = fallback)."""
 
-    def _json(self, state, stamp=None):
-        d = {"state": state}
-        if stamp is not None:
-            d["last_reported"] = stamp
-        return json.dumps(d)
+    def _p(self, temp, last_seen=None):
+        d = {"temperature": temp, "humidity": 68.6, "battery": 100}
+        if last_seen is not None:
+            d["last_seen"] = last_seen
+        return json.dumps(d).encode()
 
     def _now(self):
         return datetime(2026, 1, 5, 12, 0).timestamp()
 
     def test_fresh_plausible_rounds_1dec(self):
-        stamp = datetime(2026, 1, 5, 11, 55).astimezone().isoformat()
-        self.assertEqual(wp.parse_ha_state(self._json("10.07", stamp), self._now(), 7200, -40, 50), 10.1)
+        seen = datetime(2026, 1, 5, 11, 55).astimezone().isoformat()
+        self.assertEqual(wp.parse_z2m_outside(self._p(3.08, seen), self._now(), None, 7200, -40, 50), 3.1)
 
-    def test_missing_stamp_still_accepts(self):
-        self.assertEqual(wp.parse_ha_state(self._json("8.5"), self._now(), 7200, -40, 50), 8.5)
+    def test_no_last_seen_uses_receive_time(self):
+        recv = datetime(2026, 1, 5, 11, 50).timestamp()
+        self.assertEqual(wp.parse_z2m_outside(self._p(8.5), self._now(), recv, 7200, -40, 50), 8.5)
+        old = datetime(2026, 1, 5, 8, 0).timestamp()
+        self.assertIsNone(wp.parse_z2m_outside(self._p(8.5), self._now(), old, 7200, -40, 50))
 
-    def test_unavailable_is_none(self):
-        self.assertIsNone(wp.parse_ha_state(self._json("unavailable"), self._now(), 7200, -40, 50))
+    def test_epoch_ms_last_seen(self):
+        ms = int(datetime(2026, 1, 5, 11, 59).timestamp() * 1000)
+        self.assertEqual(wp.parse_z2m_outside(self._p(-2.0, ms), self._now(), None, 7200, -40, 50), -2.0)
+
+    def test_no_temperature_is_none(self):
+        self.assertIsNone(wp.parse_z2m_outside(b'{"battery":100}', self._now(), self._now(), 7200, -40, 50))
+        self.assertIsNone(wp.parse_z2m_outside(self._p(None), self._now(), self._now(), 7200, -40, 50))
 
     def test_implausible_is_none(self):
-        self.assertIsNone(wp.parse_ha_state(self._json("999"), self._now(), 7200, -40, 50))
+        self.assertIsNone(wp.parse_z2m_outside(self._p(999), self._now(), self._now(), 7200, -40, 50))
 
     def test_stale_is_none(self):
-        stamp = datetime(2026, 1, 5, 9, 0).astimezone().isoformat()     # 3 u oud > 7200 s
-        self.assertIsNone(wp.parse_ha_state(self._json("10.0", stamp), self._now(), 7200, -40, 50))
-        # ...but within the default of 6 h the same 3 h old value stays usable
-        self.assertEqual(wp.parse_ha_state(self._json("10.0", stamp), self._now(),
-                                           wp.build_cfg()["ha_max_age"], -40, 50), 10.0)
+        seen = datetime(2026, 1, 5, 9, 0).astimezone().isoformat()      # 3 h old > 7200 s
+        self.assertIsNone(wp.parse_z2m_outside(self._p(10.0, seen), self._now(), None, 7200, -40, 50))
+        # ...but within the default of 6 h the same 3 h old value stays usable (reports only on change)
+        self.assertEqual(wp.parse_z2m_outside(self._p(10.0, seen), self._now(), None,
+                                              wp.build_cfg()["outside_max_age"], -40, 50), 10.0)
 
     def test_bad_json_is_none(self):
-        self.assertIsNone(wp.parse_ha_state("not json", self._now(), 7200, -40, 50))
+        self.assertIsNone(wp.parse_z2m_outside(b"not json", self._now(), self._now(), 7200, -40, 50))
 
-    def test_build_cfg_ha_defaults(self):
+    def test_build_cfg_defaults(self):
         c = wp.build_cfg()
-        self.assertEqual(c["ha_entity"], "sensor.outdoor_temperature")  # generieke default (echte = .env)
-        self.assertEqual(c["ha_max_age"], 21600)   # 6 h: the sensor only reports on change
+        self.assertIsNone(c["outside_topic"])           # no default topic in code (real one = .env)
+        self.assertEqual(c["outside_max_age"], 21600)    # 6 h: the sensor only reports on change
 
-    def test_read_ha_outside_no_creds_is_none(self):
-        self.assertIsNone(wp.read_ha_outside(wp.build_cfg()))           # no HA_URL/HA_TOKEN in the test env
+    def test_read_uses_the_cached_message(self):
+        cfg = wp.build_cfg()
+        with wp._outside_lock:
+            wp._outside_cache.update(payload=None, recv=None)
+        self.assertIsNone(wp.read_mqtt_outside(cfg))     # nothing received yet -> KNMI fallback
+        msg = MagicMock()
+        msg.payload = self._p(3.08, datetime.now().astimezone().isoformat())
+        wp._on_outside_msg(None, None, msg)
+        self.assertEqual(wp.read_mqtt_outside(cfg), 3.1)
+        with wp._outside_lock:
+            wp._outside_cache.update(payload=None, recv=None)
+
+    def test_no_topic_no_listener(self):
+        self.assertIsNone(wp.start_outside_listener(wp.build_cfg()))
 
 
 class TestCurveFlow(unittest.TestCase):

@@ -177,7 +177,7 @@ them).
 
 | variable | default | meaning |
 |---|---|---|
-| `WP_OUTSIDE_ENTITY` | `sensor.outdoor_temperature` | Home Assistant outdoor sensor, first choice. **Set in `.env`** (own entity name) |
+| `WP_OUTSIDE_TOPIC` | *(unset)* | zigbee2mqtt topic of the outdoor sensor, first choice (read straight from the broker, not via Home Assistant). **Set in `.env`** (own device name). Unset = KNMI forecast only |
 | `WP_OUTSIDE_MAX_AGE_S` | `21600` | older than this = not used; fall back to the KNMI forecast. 6 h because the sensor only reports on change (gaps up to ~5 h at night) |
 | `WP_SCHED_TABLE` | `battery_schedule` | table holding the KNMI forecast (`forecast_temp_c`) for that fallback |
 | `WP_OUTSIDE_MIN` / `WP_OUTSIDE_MAX` | `-40` / `50` | values outside this range are ignored |

@@ -17,7 +17,6 @@ import sys
 import threading
 from datetime import datetime, timedelta
 from time import sleep
-from urllib.request import Request, urlopen
 
 import mysql.connector
 import paho.mqtt.publish as mqtt_publish
@@ -474,15 +473,15 @@ def build_cfg():
         "schedule":  parse_schedule(os.environ.get("WP_SCHEDULE", DEFAULT_SCHEDULE)),
         "interval":  int(os.environ.get("WP_CHECK_INTERVAL", "300")),
         "sched_table": os.environ.get("WP_SCHED_TABLE", "battery_schedule"),
-        # independent HA outdoor sensor (user 2026-10-22) = first choice for outsideTemp; KNMI = fallback.
-        # The entity id lives in .env (WP_OUTSIDE_ENTITY), not in code -- public repo.
-        "ha_url":     os.environ.get("HA_URL"),
-        "ha_token":   os.environ.get("HA_TOKEN"),
-        "ha_entity":  os.environ.get("WP_OUTSIDE_ENTITY", "sensor.outdoor_temperature"),
+        # independent outdoor sensor (user 2026-10-22) = first choice for outsideTemp; KNMI = fallback.
+        # Read straight from its zigbee2mqtt topic on our own broker (2026-11-24; was via the HA REST
+        # API, which added pi5 to the path without adding an independent source). The topic lives in
+        # .env (WP_OUTSIDE_TOPIC), not in code -- public repo. Unset = KNMI only.
+        "outside_topic": os.environ.get("WP_OUTSIDE_TOPIC") or None,
         # 6 h (2026-11-02, was 2 h): the outdoor sensor only reports on change -- gaps of up to ~5 h at
         # night and in stable weather. No report = unchanged; with 2 h it fell back to KNMI needlessly in
         # the middle of the morning warm-up (07:49-10:44).
-        "ha_max_age": int(os.environ.get("WP_OUTSIDE_MAX_AGE_S", "21600")),
+        "outside_max_age": int(os.environ.get("WP_OUTSIDE_MAX_AGE_S", "21600")),
         # the OTThing DB row (room/setpoint/flame) counts only when younger than this; read_otthing
         # writes every 5 min, so 15 min = two missed rows
         "room_max_age_s": int(os.environ.get("WP_ROOM_MAX_AGE_S", "900")),
@@ -1001,52 +1000,77 @@ def read_day_prices(cfg, day):
         return {}
 
 
-def parse_ha_state(text, now_epoch, max_age_s, out_min, out_max):
-    """PURE: an HA /api/states/<entity> JSON -> outside temperature (float, 1 decimal), or None on:
-    invalid JSON / non-numeric state ('unavailable'/'unknown') / outside [out_min, out_max] / older
-    than max_age_s (last_reported, else last_updated). Never crashes and never passes on a false or
-    frozen outside temperature. This is the core the tests exercise (read_ha_outside = I/O only)."""
+def parse_z2m_outside(payload, now_epoch, recv_epoch, max_age_s, out_min, out_max):
+    """PURE: a zigbee2mqtt sensor payload ({"temperature": .., "last_seen": ISO}) -> outside temperature
+    (float, 1 decimal), or None on: invalid JSON / no numeric temperature / outside [out_min, out_max] /
+    older than max_age_s. Age = last_seen (when z2m sends it), else the moment we received the message
+    (recv_epoch). Never crashes and never passes on a false or frozen outside temperature."""
     try:
-        d = json.loads(text)
+        d = json.loads(payload)
     except Exception:
         return None
     if not isinstance(d, dict):
         return None
     try:
-        t = float(d.get("state"))
+        t = float(d.get("temperature"))
     except (TypeError, ValueError):
-        return None                        # 'unavailable' / 'unknown' / None
+        return None
     if not (out_min <= t <= out_max):
         return None
-    stamp = d.get("last_reported") or d.get("last_updated")
-    if stamp:
+    stamp_epoch = recv_epoch
+    stamp = d.get("last_seen")
+    if isinstance(stamp, str):
         try:
-            if now_epoch - datetime.fromisoformat(stamp).timestamp() > max_age_s:
-                return None                # too old -> do not pass on a frozen value
-        except (ValueError, TypeError):
-            pass                           # unparseable timestamp -> do not throw the value away
+            stamp_epoch = datetime.fromisoformat(stamp).timestamp()
+        except ValueError:
+            pass                           # unparseable -> fall back to the receive time
+    elif isinstance(stamp, (int, float)) and stamp > 1e9:
+        stamp_epoch = stamp / 1000 if stamp > 1e12 else stamp      # z2m last_seen "epoch" format (ms)
+    if stamp_epoch is None or now_epoch - stamp_epoch > max_age_s:
+        return None                        # too old -> do not pass on a frozen value
     return round(t, 1)
 
 
-def read_ha_outside(cfg):
-    """Outside temperature from the independent HA sensor (cfg['ha_entity']) through the HA REST API.
-    Best effort -> None (then the loop falls back to the KNMI forecast). The REAL sensor instead of the
-    KNMI data that is incomplete in the morning and the P60 inlet that operation pollutes (user
-    2026-10-22). stdlib urllib, no extra dependency; HA_URL/HA_TOKEN come from ../.env (already in the
-    container)."""
-    url, token = cfg.get("ha_url"), cfg.get("ha_token")
-    if not url or not token:
+# outdoor sensor listener: the z2m topic is retained, so on (re)connect the last value arrives at once
+_outside_cache = {"payload": None, "recv": None}
+_outside_lock  = threading.Lock()
+
+
+def _on_outside_msg(client, userdata, msg):
+    """on_message: keep the newest raw payload + receive time (thread-safe); parsed at read time."""
+    with _outside_lock:
+        _outside_cache["payload"] = msg.payload
+        _outside_cache["recv"] = datetime.now().timestamp()
+
+
+def start_outside_listener(cfg):
+    """Background MQTT client on cfg['outside_topic']. Best effort -> None (the loop then uses KNMI)."""
+    if not cfg.get("outside_topic"):
+        dbg("OUT", "geen WP_OUTSIDE_TOPIC -> buitentemp alleen uit KNMI-forecast")
         return None
     try:
-        req = Request(f"{url.rstrip('/')}/api/states/{cfg['ha_entity']}",
-                      headers={"Authorization": f"Bearer {token}"})
-        with urlopen(req, timeout=5) as r:
-            text = r.read().decode()
+        c = mqtt_client.Client()
+        if cfg["mqtt_user"]:
+            c.username_pw_set(cfg["mqtt_user"], cfg["mqtt_pass"])
+        c.on_message = _on_outside_msg
+        c.on_connect = lambda cl, u, f, rc, *a: cl.subscribe(cfg["outside_topic"])
+        c.connect(cfg["broker"], cfg["port"], 30)
+        c.loop_start()
+        dbg("OUT", f"luistert op '{cfg['outside_topic']}'")
+        return c
     except Exception as e:
-        dbg("HA", f"read_ha_outside faalde: {e}")
+        dbg("OUT", f"listener-start faalde: {e}")
         return None
-    return parse_ha_state(text, datetime.now().timestamp(), cfg["ha_max_age"],
-                          cfg["out_min"], cfg["out_max"])
+
+
+def read_mqtt_outside(cfg, now_epoch=None):
+    """Outside temperature from the cached sensor message, or None (no message yet / stale / invalid)."""
+    with _outside_lock:
+        payload, recv = _outside_cache["payload"], _outside_cache["recv"]
+    if payload is None:
+        return None
+    now_epoch = datetime.now().timestamp() if now_epoch is None else now_epoch
+    return parse_z2m_outside(payload, now_epoch, recv, cfg["outside_max_age"], cfg["out_min"], cfg["out_max"])
 
 
 def _mqtt_publish(topic, payload, cfg, dry_run, retain=False):
@@ -1763,6 +1787,7 @@ def main():
                 f" | curve {len(cfg['curve'])}pt + room-comp PI (Kp={cfg['rc_kp']}, Ki={cfg['rc_ki']}, "
                 f"gedempt: leak {cfg['rc_damp_leak']}/band {cfg['rc_damp_band']}°C, I-max {cfg['rc_i_max']}, "
                 f"boost -{cfg['rc_neg_max']}..+{cfg['rc_max']}°C), aanvoer {cfg['flow_min']}..{cfg['flow_cap']}°C")
+    start_outside_listener(cfg)
     if cfg["valve_log"]:
         ensure_valve_columns(cfg)
         start_valve_listener(cfg)
@@ -1842,8 +1867,8 @@ def main():
 
         # clean outside temperature (KNMI forecast, current slot) -> outsideTemp/set, replaces the P60
         # inlet. Always read (also for overlay #1 below); publishing stays gated by publish_outside.
-        ot = read_ha_outside(cfg)                    # 1e keus: onafhankelijke HA-buitenvoeler
-        ot_src = "HA-sensor"
+        ot = read_mqtt_outside(cfg)                  # 1st choice: independent outdoor sensor via z2m/MQTT
+        ot_src = "MQTT-sensor"
         if ot is None:
             ot = read_forecast_outside(cfg)          # fallback: KNMI-forecast (huidig slot)
             ot_src = "KNMI-fallback"
