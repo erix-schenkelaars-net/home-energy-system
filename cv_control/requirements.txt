@@ -1,0 +1,3 @@
+# Same pins as the other services (2026-10-24 freeze). Bump deliberately, then test + rebuild.
+mysql-connector-python==9.7.0
+paho-mqtt==2.1.0

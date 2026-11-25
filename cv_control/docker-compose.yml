@@ -1,0 +1,14 @@
+services:
+  cv_control:
+    build: .
+    container_name: cv_control
+    restart: unless-stopped
+    stop_grace_period: 2s
+    network_mode: host
+    env_file:
+      - ../.env
+    environment:
+      - TZ=Europe/Amsterdam
+    volumes:
+      - .:/app
+      - ./logs:/logs
